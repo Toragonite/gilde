@@ -110,14 +110,14 @@ the one pulsing status dot and smooth scrolling.
 From the public repository:
 
 1. **Settings → Pages → Build and deployment → Source: GitHub Actions.**
-2. Add `.github/workflows/pages.yml`:
+2. `.github/workflows/pages.yml` (in this repository; it ships with the export):
 
    ```yaml
    name: Pages
    on:
      push:
        branches: [main]
-       paths: ['site/**']
+       paths: ['site/**', '.github/workflows/pages.yml']
      workflow_dispatch:
    permissions:
      contents: read
@@ -143,7 +143,7 @@ From the public repository:
    ```
 
 3. Push to `main`. The page is published at
-   `https://<owner>.github.io/<repo>/`; all paths in the page are relative, so
+   `https://<owner>.github.io/<repo>/` (https://toragonite.github.io/gilde/); all paths in the page are relative, so
    it works under that sub-path as is.
 
 (Without Actions: Pages can also publish from a branch, but only from the

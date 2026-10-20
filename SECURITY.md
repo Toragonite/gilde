@@ -9,6 +9,8 @@ Use GitHub's private vulnerability reporting: on the repository page, open
 **Security → Report a vulnerability**. The report is visible only to you and
 the maintainers until a fix is published.
 
+If you cannot use GitHub, e-mail toragonite@gmail.com instead.
+
 Please include:
 
 - what an attacker can do, and under which conditions;

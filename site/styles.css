@@ -1641,3 +1641,8 @@ main:focus {
     display: none;
   }
 }
+
+.sec-report {
+  margin-top: 20px;
+  font-size: 0.9375rem;
+}
