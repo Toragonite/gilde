@@ -1,0 +1,69 @@
+{
+  "_source": "adapter / authStatus / models captured live on 2026-09-07 from the real sidecar (cursor-agent is NOT installed on this machine — DESIGN R11 — so `installed` is false and `loggedIn` is false, which is itself the honest live answer). `runResult` is synthesized to the shape `CursorAdapter.finish()` builds (packages/cursor/src/adapter.ts) because no run can be executed here.",
+  "adapter": {
+    "vendor": "cursor",
+    "capabilities": {
+      "resume": true,
+      "steer": "turn",
+      "peerMesh": false,
+      "quota": false,
+      "stream": true
+    },
+    "binary": "cursor-agent",
+    "binaryPath": null,
+    "installed": false
+  },
+  "authStatus": {
+    "loggedIn": false
+  },
+  "models": [
+    {
+      "id": "auto",
+      "latencyClass": "fast",
+      "default": true,
+      "label": "Cursor's automatic router — may itself pick a resold frontier model that spends that vendor's quota"
+    },
+    {
+      "id": "composer-2.5",
+      "latencyClass": "fast"
+    },
+    {
+      "id": "cursor-grok-4.5-high",
+      "latencyClass": "slow"
+    },
+    {
+      "id": "cursor-grok-4.5-high-fast",
+      "latencyClass": "slow"
+    }
+  ],
+  "quota": null,
+  "runResult": {
+    "vendor": "cursor",
+    "conversationId": "b7c2f0f4-1d2a-4a1c-9d6b-5f3e2a1c0d9e",
+    "text": "OK",
+    "status": "ok",
+    "model": "composer-2.5",
+    "note": "model 'auto' may route to a resold frontier model",
+    "raw": {
+      "type": "result",
+      "subtype": "success",
+      "session_id": "b7c2f0f4-1d2a-4a1c-9d6b-5f3e2a1c0d9e",
+      "result": "OK"
+    }
+  },
+  "streamEvents": [
+    {
+      "type": "text",
+      "text": "OK"
+    },
+    {
+      "type": "done",
+      "result": {
+        "vendor": "cursor",
+        "conversationId": "b7c2f0f4-1d2a-4a1c-9d6b-5f3e2a1c0d9e",
+        "text": "OK",
+        "status": "ok"
+      }
+    }
+  ]
+}

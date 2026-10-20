@@ -1,0 +1,99 @@
+{
+  "_source": "Captured live on 2026-09-07 against the installed `codex` CLI. `runResult` is a successful `mesh.run` (model gpt-5.6-sol, inside a git repo); `errorRunResult` is a real vendor failure captured the same way; `unresumableRunResult` is that successful result with `conversationId` emptied, which is agent-mesh's documented way of saying \"not resumable\" (core/src/types.ts) and cannot be produced on demand by a healthy CLI. `quota` is null: `capabilities.quota` is true, but the codex quota endpoint returned nothing for this login.",
+  "adapter": {
+    "vendor": "codex",
+    "capabilities": {
+      "resume": true,
+      "steer": "turn",
+      "peerMesh": false,
+      "quota": true,
+      "stream": false
+    },
+    "binary": "codex",
+    "binaryPath": "/Users/tester/.nvm/versions/node/v20.19.2/bin/codex",
+    "installed": true
+  },
+  "authStatus": {
+    "loggedIn": true,
+    "mode": "chatgpt"
+  },
+  "models": [
+    {
+      "id": "gpt-5.6-sol",
+      "latencyClass": "fast"
+    },
+    {
+      "id": "gpt-5.6-terra",
+      "latencyClass": "fast"
+    },
+    {
+      "id": "gpt-5.6-luna",
+      "latencyClass": "fast"
+    },
+    {
+      "id": "gpt-5.5",
+      "latencyClass": "fast"
+    }
+  ],
+  "quota": null,
+  "runResult": {
+    "vendor": "codex",
+    "conversationId": "01a07b08-bb21-7700-a624-10ceeb07b6a4",
+    "text": "OK",
+    "status": "ok",
+    "model": "gpt-5.6-sol",
+    "usage": {
+      "inputTokens": 15904,
+      "outputTokens": 5,
+      "cachedInputTokens": 11264,
+      "totalTokens": 15909
+    },
+    "raw": {
+      "type": "turn.completed",
+      "usage": {
+        "input_tokens": 15904,
+        "cached_input_tokens": 11264,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 5,
+        "reasoning_output_tokens": 0
+      }
+    }
+  },
+  "errorRunResult": {
+    "vendor": "codex",
+    "conversationId": "01a07b08-657c-72e1-8a54-81820cef7863",
+    "text": "",
+    "status": "error",
+    "note": "{\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The 'gpt-6-astra' model requires a newer version of Codex. Please upgrade to the latest app or CLI and try again.\"}}",
+    "raw": {
+      "type": "turn.failed",
+      "error": {
+        "message": "{\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The 'gpt-6-astra' model requires a newer version of Codex. Please upgrade to the latest app or CLI and try again.\"}}"
+      }
+    }
+  },
+  "unresumableRunResult": {
+    "vendor": "codex",
+    "conversationId": "",
+    "text": "OK",
+    "status": "ok",
+    "model": "gpt-5.6-sol",
+    "usage": {
+      "inputTokens": 15904,
+      "outputTokens": 5,
+      "cachedInputTokens": 11264,
+      "totalTokens": 15909
+    },
+    "raw": {
+      "type": "turn.completed",
+      "usage": {
+        "input_tokens": 15904,
+        "cached_input_tokens": 11264,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 5,
+        "reasoning_output_tokens": 0
+      }
+    },
+    "note": "the vendor returned no conversation id; this run cannot be resumed"
+  }
+}

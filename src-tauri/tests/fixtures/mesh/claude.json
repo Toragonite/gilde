@@ -1,0 +1,492 @@
+{
+  "_source": "Captured live on 2026-09-07 from the real sidecar bundle against the installed `claude` CLI (mesh.hello / authStatus / availableModels / quota / run / stream). Two redactions, both noted here and nowhere else: `authStatus.detail` carried the developer's address and now reads user@example.com, and `quota.raw.raw.behaviors` — Claude Code usage telemetry with no bearing on quota semantics — was dropped. Everything else, including the whole `rate_limits` tree, is verbatim.",
+  "adapter": {
+    "vendor": "claude",
+    "capabilities": {
+      "resume": true,
+      "steer": "mid-run",
+      "peerMesh": true,
+      "quota": true,
+      "stream": true
+    },
+    "binary": "claude",
+    "binaryPath": "/Users/tester/.nvm/versions/node/v20.19.2/bin/claude",
+    "installed": true
+  },
+  "authStatus": {
+    "loggedIn": true,
+    "mode": "subscription",
+    "detail": "user@example.com"
+  },
+  "models": [
+    {
+      "id": "claude-opus-4-8",
+      "latencyClass": "slow"
+    },
+    {
+      "id": "claude-sonnet-5",
+      "latencyClass": "fast"
+    },
+    {
+      "id": "claude-haiku-4-5",
+      "latencyClass": "fast"
+    },
+    {
+      "id": "claude-fable-5",
+      "latencyClass": "slow"
+    }
+  ],
+  "quota": {
+    "vendor": "claude",
+    "windows": [
+      {
+        "label": "Session (5hr)",
+        "usedPercent": 14,
+        "resetAt": "2026-09-07T12:19:59.555281+00:00"
+      },
+      {
+        "label": "Weekly (7 day)",
+        "usedPercent": 11,
+        "resetAt": "2026-09-13T21:59:59.555304+00:00"
+      },
+      {
+        "label": "Weekly (model-scoped)",
+        "usedPercent": 5,
+        "resetAt": "2026-09-13T21:59:59.555526+00:00"
+      }
+    ],
+    "allowed": true,
+    "raw": {
+      "available": true,
+      "subscriptionType": "max",
+      "windows": [
+        {
+          "kind": "session",
+          "percent": 14,
+          "severity": "normal",
+          "resetsAt": "2026-09-07T12:19:59.555281+00:00"
+        },
+        {
+          "kind": "weekly_all",
+          "percent": 11,
+          "severity": "normal",
+          "resetsAt": "2026-09-13T21:59:59.555304+00:00"
+        },
+        {
+          "kind": "weekly_scoped",
+          "percent": 5,
+          "severity": "normal",
+          "resetsAt": "2026-09-13T21:59:59.555526+00:00"
+        }
+      ],
+      "sessionCostUsd": 0,
+      "extraUsage": {
+        "enabled": true,
+        "percent": null,
+        "used": 0,
+        "cap": 50,
+        "currency": "USD"
+      },
+      "fetchedAt": 1788770315329,
+      "raw": {
+        "session": {
+          "total_cost_usd": 0,
+          "total_api_duration_ms": 0,
+          "total_duration_ms": 2484,
+          "total_lines_added": 0,
+          "total_lines_removed": 0,
+          "model_usage": {}
+        },
+        "subscription_type": "max",
+        "rate_limits_available": true,
+        "rate_limits": {
+          "five_hour": {
+            "utilization": 14,
+            "resets_at": "2026-09-07T12:19:59.555281+00:00",
+            "limit_dollars": null,
+            "used_dollars": null,
+            "remaining_dollars": null,
+            "locked_reason": null
+          },
+          "seven_day": {
+            "utilization": 11,
+            "resets_at": "2026-09-13T21:59:59.555304+00:00",
+            "limit_dollars": null,
+            "used_dollars": null,
+            "remaining_dollars": null,
+            "locked_reason": null
+          },
+          "seven_day_oauth_apps": null,
+          "seven_day_opus": null,
+          "seven_day_sonnet": null,
+          "seven_day_cowork": null,
+          "seven_day_omelette": null,
+          "tangelo": null,
+          "iguana_necktie": null,
+          "omelette_promotional": null,
+          "nimbus_quill": {
+            "utilization": 0,
+            "resets_at": null,
+            "limit_dollars": null,
+            "used_dollars": null,
+            "remaining_dollars": null,
+            "locked_reason": null
+          },
+          "cinder_cove": null,
+          "copper_kite": null,
+          "amber_ladder": null,
+          "juniper_tide": null,
+          "extra_usage": {
+            "is_enabled": true,
+            "monthly_limit": 5000,
+            "used_credits": 0,
+            "utilization": null,
+            "currency": "USD",
+            "decimal_places": 2,
+            "disabled_reason": null,
+            "user_disabled": false,
+            "spend_limit_reached": false,
+            "credits_ever_enabled": true,
+            "daily": null,
+            "weekly": null
+          },
+          "limits": [
+            {
+              "kind": "session",
+              "group": "session",
+              "percent": 14,
+              "severity": "normal",
+              "resets_at": "2026-09-07T12:19:59.555281+00:00",
+              "scope": null,
+              "is_active": true
+            },
+            {
+              "kind": "weekly_all",
+              "group": "weekly",
+              "percent": 11,
+              "severity": "normal",
+              "resets_at": "2026-09-13T21:59:59.555304+00:00",
+              "scope": null,
+              "is_active": false
+            },
+            {
+              "kind": "weekly_scoped",
+              "group": "weekly",
+              "percent": 5,
+              "severity": "normal",
+              "resets_at": "2026-09-13T21:59:59.555526+00:00",
+              "scope": {
+                "model": {
+                  "id": null,
+                  "display_name": "Fable"
+                },
+                "surface": null
+              },
+              "is_active": false
+            }
+          ],
+          "spend": {
+            "used": {
+              "amount_minor": 0,
+              "currency": "USD",
+              "exponent": 2
+            },
+            "limit": {
+              "amount_minor": 5000,
+              "currency": "USD",
+              "exponent": 2
+            },
+            "percent": 0,
+            "severity": "normal",
+            "enabled": true,
+            "disabled_reason": null,
+            "cap": {
+              "money": null,
+              "credits": {
+                "amount_minor": 5000,
+                "exponent": 2
+              }
+            },
+            "balance": null,
+            "auto_reload": null,
+            "disclaimer": "Usage credits cover you when you hit your plan limits. [Learn more](https://support.claude.com/articles/12429409)",
+            "can_purchase_credits": false,
+            "can_toggle": false
+          },
+          "member_dashboard_available": false,
+          "model_scoped": [
+            {
+              "display_name": "Fable",
+              "utilization": 5,
+              "resets_at": "2026-09-13T21:59:59.555526+00:00"
+            }
+          ]
+        }
+      }
+    },
+    "capturedAt": "2026-09-07T08:38:35.329Z"
+  },
+  "runResult": {
+    "vendor": "claude",
+    "conversationId": "f755bc6f-0e63-4976-82c9-9a38d687e9df",
+    "text": "OK",
+    "status": "ok",
+    "usage": {
+      "inputTokens": 2,
+      "outputTokens": 4,
+      "cachedInputTokens": 10123,
+      "totalTokens": 6
+    },
+    "raw": {
+      "duration_api_ms": 4109,
+      "stop_reason": "end_turn",
+      "session_id": "f755bc6f-0e63-4976-82c9-9a38d687e9df",
+      "total_cost_usd": 0.14380275,
+      "usage": {
+        "input_tokens": 2,
+        "cache_creation_input_tokens": 7005,
+        "cache_read_input_tokens": 10123,
+        "output_tokens": 4,
+        "output_tokens_details": {
+          "thinking_tokens": 0
+        },
+        "server_tool_use": {
+          "web_search_requests": 0,
+          "web_fetch_requests": 0
+        },
+        "service_tier": "standard",
+        "cache_creation": {
+          "ephemeral_1h_input_tokens": 7005,
+          "ephemeral_5m_input_tokens": 0
+        },
+        "inference_geo": "not_available",
+        "iterations": [
+          {
+            "input_tokens": 2,
+            "output_tokens": 4,
+            "cache_read_input_tokens": 10123,
+            "cache_creation_input_tokens": 7005,
+            "cache_creation": {
+              "ephemeral_5m_input_tokens": 0,
+              "ephemeral_1h_input_tokens": 7005
+            },
+            "type": "message"
+          }
+        ],
+        "speed": "standard"
+      },
+      "modelUsage": {
+        "claude-haiku-4-5-20251001": {
+          "inputTokens": 897,
+          "outputTokens": 11,
+          "cacheReadInputTokens": 0,
+          "cacheCreationInputTokens": 0,
+          "webSearchRequests": 0,
+          "costUSD": 0.000952,
+          "contextWindow": 200000,
+          "maxOutputTokens": 32000,
+          "thinkingTokens": 0,
+          "canonicalModel": "claude-haiku-4-5",
+          "provider": "firstParty",
+          "costBasis": "list"
+        },
+        "claude-fable-5-1": {
+          "inputTokens": 2,
+          "outputTokens": 4,
+          "cacheReadInputTokens": 10123,
+          "cacheCreationInputTokens": 7005,
+          "webSearchRequests": 0,
+          "costUSD": 0.14285075,
+          "contextWindow": 1000000,
+          "maxOutputTokens": 64000,
+          "thinkingTokens": 0,
+          "canonicalModel": "claude-fable-5-1",
+          "provider": "firstParty",
+          "costBasis": "list"
+        }
+      },
+      "permission_denials": [],
+      "terminal_reason": "completed",
+      "fast_mode_state": "off",
+      "fast_mode_disabled_reason": "sdk_opt_in_required",
+      "subagent_stats": {
+        "spawned": 0,
+        "requested": {
+          "background": 0,
+          "foreground": 0,
+          "unset": 0
+        },
+        "started_in_background": 0,
+        "max_depth": 0,
+        "spawned_by_subagents": 0,
+        "completed": 0,
+        "failed": 0,
+        "killed": {
+          "parent": 0,
+          "user": 0,
+          "system": 0
+        },
+        "refused": {
+          "depth_limit": 0,
+          "concurrency_limit": 0,
+          "budget": 0
+        },
+        "by_type": {}
+      },
+      "is_error": false,
+      "num_turns": 1,
+      "subtype": "success",
+      "api_error_status": null,
+      "result": "OK",
+      "ttft_ms": 3216,
+      "type": "result",
+      "duration_ms": 3256,
+      "uuid": "5ea3ae14-b38c-4d42-9519-e00db39254d8",
+      "ttft_stream_ms": 2299,
+      "time_to_request_ms": 20,
+      "first_content_frame_ms": 2299,
+      "queued_turn_count": 0
+    }
+  },
+  "streamEvents": [
+    {
+      "type": "text",
+      "text": "OK"
+    },
+    {
+      "type": "usage",
+      "usage": {
+        "inputTokens": 2,
+        "outputTokens": 4,
+        "cachedInputTokens": 13696,
+        "totalTokens": 6
+      }
+    },
+    {
+      "type": "done",
+      "result": {
+        "vendor": "claude",
+        "conversationId": "6a6e56e1-60d4-479a-aa89-6db18dfa4a8f",
+        "text": "OK",
+        "status": "ok",
+        "model": "claude-fable-5-1",
+        "usage": {
+          "inputTokens": 2,
+          "outputTokens": 4,
+          "cachedInputTokens": 13696,
+          "totalTokens": 6
+        },
+        "raw": {
+          "duration_api_ms": 3511,
+          "stop_reason": "end_turn",
+          "session_id": "6a6e56e1-60d4-479a-aa89-6db18dfa4a8f",
+          "total_cost_usd": 0.07687599999999999,
+          "usage": {
+            "input_tokens": 2,
+            "cache_creation_input_tokens": 3614,
+            "cache_read_input_tokens": 13696,
+            "output_tokens": 4,
+            "output_tokens_details": {
+              "thinking_tokens": 0
+            },
+            "server_tool_use": {
+              "web_search_requests": 0,
+              "web_fetch_requests": 0
+            },
+            "service_tier": "standard",
+            "cache_creation": {
+              "ephemeral_1h_input_tokens": 3614,
+              "ephemeral_5m_input_tokens": 0
+            },
+            "inference_geo": "not_available",
+            "iterations": [
+              {
+                "input_tokens": 2,
+                "output_tokens": 4,
+                "cache_read_input_tokens": 13696,
+                "cache_creation_input_tokens": 3614,
+                "cache_creation": {
+                  "ephemeral_5m_input_tokens": 0,
+                  "ephemeral_1h_input_tokens": 3614
+                },
+                "type": "message"
+              }
+            ],
+            "speed": "standard"
+          },
+          "modelUsage": {
+            "claude-haiku-4-5-20251001": {
+              "inputTokens": 897,
+              "outputTokens": 11,
+              "cacheReadInputTokens": 0,
+              "cacheCreationInputTokens": 0,
+              "webSearchRequests": 0,
+              "costUSD": 0.000952,
+              "contextWindow": 200000,
+              "maxOutputTokens": 32000,
+              "thinkingTokens": 0,
+              "canonicalModel": "claude-haiku-4-5",
+              "provider": "firstParty",
+              "costBasis": "list"
+            },
+            "claude-fable-5-1": {
+              "inputTokens": 2,
+              "outputTokens": 4,
+              "cacheReadInputTokens": 13696,
+              "cacheCreationInputTokens": 3614,
+              "webSearchRequests": 0,
+              "costUSD": 0.07592399999999999,
+              "contextWindow": 1000000,
+              "maxOutputTokens": 64000,
+              "thinkingTokens": 0,
+              "canonicalModel": "claude-fable-5-1",
+              "provider": "firstParty",
+              "costBasis": "list"
+            }
+          },
+          "permission_denials": [],
+          "terminal_reason": "completed",
+          "fast_mode_state": "off",
+          "fast_mode_disabled_reason": "sdk_opt_in_required",
+          "subagent_stats": {
+            "spawned": 0,
+            "requested": {
+              "background": 0,
+              "foreground": 0,
+              "unset": 0
+            },
+            "started_in_background": 0,
+            "max_depth": 0,
+            "spawned_by_subagents": 0,
+            "completed": 0,
+            "failed": 0,
+            "killed": {
+              "parent": 0,
+              "user": 0,
+              "system": 0
+            },
+            "refused": {
+              "depth_limit": 0,
+              "concurrency_limit": 0,
+              "budget": 0
+            },
+            "by_type": {}
+          },
+          "is_error": false,
+          "num_turns": 1,
+          "subtype": "success",
+          "api_error_status": null,
+          "result": "OK",
+          "ttft_ms": 2603,
+          "type": "result",
+          "duration_ms": 2642,
+          "uuid": "4a2318f5-9da4-4fb0-8ae8-eaf3d08e4d3f",
+          "ttft_stream_ms": 1658,
+          "time_to_request_ms": 31,
+          "first_content_frame_ms": 1667,
+          "queued_turn_count": 0
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,108 @@
+{
+  "_source": "adapter / authStatus / models captured live on 2026-09-07 from the real sidecar (`agy` is installed but not logged in on this machine, so `loggedIn` is false — the honest live answer). `runResult` is synthesized to the shape `GeminiAdapter` builds (packages/gemini/src/adapter.ts) because a run needs a login this machine does not have.",
+  "adapter": {
+    "vendor": "gemini",
+    "capabilities": {
+      "resume": true,
+      "steer": "turn",
+      "peerMesh": false,
+      "quota": false,
+      "stream": true
+    },
+    "binary": "agy",
+    "binaryPath": "/Users/tester/.local/bin/agy",
+    "installed": true
+  },
+  "authStatus": {
+    "loggedIn": false
+  },
+  "models": [
+    {
+      "id": "gemini-3.6-flash-high",
+      "latencyClass": "fast"
+    },
+    {
+      "id": "gemini-3.6-flash-medium",
+      "latencyClass": "fast"
+    },
+    {
+      "id": "gemini-3.6-flash-low",
+      "latencyClass": "fast"
+    },
+    {
+      "id": "gemini-3.5-flash-high",
+      "latencyClass": "fast"
+    },
+    {
+      "id": "gemini-3.5-flash-medium",
+      "latencyClass": "fast"
+    },
+    {
+      "id": "gemini-3.5-flash-low",
+      "latencyClass": "fast"
+    },
+    {
+      "id": "gemini-3.1-pro-high",
+      "latencyClass": "slow"
+    },
+    {
+      "id": "gemini-3.1-pro-low",
+      "latencyClass": "slow"
+    },
+    {
+      "id": "claude-sonnet-4-6",
+      "label": "Claude Sonnet 4.6 (resold — selecting it spends Anthropic quota, not Gemini's)",
+      "latencyClass": "fast"
+    },
+    {
+      "id": "claude-opus-4-6-thinking",
+      "label": "Claude Opus 4.6 Thinking (resold — selecting it spends Anthropic quota, not Gemini's)",
+      "latencyClass": "slow"
+    },
+    {
+      "id": "gpt-oss-120b-medium",
+      "label": "GPT-OSS 120B (resold — selecting it spends the provider's quota, not Gemini's)",
+      "latencyClass": "fast"
+    }
+  ],
+  "quota": null,
+  "runResult": {
+    "vendor": "gemini",
+    "conversationId": "c1d2e3f4-5678-4abc-9def-0123456789ab",
+    "text": "OK",
+    "status": "ok",
+    "model": "gemini-3.6-flash-high",
+    "usage": {
+      "inputTokens": 12,
+      "outputTokens": 2,
+      "totalTokens": 14
+    },
+    "raw": {
+      "event": "turn_complete",
+      "conversation_id": "c1d2e3f4-5678-4abc-9def-0123456789ab"
+    }
+  },
+  "streamEvents": [
+    {
+      "type": "text",
+      "text": "OK"
+    },
+    {
+      "type": "usage",
+      "usage": {
+        "inputTokens": 12,
+        "outputTokens": 2,
+        "totalTokens": 14
+      }
+    },
+    {
+      "type": "done",
+      "result": {
+        "vendor": "gemini",
+        "conversationId": "c1d2e3f4-5678-4abc-9def-0123456789ab",
+        "text": "OK",
+        "status": "ok"
+      }
+    }
+  ]
+}

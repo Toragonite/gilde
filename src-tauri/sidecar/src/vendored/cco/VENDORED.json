@@ -1,0 +1,24 @@
+{
+  "what": "Claude Code Orchestrator host protocol + client + UI types, vendored byte-for-byte (team contract v2 §8; host-protocol.ts 'list_workers' structured answer RULES: a vendored copy records the commit it was copied from and is checked byte-identical to it). Never edit these copies: re-copy them and update the commit and the hashes. test/cco-vendor.mjs checks all three.",
+  "upstream": "Claude Code Orchestrator v2.0.0 (https://github.com/Toragonite/claude-code-orchestrator, tag v2.0.0)",
+  "commit": "3fcddfb7a8d6381c24c6100e4878ac923c85a191",
+  "previousCommit": "c0810beb34ad3aea874ccf119bc589ee64622c1e",
+  "copiedWith": "git -C <claude-code-orchestrator checkout> show <commit>:<from> > src/vendored/cco/<file> (each file redirected as is: no editor, no formatter, no line-ending change)",
+  "copiedOn": "2026-10-20",
+  "changedSincePrevious": "none: all three files are byte-identical at the previous commit and at the v2.0.0 release commit; re-pinned to the public release tag.",
+  "layout": "host-protocol.ts imports type-only from '../uiTypes' (its upstream place is src/mcp/, uiTypes.ts is src/). Here the copies sit side by side, so src/vendored/uiTypes.ts is a one-line type re-export of ./cco/uiTypes — not a vendored file, and erased at build time. uiTypes.ts carries one runtime value (RUN_LOGIN_FAILURE_DETAIL); whoever needs it imports it from ./cco/uiTypes directly (the frontend's src/workers/model.ts does), never through the type-only shim.",
+  "files": {
+    "host-protocol.ts": {
+      "from": "src/mcp/host-protocol.ts",
+      "sha256": "810871e1455fdd8fe876d854fc76d1fee2b05c9147ea81f289b2ee28d5edc647"
+    },
+    "host-client.ts": {
+      "from": "src/mcp/host-client.ts",
+      "sha256": "2432c11be658b39afdb4460ab824e34ac4a0bbd2d3bbb4572c34dd4ab563a6d0"
+    },
+    "uiTypes.ts": {
+      "from": "src/uiTypes.ts",
+      "sha256": "5fe786ff957f9f90109522797a34db9999e43202152e6d03d6cd42c742aa14cb"
+    }
+  }
+}

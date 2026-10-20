@@ -1,0 +1,176 @@
+{
+  "rev": 3,
+  "teamId": "tmabcdefghi1",
+  "view": {
+    "teamId": "tmabcdefghi1",
+    "rev": 3,
+    "source": "host",
+    "live": true,
+    "state": {
+      "v": 1,
+      "id": "tmabcdefghi1",
+      "name": "demo",
+      "title": "Demo team",
+      "status": "active",
+      "workspace": "/private/tmp/gcco-PIZEoo/proj",
+      "repoRoot": "/private/tmp/gcco-PIZEoo/proj",
+      "leadRel": "",
+      "baseCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "createdAt": 1792126699473,
+      "seq": 10,
+      "owner": {
+        "hostPid": 14645,
+        "hostStartedAt": 1792126639473,
+        "session": {
+          "pid": 424242,
+          "startedAt": 1792126629473
+        }
+      },
+      "lead": {
+        "unread": 0,
+        "readSeq": 0,
+        "waiter": true,
+        "lastCallAt": null,
+        "wakesToday": 0
+      },
+      "user": {
+        "unread": 0,
+        "readSeq": 0
+      },
+      "members": [
+        {
+          "name": "alice",
+          "index": 1,
+          "role": "alice role",
+          "state": "idle",
+          "provider": "claude",
+          "worker": "w1",
+          "accountLabel": "w1",
+          "machineLogin": false,
+          "sharesLeadPlan": false,
+          "billableOverage": false,
+          "runsCommands": true,
+          "model": "claude-opus-4-8",
+          "incarnation": 1,
+          "mailbox": "tools",
+          "portBase": 41000,
+          "worktree": {
+            "path": "/x/wt",
+            "branch": "cco/demo-hi1/alice",
+            "baseCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "ready": true
+          },
+          "turns": 0,
+          "tokens": {
+            "in": 0,
+            "out": 0
+          },
+          "costUsd": null,
+          "pending": 0,
+          "tasks": [],
+          "peerWakes": 0
+        },
+        {
+          "name": "bob",
+          "index": 1,
+          "role": "bob role",
+          "state": "blocked",
+          "provider": "claude",
+          "worker": "w1",
+          "accountLabel": "w1",
+          "machineLogin": false,
+          "sharesLeadPlan": false,
+          "billableOverage": false,
+          "runsCommands": true,
+          "model": "claude-opus-4-8",
+          "incarnation": 1,
+          "mailbox": "tools",
+          "portBase": 41000,
+          "worktree": {
+            "path": "/x/wt",
+            "branch": "cco/demo-hi1/bob",
+            "baseCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "ready": true
+          },
+          "turns": 0,
+          "tokens": {
+            "in": 0,
+            "out": 0
+          },
+          "costUsd": null,
+          "pending": 0,
+          "tasks": [],
+          "peerWakes": 0,
+          "reason": {
+            "code": "quota",
+            "text": "quota wall"
+          }
+        }
+      ],
+      "board": [
+        {
+          "id": "b1",
+          "title": "Write the parser",
+          "state": "claimed",
+          "paths": [
+            "src/parser.ts"
+          ],
+          "allowOverlap": false,
+          "createdBy": "lead",
+          "createdAt": 1792126709473,
+          "reports": [],
+          "commits": [],
+          "turns": [],
+          "updatedAt": 1792126719473,
+          "updatedBy": "alice",
+          "assignee": "alice"
+        }
+      ],
+      "budgets": {
+        "turnsToday": 3,
+        "turnsPerDay": 300,
+        "running": 0,
+        "maxRunning": 4,
+        "pingPongTripped": false
+      },
+      "totals": {
+        "turns": 3,
+        "inputTokens": 100,
+        "outputTokens": 50,
+        "costUsd": null
+      },
+      "warnings": [],
+      "goal": "Ship the thing"
+    },
+    "messages": [
+      {
+        "seq": 11,
+        "id": "m11",
+        "ts": 1792126760489,
+        "from": "alice",
+        "to": "lead",
+        "kind": "report",
+        "urgent": false,
+        "cut": false,
+        "bytes": 12,
+        "body": "done with b1"
+      }
+    ],
+    "activity": [
+      {
+        "member": "alice",
+        "lines": [
+          {
+            "ts": 1792126760489,
+            "turn": "t9",
+            "k": "tool",
+            "text": "Edit · src/a.ts"
+          }
+        ]
+      }
+    ],
+    "truncated": false,
+    "composedAt": 1792126760740,
+    "hostKey": "s424242"
+  }
+}

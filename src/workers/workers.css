@@ -1,0 +1,131 @@
+/*
+ * Worker accounts view styles (Gilde plan #3c).
+ *
+ * Same rules as team.css: every colour is a var(--token) from styles/tokens.css
+ * (scripts/lint-ui.sh), flat surfaces, 1px --border separators, 4/8/12px
+ * spacing, numbers and times in the mono stack. A tone always comes with words.
+ */
+
+.workers {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  background: var(--n1);
+}
+
+.workers-hdr {
+  flex: none;
+}
+
+.workers-refresh {
+  padding: 0 var(--sp-6);
+}
+
+.workers-preview {
+  flex: none;
+  padding: var(--sp-4) var(--sp-12);
+  border-bottom: 1px solid var(--border);
+}
+
+.workers-body {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.workers-note,
+.workers-guards {
+  padding: var(--sp-4) var(--sp-12);
+}
+
+.workers-status {
+  border-bottom: 1px solid var(--border);
+}
+
+.workers-banner {
+  padding: var(--sp-4) var(--sp-12);
+  overflow-wrap: anywhere;
+}
+
+.workers-banner[data-tone='warn'],
+.workers-tone[data-tone='warn'] {
+  color: var(--warn);
+}
+
+.workers-banner[data-tone='error'],
+.workers-tone[data-tone='error'] {
+  color: var(--error);
+}
+
+.workers-tone[data-tone='ok'] {
+  color: var(--ok);
+}
+
+.workers-detail {
+  overflow-wrap: anywhere;
+}
+
+.workers-section {
+  border-top: 1px solid var(--border);
+  padding-bottom: var(--sp-8);
+}
+
+.workers-section > .sec {
+  padding: 0 var(--sp-12);
+}
+
+.workers-account {
+  gap: var(--sp-2);
+  padding: var(--sp-6) var(--sp-12);
+  border-bottom: 1px solid var(--border);
+  color: var(--n11);
+  min-width: 0;
+}
+
+.workers-account-line,
+.workers-meta {
+  min-width: 0;
+}
+
+.workers-meta {
+  flex-wrap: wrap;
+}
+
+.workers-windows {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-2) 0;
+}
+
+.workers-windows[data-stale='true'] {
+  opacity: 0.6;
+}
+
+.workers-window {
+  min-width: 0;
+  align-items: center;
+}
+
+.workers-window-label {
+  width: 160px;
+  flex: none;
+}
+
+.workers-window-bar {
+  width: 120px;
+  flex: none;
+}
+
+.workers-window-pct {
+  width: 56px;
+  flex: none;
+  text-align: right;
+}
+
+.workers-unsupported {
+  margin: 0;
+  padding: 0 var(--sp-12);
+  list-style: none;
+}

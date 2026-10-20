@@ -1,0 +1,100 @@
+[package]
+name = "gilde-code"
+version = "0.1.0"
+description = "Desktop orchestrator for coding agent CLIs"
+authors = ["Toragonite"]
+license = "Apache-2.0"
+edition = "2021"
+# The highest `rust-version` any shipped dependency declares (sysinfo 0.39).
+# Builds are verified on the stable toolchain; see BUILDING.md.
+rust-version = "1.95"
+# `fake_agent` is a second [[bin]]; without this, `cargo run` (and therefore
+# `npm run tauri dev`) cannot decide which binary to launch.
+default-run = "gilde"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "gilde_code_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+# The app binary. The package is `gilde-code`; the shipped executable (and the
+# `mainBinaryName` in tauri.conf.json) is the short identifier `gilde`, so the
+# bundle is `Gilde Code.app/Contents/MacOS/gilde`.
+[[bin]]
+name = "gilde"
+path = "src/main.rs"
+
+# Test fixture binary (T06). `cargo test` builds it and exposes its path to
+# integration tests as CARGO_BIN_EXE_fake_agent. It is a deterministic stand-in
+# for a real agent CLI: see tests/fixtures/fake_agent/main.rs.
+#
+# It must never ship. cargo-tauri copies every `[[bin]]` of this package into
+# `Contents/MacOS/` *unless* the bin's `required-features` are missing from the
+# feature list `tauri build` was given — and that list never contains Cargo's
+# default features (only `--features` plus `tauri/custom-protocol`). So the
+# fixture sits behind `test-fixtures`, which is a default feature: plain
+# `cargo test` / `cargo build` still build it, the release bundle leaves it out.
+# BUILDING.md's proof run checks `Contents/MacOS/` for exactly this.
+[[bin]]
+name = "fake_agent"
+path = "tests/fixtures/fake_agent/main.rs"
+required-features = ["test-fixtures"]
+test = false
+bench = false
+doc = false
+
+[features]
+default = ["test-fixtures"]
+# Builds the `fake_agent` test fixture (above). No code and no dependencies.
+test-fixtures = []
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri-plugin-dialog = "2.7.3"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time", "fs", "signal"] }
+thiserror = "2.0.20"
+anyhow = "1.0.104"
+rusqlite = { version = "0.40.2", features = ["bundled", "functions"] }
+portable-pty = "0.9.0"
+sysinfo = "0.39.6"
+libproc = "0.14.11"
+libc = "0.2.189"
+nix = { version = "0.31.3", features = ["signal", "process", "term"] }
+notify = "8.2.0"
+notify-debouncer-full = "0.7.0"
+which = "8.0.6"
+regex = "1.13.1"
+base64 = "0.23.1"
+sha2 = "0.11.0"
+hex = "0.4.3"
+vte = "0.15.0"
+parking_lot = "0.12.5"
+dashmap = "6.2.1"
+shell-words = "1.1.1"
+tempfile = "3.27.0"
+uuid = { version = "1.26.0", features = ["v4", "v5", "v7", "serde"] }
+tracing = "0.1.44"
+tracing-appender = "0.2.5"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+
+
+# Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+strip = true
+
+[dev-dependencies]
+rusty-fork = "0.3.1"
+serial_test = "4.0.1"

@@ -1,0 +1,53 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Gilde Code",
+  "mainBinaryName": "gilde",
+  "version": "0.1.0",
+  "identifier": "com.toragonite.gildecode",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run check:version && npm run node:fetch && npm run sidecar:build && npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Gilde Code",
+        "center": true,
+        "width": 1280,
+        "height": 800,
+        "minWidth": 1024,
+        "minHeight": 640
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: asset: http://asset.localhost; font-src 'self' data:"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "copyright": "Copyright 2026 Toragonite",
+    "license": "Apache-2.0",
+    "externalBin": ["binaries/gilde-node"],
+    "macOS": {
+      "signingIdentity": "-",
+      "hardenedRuntime": false
+    },
+    "resources": {
+      "sidecar/sidecar.cjs": "sidecar/sidecar.cjs",
+      "binaries/node-LICENSE": "licenses/node-LICENSE",
+      "../LICENSE": "licenses/LICENSE",
+      "../NOTICE": "licenses/NOTICE",
+      "../THIRD_PARTY_NOTICES.md": "licenses/THIRD_PARTY_NOTICES.md"
+    }
+  }
+}

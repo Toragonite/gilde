@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <title>Gilde</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#26324a"/>
+      <stop offset="1" stop-color="#151c2c"/>
+    </linearGradient>
+  </defs>
+  <rect x="0" y="0" width="1024" height="1024" rx="224" ry="224" fill="url(#bg)"/>
+  <path d="M512 168 L800 272 L800 520 C800 700 676 818 512 872 C348 818 224 700 224 520 L224 272 Z"
+        fill="none" stroke="#e8b34a" stroke-width="56" stroke-linejoin="round"/>
+  <g stroke="#f3efe6" stroke-width="40" stroke-linecap="round">
+    <line x1="512" y1="372" x2="388" y2="596"/>
+    <line x1="512" y1="372" x2="636" y2="596"/>
+    <line x1="388" y1="596" x2="636" y2="596"/>
+  </g>
+  <g fill="#f3efe6">
+    <circle cx="512" cy="372" r="68"/>
+    <circle cx="388" cy="596" r="68"/>
+    <circle cx="636" cy="596" r="68"/>
+  </g>
+</svg>

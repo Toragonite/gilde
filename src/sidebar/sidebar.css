@@ -1,0 +1,447 @@
+/*
+ * Sidebar styles (T21).
+ *
+ * Every colour is a var(--token) from styles/tokens.css — this file adds no
+ * literal (scripts/lint-ui.sh fails on one). Structure, density and spacing come
+ * from docs/ui-mockups/Main.dc.html and Components.dc.html: 32 px header, 26 px
+ * tree rows, 12 px indent per level, two-line session rows, flat surfaces and
+ * 1 px borders.
+ *
+ * It lives next to the module instead of in styles/global.css because that file
+ * is owned by T05; nothing outside src/sidebar/ and src/dialogs/ imports it.
+ */
+
+.sb {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1 1 auto;
+}
+
+.sb-filter {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-6);
+  padding: var(--sp-6) var(--sp-8);
+  border-bottom: 1px solid var(--border);
+}
+
+.sb-filter input {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 24px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--n0);
+  color: var(--n11);
+  padding: 0 var(--sp-8);
+  font-size: var(--fs-sub);
+}
+
+/* -- inline refusal line --------------------------------------------------- */
+
+.sb-error {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-8);
+  padding: var(--sp-8) var(--sp-12);
+  border-bottom: 1px solid var(--border);
+  color: var(--error);
+  font-size: var(--fs-sub);
+  line-height: 1.45;
+}
+
+.sb-error .sb-error-text {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* -- the tree -------------------------------------------------------------- */
+
+.sb-tree {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: var(--sp-6) 0;
+}
+
+.sb-viewport {
+  position: relative;
+  width: 100%;
+}
+
+.sb-slot {
+  position: absolute;
+  left: 0;
+  right: 0;
+}
+
+.sb-indent {
+  flex: none;
+}
+
+/* Project / worktree / orphan rows reuse the shell's 26 px `.tree-row`. */
+
+.sb-caret {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  flex: none;
+  border: 0;
+  background: transparent;
+  color: var(--n7);
+  padding: 0;
+  cursor: default;
+}
+
+.sb-caret:hover {
+  color: var(--n11);
+}
+
+.sb-project {
+  color: var(--n9);
+  font-size: var(--fs-sub);
+}
+
+.sb-project .sb-name {
+  color: var(--n11);
+  font-weight: 500;
+}
+
+.sb-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  /* Never shrink: the row's flexible element is the name, nothing else. */
+  flex: none;
+  opacity: 0;
+}
+
+.tree-row:hover .sb-actions,
+.tree-row:focus-within .sb-actions {
+  opacity: 1;
+}
+
+.sb-iconbtn {
+  width: 20px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--n8);
+  padding: 0;
+  cursor: default;
+}
+
+.sb-iconbtn:hover:not(:disabled) {
+  background: var(--n4);
+  color: var(--n11);
+}
+
+.sb-iconbtn:disabled {
+  opacity: 0.45;
+}
+
+.sb-sec-btn {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  cursor: default;
+}
+
+.sb-sec-btn:hover {
+  color: var(--n11);
+}
+
+/* -- worktree row: the name owns the line (BACKLOG 7) ---------------------- */
+
+/*
+ * The numbers must never push the name out of view: the name takes every pixel
+ * the row has left and ellipsises, everything after it is `flex: none`. The
+ * facts that no longer fit (branch, dirty count, ahead, sessions, lock,
+ * unmerged) are the row's `title`, exactly as the mockup's 26 px row does.
+ */
+.sb-wt-icon {
+  flex: none;
+  color: var(--n8);
+}
+
+.sb-wt-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--n11);
+}
+
+.tree-row[aria-selected='true'] .sb-wt-name {
+  color: var(--n12);
+}
+
+/* -- session row: two lines, 42 px ---------------------------------------- */
+
+.sb-session {
+  height: 42px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 1px;
+  padding: var(--sp-4) var(--sp-8);
+  border-radius: var(--r-sm);
+  cursor: default;
+}
+
+.sb-session:hover {
+  background: var(--n3);
+}
+
+.sb-session[aria-selected='true'] {
+  background: var(--n4);
+}
+
+.sb-session[aria-selected='true'] .sb-session-title {
+  color: var(--n12);
+}
+
+.sb-session-line {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-8);
+  min-width: 0;
+  height: 18px;
+}
+
+.sb-session-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-6);
+  min-width: 0;
+  height: 16px;
+  color: var(--n8);
+  font-size: var(--fs-sub);
+}
+
+.sb-session-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--n11);
+}
+
+/* BACKLOG 6: `종료됨 · 호스트 비정상 종료` is longer than any other status
+   word, so it truncates instead of pushing the elapsed time and the RSS off
+   the row — the same rule the worktree name gets (BACKLOG 7). */
+.sb-session-meta .sb-state {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sb-session-meta .sb-state[data-tone='warn'] {
+  color: var(--warn);
+}
+
+.sb-session-meta .sb-state[data-tone='error'] {
+  color: var(--error);
+}
+
+.sb-session-meta .sb-state[data-tone='ok'] {
+  color: var(--ok);
+}
+
+/* -- worktree numbers ------------------------------------------------------ */
+
+.sb-stat {
+  color: var(--n8);
+  flex: none;
+}
+
+.sb-stat[data-tone='warn'] {
+  color: var(--warn);
+}
+
+.sb-stat[data-tone='error'] {
+  color: var(--error);
+}
+
+.sb-stat[data-tone='ok'] {
+  color: var(--ok);
+}
+
+/* -- dialogs --------------------------------------------------------------- */
+
+.sb-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-12);
+}
+
+.sb-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+}
+
+.sb-field > .sb-label {
+  color: var(--n8);
+  font-size: var(--fs-label);
+}
+
+.sb-preview {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-8);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--n0);
+}
+
+.sb-preview .sb-preview-row {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-8);
+  min-width: 0;
+}
+
+.sb-preview .sb-preview-key {
+  flex: none;
+  width: 72px;
+  color: var(--n8);
+  font-size: var(--fs-label);
+}
+
+.sb-preview .sb-preview-val {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--n11);
+}
+
+.sb-check {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-6);
+  font-size: var(--fs-sub);
+  color: var(--n11);
+}
+
+.sb-check input {
+  accent-color: var(--n9);
+  margin: 0;
+}
+
+.sb-issue {
+  color: var(--error);
+  font-size: var(--fs-sub);
+}
+
+.sb-hint {
+  color: var(--n8);
+  font-size: var(--fs-label);
+}
+
+/* -- removal card ---------------------------------------------------------- */
+
+.sb-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-8);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--n0);
+  padding: var(--sp-12);
+}
+
+.sb-facts {
+  display: grid;
+  grid-template-columns: 112px 1fr;
+  gap: var(--sp-4) var(--sp-8);
+  font-size: var(--fs-sub);
+}
+
+.sb-facts .contents {
+  display: contents;
+}
+
+.sb-facts .sb-fact-k {
+  color: var(--n8);
+}
+
+.sb-facts .sb-fact-v {
+  color: var(--n11);
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.sb-facts .sb-fact-v[data-tone='warn'] {
+  color: var(--warn);
+}
+
+.sb-facts .sb-fact-v[data-tone='error'] {
+  color: var(--error);
+}
+
+.sb-modes {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-6);
+}
+
+.sb-mode {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-8);
+  padding: var(--sp-8);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--n0);
+  color: var(--n11);
+  text-align: left;
+  font-size: var(--fs-sub);
+  cursor: default;
+}
+
+.sb-mode:hover:not(:disabled) {
+  background: var(--n3);
+}
+
+.sb-mode[aria-pressed='true'] {
+  background: var(--n4);
+  border-color: var(--n6);
+}
+
+.sb-mode:disabled {
+  opacity: 0.45;
+}
+
+.sb-mode .sb-mode-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+
+.sb-mode .sb-mode-name {
+  color: var(--n12);
+  font-weight: 500;
+}
+
+.sb-mode .sb-mode-why {
+  color: var(--n8);
+  font-size: var(--fs-label);
+  line-height: 1.45;
+}

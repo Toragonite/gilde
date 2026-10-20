@@ -1,0 +1,205 @@
+/*
+ * Design tokens — the ONLY file in src/ allowed to contain colour literals.
+ * Values are copied verbatim from docs/UI-GUIDELINES.md §2-1a (v2, pure
+ * greyscale) and docs/ui-mockups/shared.css.
+ *
+ * Shape (DESIGN §9-10 + UI-GUIDELINES §2-1):
+ *   - one neutral scale  --n0 … --n12
+ *   - one accent         --accent           (focus ring, links, text cursor only)
+ *   - four semantic      --ok --warn --error --info
+ *   - one border, one popover shadow, two radii
+ *
+ * Theme resolution:
+ *   :root                                  → complete light palette
+ *   @media (prefers-color-scheme: dark)    → dark, unless the user forced light
+ *   :root[data-theme="dark"|"light"]       → explicit override wins both ways
+ *
+ * Components never know which theme is active; they only read var(--…).
+ */
+
+:root {
+  /* -- neutral scale (light) ------------------------------------------- */
+  --n0: #ffffff;
+  --n1: #fafafa;
+  --n2: #f4f4f4;
+  --n3: #ececec;
+  --n4: #e2e2e2;
+  --n5: #d4d4d4;
+  --n6: #b3b3b3;
+  --n7: #8a8a8a;
+  --n8: #6b6b6b;
+  --n9: #525252;
+  --n10: #3a3a3a;
+  --n11: #1f1f1f;
+  --n12: #0a0a0a;
+
+  /* -- primary / accent ------------------------------------------------ */
+  --primary: #0a0a0a;
+  --on-primary: #ffffff;
+  --accent: #1f6feb;
+
+  /* -- semantic (exactly four) ----------------------------------------- */
+  --ok: #1a7f37;
+  --warn: #9a6700;
+  --error: #cf222e;
+  --info: #6b6b6b;
+
+  /* -- surfaces -------------------------------------------------------- */
+  --border: rgba(0, 0, 0, 0.1);
+  --shadow-popover: 0 8px 24px rgba(0, 0, 0, 0.12);
+
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --n0: #0f0f0f;
+    --n1: #141414;
+    --n2: #1a1a1a;
+    --n3: #202020;
+    --n4: #262626;
+    --n5: #2e2e2e;
+    --n6: #3d3d3d;
+    --n7: #525252;
+    --n8: #8a8a8a;
+    --n9: #a3a3a3;
+    --n10: #bdbdbd;
+    --n11: #d4d4d4;
+    --n12: #ededed;
+
+    --primary: #ededed;
+    --on-primary: #0f0f0f;
+    --accent: #4c8dff;
+
+    --ok: #3fb950;
+    --warn: #d29922;
+    --error: #f47067;
+    --info: #8a8a8a;
+
+    --border: rgba(255, 255, 255, 0.08);
+    --shadow-popover: 0 8px 24px rgba(0, 0, 0, 0.5);
+
+    color-scheme: dark;
+  }
+}
+
+:root[data-theme="dark"] {
+  --n0: #0f0f0f;
+  --n1: #141414;
+  --n2: #1a1a1a;
+  --n3: #202020;
+  --n4: #262626;
+  --n5: #2e2e2e;
+  --n6: #3d3d3d;
+  --n7: #525252;
+  --n8: #8a8a8a;
+  --n9: #a3a3a3;
+  --n10: #bdbdbd;
+  --n11: #d4d4d4;
+  --n12: #ededed;
+
+  --primary: #ededed;
+  --on-primary: #0f0f0f;
+  --accent: #4c8dff;
+
+  --ok: #3fb950;
+  --warn: #d29922;
+  --error: #f47067;
+  --info: #8a8a8a;
+
+  --border: rgba(255, 255, 255, 0.08);
+  --shadow-popover: 0 8px 24px rgba(0, 0, 0, 0.5);
+
+  color-scheme: dark;
+}
+
+:root[data-theme="light"] {
+  --n0: #ffffff;
+  --n1: #fafafa;
+  --n2: #f4f4f4;
+  --n3: #ececec;
+  --n4: #e2e2e2;
+  --n5: #d4d4d4;
+  --n6: #b3b3b3;
+  --n7: #8a8a8a;
+  --n8: #6b6b6b;
+  --n9: #525252;
+  --n10: #3a3a3a;
+  --n11: #1f1f1f;
+  --n12: #0a0a0a;
+
+  --primary: #0a0a0a;
+  --on-primary: #ffffff;
+  --accent: #1f6feb;
+
+  --ok: #1a7f37;
+  --warn: #9a6700;
+  --error: #cf222e;
+  --info: #6b6b6b;
+
+  --border: rgba(0, 0, 0, 0.1);
+  --shadow-popover: 0 8px 24px rgba(0, 0, 0, 0.12);
+
+  color-scheme: light;
+}
+
+/*
+ * Status tokens (DESIGN §9-6). These are ALIASES onto the four semantic
+ * colours plus the neutral scale — UI-GUIDELINES §2-1a forbids inventing a
+ * colour per status. One name per status so the graph, the sidebar dots, the
+ * tab pills and the monitor chips cannot drift apart.
+ */
+:root {
+  --st-idle: var(--info);
+  --st-working: var(--n12);
+  --st-waiting: var(--warn);
+  --st-stalled: var(--warn);
+  --st-error: var(--error);
+  --st-done: var(--ok);
+  --st-orphan: var(--error);
+  --st-exited: var(--info);
+  --st-detached: var(--info);
+  --st-clean: var(--ok);
+  --st-dirty: var(--warn);
+  --st-ok: var(--ok);
+
+  /* -- typography ------------------------------------------------------ */
+  --sans: -apple-system, 'SF Pro Text', 'Helvetica Neue', 'Apple SD Gothic Neo', system-ui,
+    sans-serif;
+  --mono: 'SF Mono', 'JetBrains Mono', Menlo, monospace;
+  --fs-body: 13px;
+  --fs-sub: 12px;
+  --fs-label: 11px;
+  --lh-body: 1.45;
+
+  /* -- radii (exactly two) --------------------------------------------- */
+  --r-sm: 4px;
+  --r-md: 6px;
+
+  /* -- spacing scale (4/8/12/16/24/32 + 2/6 for component internals) ---- */
+  --sp-2: 2px;
+  --sp-4: 4px;
+  --sp-6: 6px;
+  --sp-8: 8px;
+  --sp-12: 12px;
+  --sp-16: 16px;
+  --sp-24: 24px;
+  --sp-32: 32px;
+
+  /* -- fixed shell metrics --------------------------------------------- */
+  --rail-w: 48px;
+  --titlebar-h: 32px;
+  --hdr-h: 32px;
+  --tab-h: 32px;
+  --row-h: 26px;
+  --statusbar-h: 24px;
+  --sidebar-min: 260px;
+  --sidebar-max: 420px;
+  --inspector-min: 300px;
+  --inspector-max: 480px;
+
+  /* -- motion (UI-GUIDELINES §2-5: 120–160ms, ease-out, no springs) ----- */
+  --motion-fast: 120ms;
+  --motion-base: 160ms;
+  --easing: ease-out;
+}

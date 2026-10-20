@@ -1,0 +1,18 @@
+Gilde Code
+Copyright 2026 Toragonite
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product includes software developed by third parties. A built Gilde Code
+application bundles:
+
+  * the Node.js runtime (MIT, with the notices of the components Node.js links
+    statically), whose LICENSE ships in the application at
+    Contents/Resources/licenses/node-LICENSE;
+  * the npm packages compiled into the user interface and into the Node sidecar,
+    and the Rust crates compiled into the application binary, each listed with
+    its license in THIRD_PARTY_NOTICES.md (also shipped at
+    Contents/Resources/licenses/THIRD_PARTY_NOTICES.md).
+
+src-tauri/sidecar/src/vendored/cco/ contains files copied unmodified from
+Claude Code Orchestrator (MIT, Copyright Toragonite).

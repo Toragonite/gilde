@@ -1,0 +1,36 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# gilde-code
+src-tauri/sidecar/node_modules
+src-tauri/sidecar/dist
+src-tauri/binaries
+*.log
+
+# Build artifacts. `bundle.resources` in tauri.conf.json forces these to exist
+# before `cargo build`, so they are produced by
+# `cd src-tauri/sidecar && npm ci && npm run build`, never committed.
+src-tauri/sidecar/sidecar.cjs
+src-tauri/sidecar/sidecar.cjs.map

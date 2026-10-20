@@ -1,0 +1,114 @@
+{
+  "$comment": "Bundled defaults for agent-signatures.json (DESIGN §6-4). Seeded into <app-data>/agent-signatures.json on first run; your edits there are merged over these per agent key and hot-reloaded within ~2s. Patterns are Rust `regex` crate syntax, matched against one visible (ANSI-stripped) line of terminal output. A pattern that fails to compile is skipped with a warning and never disables the rest. Precedence is by CLASS, not by line: the whole visible tail is searched for a `waiting` match, then for `working`, then for `idle` (DESIGN §6-4), so a broad `idle` pattern that also matches a line still on screen during a turn is safe. Verified against captured streams in src-tauri/tests/fixtures/streams (claude 2.1.263, codex 0.145.0, 2026-09-07).",
+  "version": 1,
+  "agents": {
+    "claude": {
+      "idleAfterMs": 1200,
+      "working": [
+        "\\(esc to interrupt\\)",
+        "\\besc to interrupt\\b"
+      ],
+      "waiting": [
+        "Do you want to (proceed|make this edit|create)",
+        "^\\s*❯?\\s*1\\.\\s*Yes",
+        "\\[y/N\\]",
+        "\\(y/n\\)",
+        "Press Enter to continue",
+        "Enter to confirm"
+      ],
+      "idle": [
+        "^\\s*│?\\s*>\\s*│?\\s*$",
+        "^\\s*❯\\s*$",
+        "^\\s*❯\\s+Try [\"“]",
+        "⏵⏵ .*mode on"
+      ]
+    },
+    "codex": {
+      "idleAfterMs": 1200,
+      "working": [
+        "Esc to interrupt",
+        "(?i)esc to interrupt",
+        "^\\s*·\\s*Working"
+      ],
+      "waiting": [
+        "Allow command\\?",
+        "\\[y/n\\]",
+        "Approve",
+        "Press enter to continue",
+        "^\\s*›?\\s*1\\.\\s*Yes"
+      ],
+      "idle": [
+        "^\\s*›\\s*$",
+        "^\\s*▌\\s*$",
+        "^\\s*›\\s+\\S"
+      ]
+    },
+    "agy": {
+      "idleAfterMs": 1200,
+      "working": [
+        "thinking",
+        "running"
+      ],
+      "waiting": [
+        "\\[y/N\\]"
+      ],
+      "idle": [
+        "^\\s*>\\s*$"
+      ]
+    },
+    "cursor": {
+      "idleAfterMs": 1200,
+      "working": [
+        "Ctrl\\+C to interrupt"
+      ],
+      "waiting": [
+        "\\[y/N\\]"
+      ],
+      "idle": [
+        "^\\s*>\\s*$"
+      ]
+    },
+    "gemini": {
+      "idleAfterMs": 1200,
+      "working": [
+        "esc to cancel",
+        "(?i)\\bthinking\\b"
+      ],
+      "waiting": [
+        "\\[y/N\\]",
+        "\\(y/n\\)",
+        "Allow execution"
+      ],
+      "idle": [
+        "^\\s*>\\s*$"
+      ]
+    },
+    "shell": {
+      "idleAfterMs": 400,
+      "working": [],
+      "waiting": [],
+      "idle": [
+        "\\$\\s*$",
+        "%\\s*$",
+        "#\\s*$"
+      ]
+    }
+  },
+  "monitorPatterns": {
+    "agent": [
+      "(?:^|\\s)(?:\\S*/)?(?:claude|codex|cursor-agent|agy|gemini)(?:\\s|$)"
+    ],
+    "externalResidue": [
+      "Cursor Helper",
+      "Code Helper",
+      "extension-host",
+      "(?:^|/)tsserver(?:\\.js)?(?:\\s|$)"
+    ],
+    "mcpServer": [
+      "(?i)mcp[-_]server",
+      "(?i)\\bnpx\\s+(?:-y\\s+)?\\S*mcp",
+      "(?i)python[0-9.]*\\s+-m\\s+mcp",
+      "(?i)@modelcontextprotocol"
+    ]
+  }
+}
