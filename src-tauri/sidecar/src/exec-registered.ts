@@ -1,11 +1,12 @@
 /**
  * exec-registered.ts — the supervision seam.
  *
- * agent-mesh's four adapters all accept an `exec` (run-to-completion) and, except
- * codex, a `lineStream` (streaming) constructor seam. We implement those public
- * contracts FROM SCRATCH — `nodeExec` / `nodeLineStream` are never copied
- * (DESIGN §0 rule 1, §5-6) — and add exactly one thing the vendor defaults cannot
- * do: the host learns about the child BEFORE it exists.
+ * agent-mesh's four adapters all accept an `exec` (run-to-completion) and a
+ * `lineStream` (streaming) constructor seam, and codex (since 0.1.4) a `spawn` seam
+ * for its `app-server` model listing. We implement those public contracts FROM
+ * SCRATCH — `nodeExec` / `nodeLineStream` / the listing's default spawner are never
+ * copied (DESIGN §0 rule 1, §5-6) — and add exactly one thing the vendor defaults
+ * cannot do: the host learns about the child BEFORE it exists.
  *
  * Every spawn here therefore:
  *   1. awaits `host.registerSpawn` (a durable `state='planned'` row, §8-3),
@@ -26,12 +27,15 @@
  */
 
 import { spawn } from 'node:child_process';
-import type { ChildProcess } from 'node:child_process';
+import type { ChildProcess, SpawnOptions } from 'node:child_process';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import * as readline from 'node:readline';
+import { PassThrough } from 'node:stream';
 
 import type { ExecFn, ExecRequest, ExecResult, LineStreamFn } from '@toragonite/agent-mesh-claude';
+import type { SpawnFn, SpawnedChild } from '@toragonite/agent-mesh-codex';
 
 import type { Rpc } from './rpc';
 
@@ -160,7 +164,7 @@ export async function reportExited(
  * Signal the child's whole process group. `detached:true` guarantees a group of
  * its own, so this can never reach the sidecar or the app.
  */
-export function killProcessGroup(child: ChildProcess, signal: NodeJS.Signals): void {
+export function killProcessGroup(child: ChildProcess, signal: NodeJS.Signals | number): void {
   if (child.pid !== undefined) {
     try {
       process.kill(-child.pid, signal);
@@ -410,5 +414,171 @@ export function makeRegisteredLineStream(rpc: Rpc, appInstanceId: string): LineS
         await finish();
       }
     })();
+  };
+}
+
+// ---------------------------------------------------------------------------
+// The registered SpawnFn (codex `app-server` model listing, agent-mesh-codex 0.1.4)
+// ---------------------------------------------------------------------------
+
+/**
+ * How long `exit` waits, after the real child closed, for the caller to read the last
+ * of its stdout. A listing that ends successfully is judged on `exit`, so `exit` must
+ * not overtake output still in the proxy pipe; a caller that stopped reading does not
+ * hold it up longer than this.
+ */
+export const SPAWN_DRAIN_CAP_MS = 1_000;
+
+/**
+ * The child a {@link SpawnFn} must hand back AT ONCE, for a process that cannot exist
+ * yet: registration (`host.registerSpawn`) is a round trip and the plan row comes first
+ * (DESIGN §0 rule 2). So the caller gets this stand-in immediately; its pipes are
+ * buffered and joined to the real child once it is spawned.
+ *
+ *   - `stdin`  — written lines wait in the pipe and reach the child in order; an `end()`
+ *                before the spawn ends the child's stdin after them.
+ *   - `stdout` / `stderr` — the child's, piped through.
+ *   - `kill(sig)` — the child's whole process group (it is spawned detached, a group of
+ *                its own), so whatever the app-server started dies with it. Before the
+ *                spawn it cancels it: nothing is spawned, the row is settled, `exit`
+ *                fires with that signal.
+ *   - `error` — a refused registration or a failed spawn (the row settled first).
+ *   - `exit` / `close` — `(code, signal)` once the child closed and its stdout was read.
+ */
+class RegisteredChild extends EventEmitter implements SpawnedChild {
+  readonly stdin = new PassThrough();
+  readonly stdout = new PassThrough();
+  readonly stderr = new PassThrough();
+  private real: ChildProcess | undefined;
+  private killedWith: NodeJS.Signals | number | undefined;
+  private over = false;
+
+  get pid(): number | undefined {
+    return this.real?.pid;
+  }
+
+  kill(signal: NodeJS.Signals | number = 'SIGTERM'): boolean {
+    if (this.over) return false;
+    this.killedWith = signal;
+    if (this.real !== undefined) killProcessGroup(this.real, signal);
+    return true;
+  }
+
+  /** Register, then spawn and join the pipes. Never throws: failures become `error`. */
+  async start(rpc: Rpc, appInstanceId: string, command: string, args: string[], options: SpawnOptions): Promise<void> {
+    const cwd = typeof options.cwd === 'string' ? options.cwd : undefined;
+    const reqEnv = options.env as Record<string, string | undefined> | undefined;
+    let registered: RegisteredSpawn;
+    try {
+      registered = await registerSpawn(rpc, appInstanceId, 'probe', { cmd: command, args, cwd, env: reqEnv });
+    } catch (err) {
+      this.failed(err);
+      return;
+    }
+    const { spawnId, env } = registered;
+
+    if (this.killedWith !== undefined) {
+      // Killed while the row was being planned: it never runs.
+      const signal = typeof this.killedWith === 'string' ? this.killedWith : null;
+      await reportExited(rpc, spawnId, null, signal, false);
+      this.ended(null, signal);
+      return;
+    }
+
+    let child: ChildProcess;
+    try {
+      // Whatever the caller asked for, never a shell: argv goes to the binary as is.
+      child = spawn(command, args, {
+        cwd,
+        env,
+        shell: false,
+        // Own process group, so kill() reaches the app-server's children too and can
+        // never reach the sidecar.
+        detached: true,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch (err) {
+      await reportExited(rpc, spawnId, null, null, false);
+      this.failed(err);
+      return;
+    }
+    this.real = child;
+
+    let reported = false;
+    const settle = async (code: number | null, signal: NodeJS.Signals | null): Promise<void> => {
+      if (reported) return;
+      reported = true;
+      await reportExited(rpc, spawnId, code, signal, false);
+    };
+    child.on('error', (err) => {
+      void settle(null, null).then(() => this.failed(err));
+    });
+    child.on('close', (code, signal) => {
+      void settle(code, signal)
+        .then(() => this.drained())
+        .then(() => this.ended(code, signal));
+    });
+    child.stdin?.on('error', () => {
+      /* the child may close stdin before the caller is done writing; `exit` tells the outcome */
+    });
+    if (child.stdin) this.stdin.pipe(child.stdin);
+    child.stdout?.pipe(this.stdout);
+    child.stderr?.pipe(this.stderr);
+
+    if (child.pid !== undefined) {
+      try {
+        await reportSpawned(rpc, spawnId, child.pid);
+      } catch {
+        // The row stays `planned` and the reaper settles it; the listing goes on.
+      }
+    }
+  }
+
+  /** Resolves once the caller has read stdout to its end, or after the drain cap. */
+  private drained(): Promise<void> {
+    if (this.stdout.readableEnded) return Promise.resolve();
+    return new Promise((resolve) => {
+      const timer = setTimeout(resolve, SPAWN_DRAIN_CAP_MS);
+      timer.unref?.();
+      const done = (): void => {
+        clearTimeout(timer);
+        resolve();
+      };
+      this.stdout.once('end', done);
+      this.stdout.once('close', done);
+    });
+  }
+
+  private ended(code: number | null, signal: NodeJS.Signals | null): void {
+    if (this.over) return;
+    this.over = true;
+    this.stdout.end();
+    this.stderr.end();
+    this.emit('exit', code, signal);
+    this.emit('close', code, signal);
+  }
+
+  private failed(err: unknown): void {
+    if (this.over) return;
+    this.over = true;
+    this.stdout.end();
+    this.stderr.end();
+    // An `error` with no listener would throw out of a timer; the caller listens.
+    if (this.listenerCount('error') > 0) this.emit('error', err instanceof Error ? err : new Error(String(err)));
+  }
+}
+
+/**
+ * The registered {@link SpawnFn} (agent-mesh-codex 0.1.4 `CodexAdapterOptions.spawn`): the
+ * `codex app-server` model listing behind `availableModels()` gets a registry row (`kind:
+ * 'probe'`, the run of the current {@link runCtx}) before it exists, the markers in its env,
+ * `host.spawned` / `host.exited` like every other child — and its own process group, which
+ * the caller's deadline kill (`child.kill('SIGKILL')`) takes down whole.
+ */
+export function makeRegisteredSpawn(rpc: Rpc, appInstanceId: string): SpawnFn {
+  return (command, args, options) => {
+    const child = new RegisteredChild();
+    void child.start(rpc, appInstanceId, command, [...args], options ?? {});
+    return child;
   };
 }

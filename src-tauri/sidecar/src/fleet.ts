@@ -3,7 +3,7 @@
  *
  * Nothing here forks or reimplements a vendor: every adapter is the published
  * class, configured through its PUBLIC constructor seams (DESIGN §0 rule 1,
- * §5-6). We inject exactly four things:
+ * §5-6). We inject exactly five things:
  *
  *   - `exec`         the registered run-to-completion spawner (all four),
  *   - `lineStream`   the registered streaming spawner (all four; codex gained the
@@ -13,13 +13,17 @@
  *                    `ExecRequest.stdin` cannot express — §5-7),
  *   - `readKeychain` cursor's macOS keychain read (agent-mesh 0.1.3), run through
  *                    the registered `exec` instead of the vendor's own
- *                    `/usr/bin/security` spawn.
+ *                    `/usr/bin/security` spawn,
+ *   - `spawn`        the registered spawner for codex's live model listing
+ *                    (`availableModels()` → `codex app-server`, also reached by
+ *                    `Fleet.route` for a latency-class policy); the seam is new in
+ *                    agent-mesh 0.1.4. The listing used to spawn directly — the
+ *                    last unregistered launch. Now it has a registry row (`kind:
+ *                    'probe'`) and its own process group, which the adapter's
+ *                    `modelsTimeoutMs` kill takes down whole.
  *
- * One vendor launch is NOT injectable in agent-mesh 0.1.3: codex's live model
- * listing (`availableModels()` → `codex app-server`, also reached by
- * `Fleet.route` for a latency-class policy) spawns directly. It is bounded
- * (`modelsTimeoutMs`, own process group, memoized per CODEX_HOME) and recorded as
- * the one reachable unregistered launch in `scripts/check-seam.mjs`.
+ * With that, every vendor launch the sidecar can reach goes through a registered
+ * seam; `scripts/check-seam.mjs` holds the bundle to it.
  *
  * Two more deliberate choices:
  *   - cursor gets `trust: true`. Choosing to run a coding agent in a worktree IS
@@ -39,11 +43,18 @@ import type { Account, Adapter, Vendor } from '@toragonite/agent-mesh';
 import { ClaudeAdapter } from '@toragonite/agent-mesh-claude';
 import type { ClaudeAdapterOptions, ExecFn, LineStreamFn } from '@toragonite/agent-mesh-claude';
 import { CodexAdapter } from '@toragonite/agent-mesh-codex';
+import type { SpawnFn } from '@toragonite/agent-mesh-codex';
 import { CursorAdapter } from '@toragonite/agent-mesh-cursor';
 import type { CursorAdapterOptions } from '@toragonite/agent-mesh-cursor';
 import { GeminiAdapter } from '@toragonite/agent-mesh-gemini';
 
-import { makeRegisteredExec, makeRegisteredLineStream, runCtx, INTROSPECT_RUN_ID } from './exec-registered';
+import {
+  makeRegisteredExec,
+  makeRegisteredLineStream,
+  makeRegisteredSpawn,
+  runCtx,
+  INTROSPECT_RUN_ID,
+} from './exec-registered';
 import type { Rpc } from './rpc';
 
 /** The four vendors this build registers, in the order `mesh.hello` reports them. */
@@ -128,6 +139,12 @@ function pinLineStream(lineStream: LineStreamFn, vendor: Vendor): LineStreamFn {
     runCtx.run({ runId: INTROSPECT_RUN_ID, vendor: String(vendor) }, () => lineStream(req, onEnd));
 }
 
+/** The plan row is requested synchronously inside the call, so the pinned context reaches it. */
+function pinSpawn(spawnFn: SpawnFn, vendor: Vendor): SpawnFn {
+  return (command, args, options) =>
+    runCtx.run({ runId: INTROSPECT_RUN_ID, vendor: String(vendor) }, () => spawnFn(command, args, options));
+}
+
 type ReadKeychain = NonNullable<CursorAdapterOptions['readKeychain']>;
 
 /** What cursor-agent's default credential store keeps in the login keychain. */
@@ -168,6 +185,7 @@ function registeredKeychain(exec: ExecFn): ReadKeychain {
 interface Seams {
   exec: ExecFn;
   lineStream: LineStreamFn;
+  spawn: SpawnFn;
 }
 
 function makeAdapters(
@@ -180,6 +198,7 @@ function makeAdapters(
   const exec = (vendor: Vendor): ExecFn => (pin ? pinExec(seams.exec, vendor) : seams.exec);
   const lineStream = (vendor: Vendor): LineStreamFn =>
     pin ? pinLineStream(seams.lineStream, vendor) : seams.lineStream;
+  const spawnSeam = (vendor: Vendor): SpawnFn => (pin ? pinSpawn(seams.spawn, vendor) : seams.spawn);
 
   const claudeOpts: ClaudeAdapterOptions = {
     exec: exec('claude'),
@@ -199,11 +218,13 @@ function makeAdapters(
   map.set('claude', new ClaudeAdapter(claudeOpts));
   map.set(
     'codex',
-    // agent-mesh 0.1.3 gave CodexAdapter a lineStream seam (and stream: true); leaving
-    // it out would fall back to the vendor's own unregistered spawner.
+    // agent-mesh 0.1.3 gave CodexAdapter a lineStream seam (and stream: true), 0.1.4 a
+    // spawn seam for the app-server model listing; leaving either out would fall back to
+    // the vendor's own unregistered spawner.
     new CodexAdapter({
       exec: exec('codex'),
       lineStream: lineStream('codex'),
+      spawn: spawnSeam('codex'),
       binary: binaries.codex,
       ...(codexAccount !== undefined ? { defaultAccount: codexAccount } : {}),
     }),
@@ -247,6 +268,7 @@ export function buildFleet(cfg: BuildConfig): BuiltFleet {
   const seams: Seams = {
     exec: makeRegisteredExec(cfg.rpc, cfg.appInstanceId),
     lineStream: makeRegisteredLineStream(cfg.rpc, cfg.appInstanceId),
+    spawn: makeRegisteredSpawn(cfg.rpc, cfg.appInstanceId),
   };
 
   const adapters = makeAdapters(seams, binaries, cfg.accounts, cfg.getUsage, false);

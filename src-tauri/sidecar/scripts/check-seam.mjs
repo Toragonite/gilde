@@ -10,9 +10,10 @@
  * the type system would notice.
  *
  * So this script audits the artifact, not the source. It attributes every
- * `child_process` launch call in `sidecar.cjs` to the module it came from
- * (esbuild's per-module `// path` banners) and compares that against a blessed
- * BASELINE:
+ * `child_process` launch call in `sidecar.cjs` — and every launcher taken as a
+ * VALUE (`x.spawn` not called on the spot, e.g. `opts.spawn ?? cp.spawn`, the
+ * shape of a spawn seam's default) — to the module it came from (esbuild's
+ * per-module `// path` banners) and compares that against a blessed BASELINE:
  *
  *   - a launch call in one of OUR modules is allowed only in the two seam
  *     modules, `src/exec-registered.ts` and `src/duplex.ts`;
@@ -64,13 +65,19 @@ const OUR_SEAM_MODULES = new Set(['src/exec-registered.ts', 'src/duplex.ts']);
  * still match, i.e. the seam that replaces this default is still wired. A
  * `reachable` site has no such seam; its `why` is the accepted reason.
  *
- * agent-mesh 0.1.3 (re-blessed 2026-10-16 from 0.1.1):
+ * A `ref: true` entry blesses a launcher taken as a value; its `sig` is matched
+ * against that whole source line (whitespace removed). Call entries match calls only.
+ *
+ * agent-mesh 0.1.4 (re-blessed 2026-10-20 from 0.1.3):
  *   claude  nodeExec + nodeLineStream, getLiveUsage                     (unchanged)
- *   codex   nodeExec + nodeLineStream (NEW: 0.1.3 added the lineStream seam
- *           and stream:true), `codex app-server` model listing (NEW, no seam)
- *   cursor  nodeExec + nodeLineStream, defaultReadCursorKeychain (NEW: 0.1.3
- *           added quota via the macOS keychain; `readKeychain` is a seam)
+ *   codex   nodeExec + nodeLineStream                                   (unchanged)
+ *           `codex app-server` model listing: was a direct, REACHABLE
+ *           `spawn(req.cmd, ["app-server"], …)`; 0.1.4 added the `spawn` seam
+ *           (CodexAdapterOptions.spawn), so it is now `req.spawn ?? cp.spawn` —
+ *           a default replaced by src/fleet.ts's registered spawner, never reached
+ *   cursor  nodeExec + nodeLineStream, defaultReadCursorKeychain        (unchanged)
  *   gemini  nodeExec + nodeLineStream                                   (unchanged)
+ * No reachable unregistered vendor launch is left.
  */
 const SEAM_DEFAULTS = /^req\.cmd,req\.args,\{/;
 const BASELINE = new Map([
@@ -103,14 +110,17 @@ const BASELINE = new Map([
         injectedBy: [['src/fleet.ts', /exec: exec\('codex'\),\s*lineStream: lineStream\('codex'\)/]],
       },
       {
-        sig: /^req\.cmd,\["app-server"\],\{/,
+        ref: true,
+        sig: /^constspawnFn=req\.spawn\?\?[\w$]+\.spawn;$/,
         count: 1,
-        reachable: true,
         why:
-          'codex `app-server` live model listing behind availableModels() (also Fleet.route with a ' +
-          'latencyClass policy). agent-mesh-codex 0.1.3 exposes no seam for it. Bounded by ' +
-          'modelsTimeoutMs (15 s, own process group killed), memoized per CODEX_HOME, env stripped of ' +
-          'ANTHROPIC_/CLAUDE_ vars. Upstream fix needed: an injectable spawner for the listing.',
+          'listAppServerModels default spawner (`req.spawn ?? spawn`) for the `codex app-server` live ' +
+          'model listing behind availableModels() / Fleet.route latencyClass; spawn seam since 0.1.4, ' +
+          'injected with the registered spawner (registry row kind probe, own process group)',
+        injectedBy: [
+          ['src/fleet.ts', /spawn: spawnSeam\('codex'\)/],
+          ['src/fleet.ts', /spawn: makeRegisteredSpawn\(cfg\.rpc, cfg\.appInstanceId\)/],
+        ],
       },
     ],
   ],
@@ -182,6 +192,8 @@ if (bindings.size === 0) {
 // 2. Attribute every launch call to its module.
 const bindingAlt = [...bindings].map((b) => b.replace(/[$]/g, '\\$')).join('|');
 const memberCall = new RegExp(`\\b(?:${bindingAlt})\\s*\\.\\s*(${LAUNCHERS.join('|')})\\b\\s*\\)?\\s*\\(`, 'g');
+// A launcher taken as a value (not called right there): `opts.spawn ?? cp.spawn`.
+const memberRef = new RegExp(`\\b(?:${bindingAlt})\\s*\\.\\s*(${LAUNCHERS.join('|')})\\b(?!\\s*\\)?\\s*\\()`, 'g');
 // Defensive: a bare `spawn(` call, in case a future esbuild inlines the binding.
 const bareCall = new RegExp(`(?:^|[^\\w$.])(${BARE_LAUNCHERS.join('|')})\\s*\\(`, 'g');
 
@@ -214,22 +226,27 @@ for (let i = 0; i < lines.length; i += 1) {
   if (code.trim().length === 0) continue;
 
   const hits = [];
+  const refs = [];
   for (const m of code.matchAll(memberCall)) hits.push(m[1]);
-  if (hits.length === 0) {
+  for (const m of code.matchAll(memberRef)) refs.push(m[1]);
+  if (hits.length === 0 && refs.length === 0) {
     // A bare launcher identifier that is not a property access. `exec(` is
     // deliberately not in this set — it is the injected seam, not a launch.
     for (const m of code.matchAll(bareCall)) hits.push(m[1]);
   }
-  if (hits.length === 0) continue;
+  if (hits.length === 0 && refs.length === 0) continue;
 
   if (!found.has(current)) found.set(current, new Map());
   const perModule = found.get(current);
-  for (const member of hits) perModule.set(member, (perModule.get(member) ?? 0) + 1);
+  for (const member of [...hits, ...refs]) perModule.set(member, (perModule.get(member) ?? 0) + 1);
   if (!sites.has(current)) sites.set(current, []);
   sites.get(current).push(`    ${current}:${i + 1}  ${code.trim().slice(0, 100)}`);
   if (!launches.has(current)) launches.set(current, []);
   for (const member of hits) {
-    launches.get(current).push({ member, args: argumentText(i, member), where: `${current}:${i + 1}` });
+    launches.get(current).push({ member, ref: false, args: argumentText(i, member), where: `${current}:${i + 1}` });
+  }
+  for (const member of refs) {
+    launches.get(current).push({ member, ref: true, args: code.replace(/\s+/g, ''), where: `${current}:${i + 1}` });
   }
 }
 
@@ -260,10 +277,12 @@ for (const [module, members] of found) {
 
   const perSig = new Map(blessed.map((b) => [b, 0]));
   for (const launch of launches.get(module) ?? []) {
-    const match = launch.member === 'spawn' ? blessed.filter((b) => b.sig.test(launch.args)) : [];
+    const match =
+      launch.member === 'spawn' ? blessed.filter((b) => (b.ref === true) === launch.ref && b.sig.test(launch.args)) : [];
     if (match.length !== 1) {
+      const shown = launch.ref ? `${launch.args.slice(0, 60)}… (launcher taken as a value)` : `${launch.member}(${launch.args.slice(0, 60)}…`;
       problems.push(
-        `check-seam: ${launch.where} \`${launch.member}(${launch.args.slice(0, 60)}…\` matches ` +
+        `check-seam: ${launch.where} \`${shown}\` matches ` +
           `${match.length} blessed signature(s), expected exactly 1.`,
       );
       continue;

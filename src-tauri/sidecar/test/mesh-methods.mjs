@@ -35,6 +35,12 @@
  *                         event: an iterator that throws, one that just ends, and
  *                         one that emits a second terminal all resolve to exactly
  *                         one terminal event.
+ *   N. codex listing    — agent-mesh 0.1.4's `spawn` seam: `mesh.availableModels`
+ *                         for codex runs `<binary> app-server` through the REGISTERED
+ *                         spawner (registry row kind probe, runId introspect, env
+ *                         marker, spawned → exited), with a fake app-server only; a
+ *                         listing that never answers is killed at the adapter's 15 s
+ *                         deadline — the whole process group — and its row settles.
  *
  * Run:  node test/mesh-methods.mjs        (from src-tauri/sidecar)
  * Exit: 0 all green, 1 on the first failed assertion.
@@ -44,7 +50,7 @@
  */
 
 import { spawn, execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -155,7 +161,17 @@ function eq(name, actual, expected) {
 }
 
 // ── channel ──────────────────────────────────────────────────────────────────
-function startSidecar() {
+function startSidecar(envPatch = {}) {
+  const env = {
+    ...process.env,
+    GILDE_APP_INSTANCE: APP_INSTANCE,
+    GILDE_SIDECAR_SELFTEST: '1',
+    AGENT_CLI_CREDENTIAL_STORE: 'memory',
+  };
+  for (const [key, value] of Object.entries(envPatch)) {
+    if (value === undefined) delete env[key];
+    else env[key] = value;
+  }
   const child = spawn(NODE, [bundle], {
     cwd: sidecarDir,
     // GILDE_SIDECAR_SELFTEST unlocks `dev.streamScript` (section M): the scripted
@@ -167,12 +183,7 @@ function startSidecar() {
     // endpoint. `fleet.route` asks every candidate for its quota, so without this the
     // J section would reach the machine's real Cursor login. The "memory" store has no
     // keychain and no login file, so cursor's quota() is `null` without any I/O.
-    env: {
-      ...process.env,
-      GILDE_APP_INSTANCE: APP_INSTANCE,
-      GILDE_SIDECAR_SELFTEST: '1',
-      AGENT_CLI_CREDENTIAL_STORE: 'memory',
-    },
+    env,
     stdio: ['pipe', 'pipe', 'pipe'],
   });
 
@@ -674,7 +685,174 @@ async function main() {
     other.child.kill('SIGKILL');
   }
 
+  await codexListingSection();
+
   await call(host, 'mesh.shutdown', { graceMs: 0 });
+}
+
+// ── N. the codex app-server listing goes through the registered spawner ───────
+/**
+ * A fake `codex app-server` (never the real CLI): JSON-RPC over stdio like the real
+ * one. `ok` answers initialize and one model/list page, then exits 0 when stdin closes;
+ * `hang` answers nothing and keeps a grandchild alive, so the deadline kill must take
+ * the whole group. Each writes what it saw (pid, GILDE_SPAWN_ID, CODEX_HOME, argv) to
+ * `<name>.seen.json` next to itself.
+ */
+function writeFakeAppServer(dir, name, mode) {
+  const file = join(dir, name);
+  const seen = join(dir, `${name}.seen.json`);
+  const body = `#!${NODE}
+const fs = require('node:fs');
+const { spawn } = require('node:child_process');
+const seen = { pid: process.pid, argv: process.argv.slice(2), marker: process.env.GILDE_SPAWN_ID ?? null, codexHome: process.env.CODEX_HOME ?? null, grandchild: null };
+if (${JSON.stringify(mode)} === 'hang') {
+  const g = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+  seen.grandchild = g.pid;
+}
+fs.writeFileSync(${JSON.stringify(seen)}, JSON.stringify(seen));
+if (${JSON.stringify(mode)} === 'hang') { setInterval(() => {}, 1000); return; }
+let buf = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (d) => {
+  buf += d;
+  let nl;
+  while ((nl = buf.indexOf('\\n')) !== -1) {
+    const line = buf.slice(0, nl); buf = buf.slice(nl + 1);
+    if (!line.trim()) continue;
+    const m = JSON.parse(line);
+    if (m.method === 'initialize') process.stdout.write(JSON.stringify({ id: m.id, result: { userAgent: 'fake-app-server' } }) + '\\n');
+    else if (m.method === 'model/list') process.stdout.write(JSON.stringify({ id: m.id, result: { data: [{ id: 'fake-live-model', displayName: 'Fake Live', isDefault: true }], nextCursor: null } }) + '\\n');
+  }
+});
+process.stdin.on('end', () => process.exit(0));
+`;
+  writeFileSync(file, body);
+  chmodSync(file, 0o755);
+  return { file, seen };
+}
+
+function alive(pid) {
+  if (typeof pid !== 'number' || pid <= 1) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function codexListingSection() {
+  const dir = join(work, 'codex-listing');
+  const codexHome = join(dir, 'codex-home'); // empty: no auth.json, so the gate passes the list as is
+  mkdirSync(codexHome, { recursive: true });
+  const ok = writeFakeAppServer(dir, 'fake-codex-ok', 'ok');
+  const hang = writeFakeAppServer(dir, 'fake-codex-hang', 'hang');
+  // Never the developer's ~/.codex: the adapter reads <CODEX_HOME>/auth.json for the gate.
+  const envPatch = { CODEX_HOME: codexHome, OPENAI_API_KEY: undefined };
+  const helloFor = (binary, suffix) => ({
+    protocol: PROTOCOL,
+    appInstanceId: `${APP_INSTANCE}-${suffix}`,
+    binaries: { claude: fakeAgent, codex: binary },
+    defaults: { timeoutMs: 60_000 },
+  });
+  const started = [];
+  try {
+    // N1–N4: a listing that answers.
+    {
+      const ch = startSidecar(envPatch);
+      started.push(ch);
+      await call(ch, 'mesh.hello', helloFor(ok.file, 'codex-ok'));
+      const models = await call(ch, 'mesh.availableModels', { vendor: 'codex' });
+      const reg = ch.journal.find((e) => e.method === 'host.registerSpawn' && e.params?.cmd === ok.file)?.params ?? {};
+      const spawned = ch.journal.find((e) => e.method === 'host.spawned' && e.params?.spawnId === reg.spawnId)?.params;
+      const exited = ch.journal.find((e) => e.method === 'host.exited' && e.params?.spawnId === reg.spawnId)?.params;
+      const seen = existsSync(ok.seen) ? JSON.parse(readFileSync(ok.seen, 'utf8')) : {};
+      check(
+        'N1 the codex app-server listing is registered before it runs: kind probe, runId introspect, vendor codex, argv app-server',
+        reg.spawnId !== undefined && reg.kind === 'probe' && reg.runId === 'introspect' && reg.vendor === 'codex' &&
+          JSON.stringify(reg.args) === '["app-server"]',
+        JSON.stringify(reg),
+      );
+      check(
+        'N2 registerSpawn → spawned → exited, in order; the row ends with exit 0',
+        trace(ch, reg.spawnId).join(' → ') === 'host.registerSpawn → host.spawned → host.exited' &&
+          exited?.exitCode === 0 && exited?.signal === null,
+        JSON.stringify({ trace: trace(ch, reg.spawnId), exited }),
+      );
+      check(
+        'N3 the child is the registered one: its pid is host.spawned\'s, GILDE_SPAWN_ID is the host\'s marker, CODEX_HOME the account home (keys only reported)',
+        spawned?.pid === seen.pid && seen.marker === `marker-${reg.spawnId}` && seen.codexHome === codexHome &&
+          Array.isArray(reg.envKeys) && reg.envKeys.includes('CODEX_HOME') && !JSON.stringify(reg).includes(codexHome),
+        JSON.stringify({ spawnedPid: spawned?.pid, seen, envKeys: (reg.envKeys ?? []).length }),
+      );
+      check(
+        'N4 the listing answered through the proxied pipes: the live model is in the result',
+        Array.isArray(models) && models.some((m) => m.id === 'fake-live-model' && m.label === 'Fake Live'),
+        JSON.stringify(models),
+      );
+      ch.child.kill('SIGKILL');
+    }
+
+    // N5–N7: a listing that never answers → the adapter's deadline kill.
+    {
+      const ch = startSidecar(envPatch);
+      started.push(ch);
+      await call(ch, 'mesh.hello', helloFor(hang.file, 'codex-hang'));
+      const t0 = Date.now();
+      const models = await call(ch, 'mesh.availableModels', { vendor: 'codex' }, 60_000);
+      const waited = Date.now() - t0;
+      const reg = ch.journal.find((e) => e.method === 'host.registerSpawn' && e.params?.cmd === hang.file)?.params ?? {};
+      // host.exited may land just after the answer (the kill → close → report chain).
+      const deadline = Date.now() + 5_000;
+      let exited;
+      while (Date.now() < deadline) {
+        exited = ch.journal.find((e) => e.method === 'host.exited' && e.params?.spawnId === reg.spawnId)?.params;
+        if (exited !== undefined) break;
+        await sleep(25);
+      }
+      const seen = existsSync(hang.seen) ? JSON.parse(readFileSync(hang.seen, 'utf8')) : {};
+      await sleep(200);
+      check(
+        `N5 a listing that never answers is given up at the adapter's deadline (${waited} ms ≥ 14.5 s) with the static list`,
+        waited >= 14_500 && Array.isArray(models) && models.length > 0 && !models.some((m) => m.id === 'fake-live-model'),
+        JSON.stringify({ waited, n: Array.isArray(models) ? models.length : models }),
+      );
+      check(
+        'N6 the deadline kill reaches the registered child: its row settles with SIGKILL (spawned before, exited after)',
+        trace(ch, reg.spawnId).join(' → ') === 'host.registerSpawn → host.spawned → host.exited' && exited?.signal === 'SIGKILL',
+        JSON.stringify({ trace: trace(ch, reg.spawnId), exited }),
+      );
+      check(
+        'N7 the whole process group is gone: the app-server and the grandchild it started',
+        typeof seen.pid === 'number' && typeof seen.grandchild === 'number' && !alive(seen.pid) && !alive(seen.grandchild),
+        JSON.stringify({ pid: seen.pid, pidAlive: alive(seen.pid), grandchild: seen.grandchild, grandchildAlive: alive(seen.grandchild) }),
+      );
+      check('N8 no real CLI was asked for on either channel', started.every((c) => c.refusedSpawns.length === 0), JSON.stringify(started.map((c) => c.refusedSpawns)));
+      ch.child.kill('SIGKILL');
+    }
+  } finally {
+    for (const ch of started) {
+      try {
+        ch.child.kill('SIGKILL');
+      } catch {
+        /* gone */
+      }
+    }
+    // Only the fakes this section started, and only if a failure left them behind.
+    for (const f of [ok.seen, hang.seen]) {
+      if (!existsSync(f)) continue;
+      const seen = JSON.parse(readFileSync(f, 'utf8'));
+      for (const pid of [seen.pid, seen.grandchild]) {
+        if (alive(pid)) {
+          try {
+            process.kill(pid, 'SIGKILL');
+          } catch {
+            /* gone */
+          }
+        }
+      }
+    }
+  }
 }
 
 const guard = setTimeout(() => {

@@ -13,11 +13,11 @@
     "test:live": "node test/live-check.mjs"
   },
   "dependencies": {
-    "@toragonite/agent-mesh": "0.1.3",
-    "@toragonite/agent-mesh-claude": "0.1.3",
-    "@toragonite/agent-mesh-codex": "0.1.3",
-    "@toragonite/agent-mesh-cursor": "0.1.3",
-    "@toragonite/agent-mesh-gemini": "0.1.3"
+    "@toragonite/agent-mesh": "0.1.4",
+    "@toragonite/agent-mesh-claude": "0.1.4",
+    "@toragonite/agent-mesh-codex": "0.1.4",
+    "@toragonite/agent-mesh-cursor": "0.1.4",
+    "@toragonite/agent-mesh-gemini": "0.1.4"
   },
   "devDependencies": {
     "@types/node": "^20.19.0",
