@@ -102,11 +102,51 @@ const TEAM_ID = 'tmabcdefghi1';
 const DISK_TEAM_ID = 'tmzzzzzzzzz2';
 const NOW = Date.now();
 
+// ── timing knobs ─────────────────────────────────────────────────────────────
+// Two kinds of time bound live in this file, and they are treated differently:
+//  - a HANG GUARD only stops a wait for something that must happen eventually
+//    (`until(…)` budgets, the settle sleeps before a negative check). On a loaded
+//    machine those are what flake, so they are 3× what an idle machine needs and
+//    scale with CCO_TEAM_TEST_TIME_SCALE (default 1): `hang(ms)`, `settle(ms)`.
+//  - a BEHAVIOUR bound is what the sidecar promises (the ~1 s reconnect backoff
+//    floor, the 5 s refresh minimum, the 60 s workers floor, the two-reads-per-
+//    second debounce derived from the measured burst). Those stay exact.
+function positiveNumber(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  const value = Number(raw);
+  if (Number.isFinite(value) && value > 0) return value;
+  process.stdout.write(`cco-team: ignoring ${name}=${JSON.stringify(raw)} (not a positive number), using ${fallback}\n`);
+  return fallback;
+}
+const TIME_SCALE = positiveNumber('CCO_TEAM_TEST_TIME_SCALE', 1);
+const GUARD_MS = Math.round(positiveNumber('CCO_TEAM_TEST_GUARD_MS', 600_000));
+/** A wait that only guards against a hang: 3× the idle-machine need, times the scale. */
+const hang = (ms) => Math.round(ms * 3 * TIME_SCALE);
+/** A settle pause before a negative check (nothing must have happened): times the scale. */
+const settle = (ms) => Math.round(ms * TIME_SCALE);
+
+// ── progress (what was running when the guard fired) ────────────────────────
+const STARTED_AT = Date.now();
+let current = { name: 'setup', startedAt: STARTED_AT };
+const finishedSections = [];
+let lastCheck = '(none yet)';
+/** Mark the start of a section; the previous one is recorded with its duration. */
+function section(name) {
+  const now = Date.now();
+  finishedSections.push({ name: current.name, ms: now - current.startedAt });
+  current = { name, startedAt: now };
+}
+function sectionTimings() {
+  return finishedSections.map((s) => `${s.name.split(' ')[0]} ${(s.ms / 1000).toFixed(1)}s`).join(', ');
+}
+
 // ── assertion harness ────────────────────────────────────────────────────────
 let failures = 0;
 let checks = 0;
 function check(name, ok, detail) {
   checks += 1;
+  lastCheck = name;
   if (ok) process.stdout.write(`  ok   ${name}\n`);
   else {
     failures += 1;
@@ -114,7 +154,7 @@ function check(name, ok, detail) {
   }
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-async function until(pred, timeoutMs = 8_000, stepMs = 25) {
+async function until(pred, timeoutMs = hang(8_000), stepMs = 25) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const v = pred();
@@ -212,6 +252,8 @@ function fakeHost({ socketPath, hostPid = process.pid, workspace = PROJECT_REAL,
     workersServed: undefined,
     /** Extra TeamListEntry objects appended to every `cco/team.list` answer (CCO 0b7b1b8 `reason`). */
     listExtra: [],
+    /** Whether `cco/team.list` says this host owns TEAM_ID (`ownedHere`). */
+    ownsTeam: true,
     state: teamState(),
     conns: new Set(),
     sub: undefined,
@@ -269,7 +311,7 @@ function fakeHost({ socketPath, hostPid = process.pid, workspace = PROJECT_REAL,
           id,
           result: {
             ok: true,
-            teams: [{ teamId: TEAM_ID, name: 'demo', state: host.state.status, members: 2, ownedHere: true }, ...host.listExtra],
+            teams: [{ teamId: TEAM_ID, name: 'demo', state: host.state.status, members: 2, ownedHere: host.ownsTeam }, ...host.listExtra],
           },
         });
         return;
@@ -480,7 +522,7 @@ function onSidecarLine(state, line) {
 function call(state, method, params) {
   const id = `h${++state.nextId}`;
   return new Promise((resolve, reject) => {
-    state.pending.set(id, { resolve, reject });
+    state.pending.set(id, { resolve, reject, method, at: Date.now() });
     state.child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
   });
 }
@@ -556,6 +598,7 @@ async function main() {
   sc = startSidecar();
 
   // ── K0. workers with no host in sight (Plan #3c) ───────────────────────────
+  section('K0. workers with no host');
   {
     const none = await call(sc, 'cco.workers', { roots: [join(HOME, 'no-such-project')], panePids: [] });
     check(
@@ -568,19 +611,21 @@ async function main() {
   }
 
   // ── H. params ──────────────────────────────────────────────────────────────
+  section('H. params');
   {
     const bad = await expectError(call(sc, 'cco.team.get', { teamId: '../../etc' }));
     check('H1 a team id that is not TEAM_ID is -32602', bad !== null && bad.code === -32602, String(bad?.code));
     const badRoots = await expectError(call(sc, 'cco.team.list', { roots: '/', panePids: [] }));
     check('H2 roots that are not an array are -32602', badRoots !== null && badRoots.code === -32602, String(badRoots?.code));
     const fsRoot = await call(sc, 'cco.team.list', { roots: ['/'], panePids: [] });
-    await sleep(300);
+    await sleep(settle(300));
     check('H3 a filesystem root is never a scope (nothing connected)', h1.connections === 0 && fsRoot.hosts.length === 0, `${h1.connections} ${JSON.stringify(fsRoot.hosts)}`);
     const unknown = await call(sc, 'cco.team.get', { teamId: 'tmnotknown12' });
     check('H4 an unknown team is null, not an error', unknown === null, JSON.stringify(unknown));
   }
 
   // ── A. discovery ───────────────────────────────────────────────────────────
+  section('A. discovery');
   const first = await call(sc, 'cco.team.list', { roots: [PROJECT], panePids: [] });
   check('A1 supported, data root under HOME, teamMode read from registry.json', first.supported === true && first.dataRoot === DATA_ROOT && first.teamMode === 'on', JSON.stringify({ s: first.supported, d: first.dataRoot, t: first.teamMode }));
   await until(() => h1.subscribes.length > 0);
@@ -589,7 +634,8 @@ async function main() {
   check('A4 the first subscribe replays the whole short log (fromSeq: 0 is sent, not dropped)', h1.subscribes[0]?.fromSeq === 0, JSON.stringify(h1.subscribes[0]));
 
   // ── B. refusals ────────────────────────────────────────────────────────────
-  await sleep(600);
+  section('B. refusals');
+  await sleep(settle(600));
   check('B1 a record whose socket is not socketPathFor\'s is never connected to', elsewhere.connections === 0, String(elsewhere.connections));
   check('B2 an unrelated workspace is never connected to', h3.connections === 0, String(h3.connections));
   check('B3 a dead host pid is skipped', h5.connections === 0, String(h5.connections));
@@ -599,6 +645,7 @@ async function main() {
   check('B5 the no-team host was greeted once and never listed', h4.hellos.length === 1 && h4.lists === 0, JSON.stringify({ hellos: h4.hellos.length, lists: h4.lists }));
 
   // ── C. forwarding ──────────────────────────────────────────────────────────
+  section('C. forwarding');
   const v1 = await until(() => lastView(sc, TEAM_ID));
   check('C1 a view is forwarded: source host, live, the engine projection', v1?.view?.source === 'host' && v1.view.live === true && v1.view.state.id === TEAM_ID && v1.view.state.members.length === 2, JSON.stringify(v1?.view?.source));
   check('C2 nothing but views crosses the pipe (no event payloads)', sc.rawSnapshots.every((l) => !l.includes('"kind":"snapshot"') && !l.includes('cco/team.event')), 'an event leaked');
@@ -621,7 +668,8 @@ async function main() {
   }
 
   // ── D. A14 debounce ────────────────────────────────────────────────────────
-  await sleep(700);
+  section('D. debounce');
+  await sleep(settle(700));
   const getsBefore = h1.gets.length;
   const viewsBefore = sc.snapshots.length;
   const t0 = Date.now();
@@ -633,16 +681,21 @@ async function main() {
   const burstMs = Date.now() - t0;
   const getsInBurst = h1.gets.filter((t) => t >= t0 && t <= t0 + burstMs).length;
   await sleep(900);
+  // The trailing read and view may need longer on a loaded machine: wait for the last
+  // state (a hang guard), then derive the view bound from the time that really passed.
+  await until(() => lastView(sc, TEAM_ID)?.view?.state?.seq === 59);
+  const settleMs = Date.now() - t0 - burstMs;
   const bound = Math.ceil(burstMs / 500) + 2;
   check(`D1 40 events in ${burstMs} ms → ${getsInBurst} re-reads (≤ ${bound}: two per second)`, getsInBurst >= 1 && getsInBurst <= bound, String(getsInBurst));
   const final = lastView(sc, TEAM_ID)?.view;
   check('D2 the last state wins', final?.state?.members?.find((m) => m.name === 'alice')?.role === 'role-39' && final.state.seq === 59, JSON.stringify(final?.state?.members?.[0]?.role));
   const viewsInBurst = sc.snapshots.length - viewsBefore;
-  const viewBound = Math.ceil((burstMs + 900) / 250) + 2;
+  const viewBound = Math.ceil((burstMs + settleMs) / 250) + 2;
   check(`D3 views are coalesced (${viewsInBurst} for 40 events, ≤ ${viewBound})`, viewsInBurst <= viewBound, String(viewsInBurst));
   check('D4 re-reads after the burst settle (one trailing read, not one per event)', h1.gets.length - getsBefore <= bound + 1, String(h1.gets.length - getsBefore));
 
   // ── E. hostile values ──────────────────────────────────────────────────────
+  section('E. hostile values');
   h1.state = teamState({ seq: 70, createdAt: 1234.75, members: [member('alice', { role: 'bad \uD800 role', turns: 2.9 }), member('bob')] });
   h1.event(70, 'member.state', { name: 'alice', state: 'idle' });
   const hostile = await until(() => {
@@ -684,6 +737,7 @@ async function main() {
   }
 
   // ── F. reconnect ───────────────────────────────────────────────────────────
+  section('F. reconnect');
   await until(() => lastView(sc, TEAM_ID)?.view?.state?.seq === 81);
   const lastSeq = 81;
   const hellosBefore = h1.hellos.length;
@@ -693,9 +747,9 @@ async function main() {
   const backOnDisk = await until(() => {
     const v = lastView(sc, TEAM_ID);
     return v !== undefined && (v.view === null || v.view.live === false) ? v : undefined;
-  }, 3_000);
+  }, settle(3_000));
   check('F1 a dropped connection withdraws the live view at once', backOnDisk !== undefined, JSON.stringify(lastView(sc, TEAM_ID)?.view?.live));
-  await until(() => h1.subscribes.length > subsBefore, 8_000);
+  await until(() => h1.subscribes.length > subsBefore, hang(8_000));
   const reconnectMs = Date.now() - dropAt;
   check(`F2 the sidecar reconnects with backoff (${reconnectMs} ms, ≥ ~1 s) and says hello again`, h1.hellos.length === hellosBefore + 1 && reconnectMs >= 900, JSON.stringify({ hellos: h1.hellos.length, reconnectMs }));
   check('F3 it resubscribes FROM THE LAST SEQ it saw', h1.subscribes[subsBefore]?.fromSeq === lastSeq, JSON.stringify(h1.subscribes[subsBefore]));
@@ -703,6 +757,7 @@ async function main() {
   check('F4 the view is live again', relive === true, JSON.stringify(lastView(sc, TEAM_ID)?.view?.source));
 
   // ── G. disk teams ──────────────────────────────────────────────────────────
+  section('G. disk teams');
   const diskView = await until(() => lastView(sc, DISK_TEAM_ID)?.view);
   check('G1 a suspended team on disk is in view as source disk, not live', diskView?.source === 'disk' && diskView.live === false && diskView.state.status === 'suspended', JSON.stringify(diskView?.source));
   check('G2 its feed backlog is read (tail of members/<name>/feed.jsonl)', diskView?.activity?.[0]?.member === 'carol' && diskView.activity[0].lines.length === 3 && diskView.activity[0].lines[2].text === 'Read · file3.ts', JSON.stringify(diskView?.activity));
@@ -718,6 +773,7 @@ async function main() {
   }
 
   // ── J. hostile hosts and files ─────────────────────────────────────────────
+  section('J. hostile hosts and files');
   {
     // J1: the run directory also holds every host's LOG; a log storm is not a list storm.
     const listsBefore = h1.lists;
@@ -726,7 +782,7 @@ async function main() {
       appendFileSync(logFile, `log line ${i}\n`);
       if (i % 20 === 0) await sleep(10);
     }
-    await sleep(1_500);
+    await sleep(settle(1_500));
     check(`J1 a host-log storm in run/ causes no list storm (${h1.lists - listsBefore} list polls)`, h1.lists - listsBefore <= 2, String(h1.lists - listsBefore));
 
     // J2: garbage from the host, a notification for another team, a snapshot of another
@@ -737,7 +793,7 @@ async function main() {
     conn?.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'cco/team.event', params: { requestId: h1.sub.id, teamId: 'tmothertea12', seq: 999, ts: 1, kind: 'snapshot', state: { ...teamState(), id: 'tmothertea12', name: 'intruder' } } })}\n`);
     conn?.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'cco/team.event', params: { requestId: h1.sub.id, teamId: TEAM_ID, seq: 998, ts: 1, kind: 'snapshot', state: { ...teamState(), id: 'tmothertea12', name: 'intruder' } } })}\n`);
     conn?.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'cco/team.activity', params: { requestId: h1.sub.id, teamId: TEAM_ID, member: '../../etc', items: [{ ts: 1, turn: 't', k: 'text', s: 'nope' }] } })}\n`);
-    await sleep(800);
+    await sleep(settle(800));
     const after = lastView(sc, TEAM_ID)?.view;
     const stillAnswers = await call(sc, 'cco.team.get', { teamId: TEAM_ID });
     check('J2 garbage, another team\'s snapshot and a bad member name change nothing', after?.state?.name === 'demo' && !sc.snapshots.some((p) => p.teamId === 'tmothertea12') && stillAnswers?.state?.name === 'demo' && !(after?.activity ?? []).some((a) => a.member.includes('/')), JSON.stringify({ name: after?.state?.name, before: before?.state?.name }));
@@ -751,7 +807,7 @@ async function main() {
     writeFileSync(target, JSON.stringify({ protocol: 1, hostPid: process.pid, hostStartedAt: NOW, session: { pid: 434343, startedAt: NOW }, workspace: PROJECT_REAL, socket: join(RUN_DIR, 's434343.sock'), serverHash: 'x' }));
     symlinkSync(target, join(RUN_DIR, 's434343.json'));
     await call(sc, 'cco.team.list', { roots: [PROJECT], panePids: [] });
-    await sleep(1_200);
+    await sleep(settle(1_200));
     check('J3 a symlinked host record is never followed', linked.connections === 0, String(linked.connections));
 
     // J4: a body over the inline cap is read from bodies/m<seq>.md (its head only).
@@ -764,24 +820,27 @@ async function main() {
   }
 
   // ── I. scope ───────────────────────────────────────────────────────────────
+  section('I. scope');
   const closedBefore = h1.conns.size;
   await call(sc, 'cco.team.list', { roots: [], panePids: [] });
-  const withdrawn = await until(() => lastView(sc, TEAM_ID)?.view === null && lastView(sc, DISK_TEAM_ID)?.view === null, 3_000);
-  check('I1 an empty scope withdraws every view (view: null) and closes the host', withdrawn === true && (await until(() => h1.conns.size === 0, 2_000)) === true, JSON.stringify({ closedBefore, now: h1.conns.size }));
+  const withdrawn = await until(() => lastView(sc, TEAM_ID)?.view === null && lastView(sc, DISK_TEAM_ID)?.view === null, hang(3_000));
+  check('I1 an empty scope withdraws every view (view: null) and closes the host', withdrawn === true && (await until(() => h1.conns.size === 0, hang(2_000))) === true, JSON.stringify({ closedBefore, now: h1.conns.size }));
   const paneList = await call(sc, 'cco.team.list', { roots: [], panePids: [424242] });
-  await until(() => lastView(sc, TEAM_ID)?.view?.live === true, 8_000);
+  await until(() => lastView(sc, TEAM_ID)?.view?.live === true, hang(8_000));
   const paneView = lastView(sc, TEAM_ID)?.view;
   check('I2 a Gilde pane pid alone brings its host back, tagged with the pane', paneView?.paneSessionPid === 424242 && paneList.hosts.some((h) => h.key === 's424242' && h.pane === true), JSON.stringify({ pane: paneView?.paneSessionPid, hosts: paneList.hosts }));
   check('I3 never a write: the host saw only list/get/subscribe/unsubscribe and hellos', h1.gets.length > 0, '');
   check('I4 the team preview alone never calls a tool (list_workers is asked only by cco.workers)', h1.toolCalls.length === 0, String(h1.toolCalls.length));
 
   await allWorkspacesSection(h1, h3);
+  await sharedTeamSection(h1, h3);
   await workersSection(h1);
 }
 
 // ── L. all workspaces (Gilde preview: Team works with no project added) ──────
 const FAR_TEAM_ID = 'tmfarawayzz4';
 async function allWorkspacesSection(h1, h3) {
+  section('L. all workspaces');
   // A suspended team on disk in a workspace no root is related to.
   const farDir = join(TEAMS_DIR, FAR_TEAM_ID);
   mkdirSync(farDir, { recursive: true, mode: 0o700 });
@@ -809,7 +868,7 @@ async function allWorkspacesSection(h1, h3) {
 
   const h3Before = h3.connections;
   await call(sc, 'cco.team.list', { roots: [PROJECT], panePids: [], allWorkspaces: false });
-  await sleep(600);
+  await sleep(settle(600));
   const scoped = await call(sc, 'cco.team.list', { roots: [PROJECT], panePids: [], allWorkspaces: false });
   check(
     'L2 allWorkspaces false: a team in an unrelated workspace is NOT listed, its host never connected',
@@ -819,7 +878,7 @@ async function allWorkspacesSection(h1, h3) {
 
   await call(sc, 'cco.team.list', { roots: [PROJECT], panePids: [], allWorkspaces: true });
   let everywhere;
-  const deadline = Date.now() + 8_000;
+  const deadline = Date.now() + hang(8_000);
   for (;;) {
     everywhere = await call(sc, 'cco.team.list', { roots: [PROJECT], panePids: [], allWorkspaces: true });
     if ((everywhere.teams.some((t) => t.teamId === FAR_TEAM_ID) && h3.connections > h3Before) || Date.now() > deadline) break;
@@ -838,9 +897,9 @@ async function allWorkspacesSection(h1, h3) {
 
   // Back to the scope the next section expects (I2's): the far team and host drop out again.
   // Views are forwarded coalesced; wait for the far team's before narrowing again.
-  const farForwarded = await until(() => (lastView(sc, FAR_TEAM_ID)?.view ? lastView(sc, FAR_TEAM_ID) : undefined), 4_000);
+  const farForwarded = await until(() => (lastView(sc, FAR_TEAM_ID)?.view ? lastView(sc, FAR_TEAM_ID) : undefined), hang(4_000));
   await call(sc, 'cco.team.list', PANE_SCOPE);
-  const narrowed = await until(() => lastView(sc, FAR_TEAM_ID)?.view === null && h3.conns.size === 0, 4_000);
+  const narrowed = await until(() => lastView(sc, FAR_TEAM_ID)?.view === null && h3.conns.size === 0, hang(4_000));
   const after = await call(sc, 'cco.team.list', PANE_SCOPE);
   check(
     'L5 narrowing the scope again withdraws the far team (view: null) and closes its host',
@@ -848,7 +907,79 @@ async function allWorkspacesSection(h1, h3) {
     JSON.stringify({ forwarded: farForwarded?.view?.teamId, last: lastView(sc, FAR_TEAM_ID)?.view, h3: h3.conns.size, teams: after.teams.map((t) => t.teamId) }),
   );
   rmSync(farDir, { recursive: true, force: true });
-  await until(() => lastView(sc, TEAM_ID)?.view?.live === true && lastView(sc, TEAM_ID)?.view?.paneSessionPid === 424242, 8_000);
+  // L6: h3 (the unrelated workspace, connected only while allWorkspaces was on) also lists
+  // TEAM_ID as ownedHere, so the team may have been followed through it. With h3 out of
+  // sight again, the team must be live again through the pane host — what a fresh sidecar
+  // with this scope would forward.
+  const backLive = await until(() => isLiveVia(TEAM_ID, 's424242'), hang(8_000));
+  const backList = await call(sc, 'cco.team.list', PANE_SCOPE);
+  check(
+    'L6 back to the pane scope: the team is live again through the pane host (view and list)',
+    backLive === true && backList.teams.some((t) => t.teamId === TEAM_ID && t.live === true && t.paneSessionPid === 424242),
+    JSON.stringify({ last: viewSummary(TEAM_ID), teams: backList.teams.map((t) => [t.teamId, t.source, t.live]) }),
+  );
+}
+
+/** The last forwarded view of a team is live, through the given host. */
+function isLiveVia(teamId, hostKey) {
+  const v = lastView(sc, teamId)?.view;
+  return v?.live === true && v.hostKey === hostKey && (hostKey !== 's424242' || v.paneSessionPid === 424242);
+}
+const viewSummary = (teamId) => {
+  const v = lastView(sc, teamId)?.view;
+  return v === undefined ? 'none' : v === null ? 'null' : { live: v.live, source: v.source, hostKey: v.hostKey, pane: v.paneSessionPid };
+};
+
+// ── M. two hosts claim one team (the bug class of L6, other sequences) ───────
+// A team is followed through ONE host connection at a time. When a second connected host
+// claims the same team (a lease handoff window; here h3, in sight only with allWorkspaces)
+// and then leaves or stops claiming it, the first host must follow the team again — the
+// forwarded set after any sequence equals what a fresh sidecar with the final scope forwards.
+async function sharedTeamSection(h1, h3) {
+  section('M. two hosts, one team');
+  const WIDE = { ...PANE_SCOPE, allWorkspaces: true };
+  // M1: pane → all → pane → all → pane. Each widening lets h3 take the team over; each
+  // narrowing must hand it back to the pane host.
+  const rounds = [];
+  for (let round = 1; round <= 2; round += 1) {
+    await call(sc, 'cco.team.list', WIDE);
+    const taken = await until(() => isLiveVia(TEAM_ID, 's626262'), hang(8_000));
+    await call(sc, 'cco.team.list', PANE_SCOPE);
+    const back = await until(() => isLiveVia(TEAM_ID, 's424242'), hang(8_000));
+    rounds.push({ round, taken: taken === true, back: back === true, last: viewSummary(TEAM_ID) });
+  }
+  check('M1 pane → all → pane, twice: every narrowing leaves the team live through the pane host', rounds.every((r) => r.taken && r.back), JSON.stringify(rounds));
+
+  // M2: no scope change at all — the other claimant stops claiming (its list no longer says
+  // ownedHere, as after a lease moves back): the team is followed through the pane host again.
+  await call(sc, 'cco.team.list', WIDE);
+  const taken = await until(() => isLiveVia(TEAM_ID, 's626262'), hang(8_000));
+  // M3: while BOTH claim it, the team stays with the claimant that has it — no flapping:
+  // once each host has been list-polled again (the 5 s discovery tick, a poll at most every
+  // 4.5 s — so up to ~10 s), plus the time a re-subscribe would take, nobody subscribed again.
+  const h1Subs = h1.subscribes.length;
+  const h3Subs = h3.subscribes.length;
+  const h1Lists = h1.lists;
+  const h3Lists = h3.lists;
+  await until(() => h1.lists > h1Lists && h3.lists > h3Lists, hang(10_000));
+  await sleep(settle(500));
+  check(
+    'M3 two claimants at once: no flapping across a list poll (no new subscribe, still followed through the same host)',
+    taken === true && h1.lists > h1Lists && h3.lists > h3Lists && h1.subscribes.length === h1Subs && h3.subscribes.length === h3Subs && isLiveVia(TEAM_ID, 's626262'),
+    JSON.stringify({ lists: [h1.lists - h1Lists, h3.lists - h3Lists], subs: [h1.subscribes.length - h1Subs, h3.subscribes.length - h3Subs], last: viewSummary(TEAM_ID) }),
+  );
+  h3.ownsTeam = false;
+  const handedBack = await until(() => isLiveVia(TEAM_ID, 's424242'), hang(8_000));
+  const wideList = await call(sc, 'cco.team.list', WIDE);
+  check(
+    'M2 the other host stops claiming the team (scope unchanged): live again through the pane host',
+    taken === true && handedBack === true && wideList.teams.some((t) => t.teamId === TEAM_ID && t.live === true && t.hostKey === 's424242'),
+    JSON.stringify({ taken: taken === true, last: viewSummary(TEAM_ID), teams: wideList.teams.map((t) => [t.teamId, t.live, t.hostKey]) }),
+  );
+  // Back to the scope the next section expects: h3 out of sight, the team live via the pane host.
+  h3.ownsTeam = true;
+  await call(sc, 'cco.team.list', PANE_SCOPE);
+  await until(() => h3.conns.size === 0 && isLiveVia(TEAM_ID, 's424242'), hang(8_000));
 }
 
 // ── K. worker accounts (Plan #3c: `cco.workers` → `tools/call list_workers`) ──
@@ -856,6 +987,7 @@ const PANE_SCOPE = { roots: [], panePids: [424242] };
 const REFRESH_WAIT_MS = 5_150; // just past WORKERS_REFRESH_MIN_MS
 
 async function workersSection(h1) {
+  section('K. worker accounts');
   // K1: three consumers at once share ONE host call; the snapshot is the fixture, by value.
   h1.workers = { mode: 'snapshot' };
   const [a, b, c] = await Promise.all([call(sc, 'cco.workers', PANE_SCOPE), call(sc, 'cco.workers', PANE_SCOPE), call(sc, 'cco.workers', PANE_SCOPE)]);
@@ -941,8 +1073,13 @@ async function workersSection(h1) {
 
   // K16: the socket goes away → the snapshot is kept, stale, with its time; no host is asked.
   const callsBefore = h1.toolCalls.length;
+  const closedLogs = () => sc.stderr.filter((l) => l.includes('the connection closed')).length;
+  const closedBefore = closedLogs();
   h1.dropAll();
   await sleep(150);
+  // On a loaded machine 150 ms may not be enough for the sidecar to see the drop: wait for
+  // its own log line saying so (it comes before the ~1 s reconnect backoff ends).
+  await until(() => closedLogs() > closedBefore, hang(3_000));
   const dropped = await call(sc, 'cco.workers', PANE_SCOPE);
   {
     // K16b: the reason a team is listed with lives only while the host that said it is connected.
@@ -964,7 +1101,7 @@ async function workersSection(h1) {
   servers.push(restarted);
   await restarted.listen();
   writeRecord(424242, { hostPid: process.ppid });
-  await until(() => restarted.hellos.length > 0, 8_000);
+  await until(() => restarted.hellos.length > 0, hang(8_000));
   await sleep(REFRESH_WAIT_MS);
   const back = await call(sc, 'cco.workers', PANE_SCOPE);
   check('K18 a restarted host is asked inside the old floor (its predecessor is gone): fresh again', restarted.toolCalls.length === 1 && back.stale === false && back.unavailable === null && back.snapshot?.generatedAt > goodAt, JSON.stringify({ calls: restarted.toolCalls.length, u: back.unavailable, stale: back.stale }));
@@ -973,9 +1110,18 @@ async function workersSection(h1) {
 }
 
 const guard = setTimeout(() => {
-  process.stdout.write('\ncco-team: TIMED OUT\n');
+  const now = Date.now();
+  const waiting = [...(sc?.pending?.values() ?? [])].map((p) => `${p.method} (${now - p.at} ms)`);
+  process.stdout.write(
+    `\ncco-team: TIMED OUT after ${((now - STARTED_AT) / 1000).toFixed(1)} s (guard ${GUARD_MS} ms, CCO_TEAM_TEST_GUARD_MS; time scale ${TIME_SCALE}, CCO_TEAM_TEST_TIME_SCALE)\n` +
+      `  running:  section ${current.name} for ${((now - current.startedAt) / 1000).toFixed(1)} s, last check: ${lastCheck}\n` +
+      `  waiting on sidecar: ${waiting.length > 0 ? waiting.join(', ') : 'nothing'}\n` +
+      `  finished: ${sectionTimings() || '(none)'}\n` +
+      `  checks so far: ${checks - failures}/${checks} passed\n`,
+  );
+  for (const l of (sc?.stderr ?? []).slice(-30)) process.stdout.write(`  ${l}\n`);
   finish(1);
-}, 240_000);
+}, GUARD_MS);
 guard.unref();
 
 async function finish(code) {
@@ -997,7 +1143,8 @@ async function finish(code) {
 
 main()
   .then(async () => {
-    process.stdout.write(`\ncco-team: ${checks - failures}/${checks} checks passed\n`);
+    section('end');
+    process.stdout.write(`\ncco-team: ${checks - failures}/${checks} checks passed in ${((Date.now() - STARTED_AT) / 1000).toFixed(1)} s (${sectionTimings()})\n`);
     if (failures > 0) {
       process.stdout.write('sidecar stderr:\n');
       for (const l of (sc?.stderr ?? []).slice(-30)) process.stdout.write(`  ${l}\n`);

@@ -16,13 +16,18 @@
  * than as an error. The status bar's "Not connected — details" opens the sheet
  * focused on it (`ui.settingsFocus === 'diagnostics'`), which also runs it.
  *
- * Preview build (`src/features.ts`): Appearance and Diagnostics only. The
+ * Notifications: one toggle, `config.notifications.system` (default on), held
+ * in the store (`ui.systemNotifications`) because the health slice reads it.
+ * When macOS refused the permission this run (`lib/notify.ts`), a muted line
+ * under it says where to turn it back on.
+ *
+ * Preview build (`src/features.ts`): Appearance, Notifications and Diagnostics only. The
  * sections that configure the experimental lanes — Terminal, Memory and
  * supervision, Scan intervals, Agent binaries, Launch overrides, the terminal
  * font size and the signature buttons — appear only with the lanes on.
  */
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from 'react';
 import type { ReactNode } from 'react';
 
 import { Mono } from '../components/Mono';
@@ -33,6 +38,7 @@ import { LOCALES } from '../i18n';
 import type { MessageKey } from '../i18n';
 import { LANGUAGE_NAME } from '../shell/TitleBar';
 import { cmd, isUnavailable, asGildeError } from '../lib/commands';
+import { notifyPermission, subscribeNotifyPermission } from '../lib/notify';
 import type {
   AgentKindKey,
   GildeErrorPayload,
@@ -316,6 +322,9 @@ export function SettingsForm({
   const setTheme = useAppStore((s) => s.setTheme);
   const theme = useAppStore((s) => s.ui.theme);
   const localePref = useAppStore((s) => s.ui.localePref);
+  const systemNotifications = useAppStore((s) => s.ui.systemNotifications);
+  const setSystemNotifications = useAppStore((s) => s.setSystemNotifications);
+  const permission = useSyncExternalStore(subscribeNotifyPermission, notifyPermission, notifyPermission);
   const lanes = experimentalLanes();
 
   useEffect(() => {
@@ -424,6 +433,26 @@ export function SettingsForm({
               onCommit={(value) => onPatch({ terminal: { fontSize: value } })}
             />
           </Row>
+        ) : null}
+      </div>
+
+      {/* -- notifications -------------------------------------------------- */}
+      <div className="set-sec">{t('settings.section.notifications')}</div>
+      <div className="set-group">
+        <Row label={t('settings.systemNotifications')} hint={t('settings.systemNotifications.hint')}>
+          <Toggle
+            value={systemNotifications}
+            label={t('settings.systemNotifications')}
+            onChange={setSystemNotifications}
+          />
+        </Row>
+        {permission === 'denied' ? (
+          <div className="set-row">
+            <span />
+            <span className="set-hint muted" data-testid="notify-denied">
+              {t('settings.systemNotifications.denied')}
+            </span>
+          </div>
         ) : null}
       </div>
 

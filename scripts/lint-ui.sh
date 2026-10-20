@@ -53,7 +53,7 @@ command -v python3 >/dev/null 2>&1 || {
 }
 
 ALLOW_DEPS="react react-dom @tauri-apps/api @tauri-apps/plugin-opener
-@tauri-apps/plugin-dialog @xterm/xterm @xterm/addon-fit @xterm/addon-web-links
+@tauri-apps/plugin-dialog @tauri-apps/plugin-notification @xterm/xterm @xterm/addon-fit @xterm/addon-web-links
 @xterm/addon-webgl zustand @xyflow/react @dagrejs/dagre @types/react
 @types/react-dom @vitejs/plugin-react typescript vite @tauri-apps/cli esbuild
 @types/node"

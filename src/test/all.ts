@@ -21,6 +21,7 @@ import '../monitor/monitor.test'; // T23
 import '../graph/graph.test'; // T25
 import '../shell/shell.test'; // M1.5 C-shell (BACKLOG 3, 6, 9)
 import '../shell/health.test'; // the health surface (indicator, popover, alerts)
+import '../lib/notify.test'; // system notifications for health alerts
 import '../dialogs/dialogs.test'; // T26
 import '../palette/palette.test'; // T27
 import '../team/team.test'; // T8 team preview (read-only)

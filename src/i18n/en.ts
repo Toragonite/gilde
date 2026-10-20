@@ -596,6 +596,7 @@ export const en: Record<MessageKey, string> = {
   // -- settings sheet (T26, DESIGN §10-3, §10-6) ----------------------------
   'settings.title': 'Settings',
   'settings.section.appearance': 'Appearance',
+  'settings.section.notifications': 'Notifications',
   'settings.section.terminal': 'Terminal',
   'settings.section.memory': 'Memory and supervision',
   'settings.section.scan': 'Scan intervals',
@@ -605,6 +606,11 @@ export const en: Record<MessageKey, string> = {
   'settings.locale': 'Language',
   'settings.locale.system': 'Follow the system',
   'settings.theme': 'Theme',
+  'settings.systemNotifications': 'System notifications',
+  'settings.systemNotifications.hint':
+    'When Gilde is in the background, problems that need you are also shown as macOS notifications.',
+  'settings.systemNotifications.denied':
+    'Notifications are turned off for Gilde in macOS System Settings → Notifications.',
   'settings.fontSize': 'Terminal font size',
   'settings.rawPtyLog': 'Raw PTY log',
   'settings.rawPtyLog.hint':

@@ -419,6 +419,32 @@ pub struct AccountsConfig {
     pub extra: Extra,
 }
 
+fn default_true() -> bool {
+    true
+}
+
+/// What the app may tell the user outside its own window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct NotificationsConfig {
+    /// A health alert that needs the user is also posted as a macOS
+    /// notification while the window is in the background. Default on; a
+    /// config written before this field existed reads as on.
+    #[serde(default = "default_true")]
+    pub system: bool,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            system: default_true(),
+            extra: Extra::new(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // root
 // ---------------------------------------------------------------------------
@@ -442,6 +468,7 @@ pub struct AppConfig {
     pub terminal: TerminalConfig,
     pub layout: LayoutConfig,
     pub accounts: AccountsConfig,
+    pub notifications: NotificationsConfig,
     /// Keys written by a newer build. Never interpreted, never dropped.
     #[serde(flatten)]
     pub extra: Extra,
@@ -463,6 +490,7 @@ impl Default for AppConfig {
             terminal: TerminalConfig::default(),
             layout: LayoutConfig::default(),
             accounts: AccountsConfig::default(),
+            notifications: NotificationsConfig::default(),
             extra: Extra::new(),
         }
     }
@@ -589,11 +617,12 @@ mod tests {
             })
         );
         assert_eq!(value["accounts"], json!({ "registryMode": "import-once" }));
+        assert_eq!(value["notifications"], json!({ "system": true }));
 
-        // Exactly the sections DESIGN §10-3 lists — no more, no less.
+        // Exactly the sections DESIGN §10-3 lists, plus `notifications` — no more, no less.
         assert_eq!(
             value.as_object().expect("object").len(),
-            13,
+            14,
             "unexpected top-level keys: {value:#?}"
         );
     }
@@ -707,6 +736,29 @@ mod tests {
         let mut base = json!({ "keep": 1, "drop": { "nested": true } });
         deep_merge(&mut base, json!({ "drop": null }));
         assert_eq!(base, json!({ "keep": 1 }));
+    }
+
+    #[test]
+    fn an_old_config_without_notifications_reads_system_notifications_as_on() {
+        // A config.json written before the field existed: no section at all.
+        let cfg: AppConfig =
+            serde_json::from_str(r#"{ "schemaVersion": 1, "locale": "ko", "theme": "dark" }"#).expect("parse");
+        assert!(cfg.notifications.system, "no section → on");
+        // A section without the field (e.g. only a key from a newer build).
+        let cfg: AppConfig =
+            serde_json::from_str(r#"{ "notifications": { "futureKnob": 1 } }"#).expect("parse");
+        assert!(cfg.notifications.system, "no field → on");
+        assert_eq!(cfg.notifications.extra.get("futureKnob"), Some(&json!(1)), "unknown keys kept");
+        // An explicit choice is kept and round-trips.
+        let cfg: AppConfig = serde_json::from_str(r#"{ "notifications": { "system": false } }"#).expect("parse");
+        assert!(!cfg.notifications.system, "an explicit off stays off");
+        let value = serde_json::to_value(&cfg).expect("serialize");
+        assert_eq!(value["notifications"], json!({ "system": false }));
+        // `{"notifications":{"system":null}}` (the reset patch) removes the key → back to on.
+        let mut raw = serde_json::to_value(&cfg).expect("serialize");
+        deep_merge(&mut raw, json!({ "notifications": { "system": null } }));
+        let back: AppConfig = serde_json::from_value(raw).expect("parse");
+        assert!(back.notifications.system, "reset → the default, on");
     }
 
     #[test]

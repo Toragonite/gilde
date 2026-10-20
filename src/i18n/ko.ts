@@ -135,7 +135,7 @@ export const ko = {
   'health.teams.none': '실행 중인 팀이 없습니다.',
   'health.teams.unknown': '팀 정보를 읽지 못했습니다. 연결되면 다시 보여 드립니다.',
   'health.member.running': '실행 중',
-  'health.member.idle': '대기',
+  'health.member.idle': '유휴',
   'health.member.leftover': '남은 프로세스',
   'health.team.hostGone': '디스패치 호스트 없음',
   'health.hosts': '디스패치 호스트 {n}개',
@@ -602,6 +602,7 @@ export const ko = {
   // -- settings sheet (T26, DESIGN §10-3, §10-6) ----------------------------
   'settings.title': '설정',
   'settings.section.appearance': '표시',
+  'settings.section.notifications': '알림',
   'settings.section.terminal': '터미널',
   'settings.section.memory': '메모리와 감독',
   'settings.section.scan': '스캔 주기',
@@ -611,6 +612,10 @@ export const ko = {
   'settings.locale': '언어',
   'settings.locale.system': '시스템 설정 따름',
   'settings.theme': '테마',
+  'settings.systemNotifications': '시스템 알림',
+  'settings.systemNotifications.hint':
+    'Gilde가 백그라운드에 있을 때 조치가 필요한 문제를 macOS 알림으로도 알립니다.',
+  'settings.systemNotifications.denied': 'macOS 시스템 설정 → 알림에서 Gilde 알림이 꺼져 있습니다.',
   'settings.fontSize': '터미널 글꼴 크기',
   'settings.rawPtyLog': 'PTY 원본 로그',
   'settings.rawPtyLog.hint': '기본은 끔. 켜면 세션 바이트를 sessions/<id>/raw.log에 그대로 씁니다.',

@@ -61,6 +61,9 @@ tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri-plugin-dialog = "2.7.3"
+# 2.4 is the last line that builds on tauri 2.11 (2.5+ needs tauri ^2.12);
+# keep it in step with `@tauri-apps/plugin-notification` in package.json.
+tauri-plugin-notification = "2.4.0"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time", "fs", "signal"] }
 thiserror = "2.0.20"
 anyhow = "1.0.104"

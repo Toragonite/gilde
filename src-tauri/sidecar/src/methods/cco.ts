@@ -1231,6 +1231,29 @@ export class CcoObserver implements WorkersHostSource {
       if (team.timer !== undefined) clearTimeout(team.timer);
       this.live.delete(teamId);
       this.changed(teamId);
+      this.refollow(teamId, hostKey);
+    }
+  }
+
+  /**
+   * Whether the host behind `hostKey` follows `teamId` now: connected, and its
+   * subscription is to that team.
+   */
+  private following(hostKey: string, teamId: string): boolean {
+    const host = this.hosts.get(hostKey);
+    return host?.client !== undefined && !host.client.closed && host.sub?.teamId === teamId;
+  }
+
+  /**
+   * The live side of `teamId` (followed through `goneKey`) just went. Another connected
+   * host may claim the same team (a lease handoff window, or a second host in sight with
+   * `allWorkspaces`): its subscription was left in place when the team was taken over
+   * through `goneKey`, so ask it again now — its list poll follows the team afresh.
+   */
+  private refollow(teamId: string, goneKey: string): void {
+    for (const other of this.hosts.values()) {
+      if (other.key === goneKey || other.sub?.teamId !== teamId) continue;
+      if (other.client !== undefined && !other.client.closed) void this.pollList(other);
     }
   }
 
@@ -1354,7 +1377,14 @@ export class CcoObserver implements WorkersHostSource {
         }
         return;
       }
-      if (host.sub?.teamId !== owned) await this.startTeam(host, client, owned);
+      // Follow it unless this host already does. "Already" means the live side is this
+      // host's own: a subscription left in place while another host took the team over is
+      // not following it once that other host is gone (a team is followed through ONE
+      // connection; the most recent claimant wins and keeps it while it follows it).
+      const team = this.live.get(owned);
+      const ownLive = team !== undefined && team.hostKey === host.key;
+      const heldElsewhere = team !== undefined && !ownLive && this.following(team.hostKey, owned);
+      if (host.sub?.teamId !== owned || (!ownLive && !heldElsewhere)) await this.startTeam(host, client, owned);
     } finally {
       host.listing = false;
     }

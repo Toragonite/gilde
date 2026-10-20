@@ -12,6 +12,9 @@
  *     because its severity rose) carries a new `raisedAt` and is toasted once
  *     more. `attention` alerts never toast — they only colour the indicator.
  *     When an alert ends, is dismissed, or is no longer `action`, its toast goes.
+ *     The same moment — and only then — is when a system notification may be
+ *     posted (`lib/notify.ts`: setting on, window not focused, macOS allows
+ *     it). It runs on its own and can never hold up or break the toast.
  *  2. **Actions.** Copy command (clipboard), Details / Show agents (the
  *     popover), Clean up (the existing kill sheet, restricted by Rust to the
  *     confirmed leftovers via `onlyHealthOrphans`).
@@ -23,6 +26,7 @@
 import type { StateCreator } from 'zustand';
 
 import { cmd, isUnavailable } from '../lib/commands';
+import { notifyHealthAlert } from '../lib/notify';
 import type { HealthAction, HealthAlert, HealthSnapshot } from '../lib/ipc';
 import { cleanUpAgents } from '../shell/healthText';
 import type { ProcSlice } from './procSlice';
@@ -104,6 +108,18 @@ export const createHealthSlice: StateCreator<
 > = (set, get) => {
   const patch = (update: Partial<HealthState>) => set({ health: { ...get().health, ...update } });
 
+  /** The OS notification for a raise that was just toasted. Fire and forget; it never throws. */
+  const postSystemNotification = (alert: HealthAlert) => {
+    try {
+      const ui = get().ui;
+      void notifyHealthAlert(alert, { locale: ui.locale, enabled: ui.systemNotifications !== false }).catch(
+        () => undefined,
+      );
+    } catch (e) {
+      console.warn('[gilde] notify: not started', e);
+    }
+  };
+
   return {
     health: initialHealthState(),
 
@@ -144,6 +160,7 @@ export const createHealthSlice: StateCreator<
           actions: alert.actions,
         });
         toastOf.set(alert.id, id);
+        postSystemNotification(alert);
       }
       patch({ snapshot, toasted, toastOf });
     },

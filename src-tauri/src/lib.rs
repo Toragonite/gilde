@@ -186,6 +186,9 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        // System notifications for health alerts (`src/lib/notify.ts`); the
+        // capability grants only the permission check, the request and `notify`.
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             boot(app)?;
             Ok(())

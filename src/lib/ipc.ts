@@ -464,6 +464,12 @@ export interface AccountsConfig {
   registryMode: 'import-once' | 'follow';
 }
 
+/** What the app may tell the user outside its window. */
+export interface NotificationsConfig {
+  /** Health alerts that need the user also as macOS notifications while in the background. Default true. */
+  system: boolean;
+}
+
 /** `config.json` (DESIGN §10-3). Unknown keys round-trip untouched. */
 export interface AppConfig {
   schemaVersion: number;
@@ -479,6 +485,8 @@ export interface AppConfig {
   terminal: TerminalConfig;
   layout: LayoutConfig;
   accounts: AccountsConfig;
+  /** Optional only so a payload from an older backend still type-checks; absent = defaults. */
+  notifications?: NotificationsConfig;
   [extra: string]: unknown;
 }
 

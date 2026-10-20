@@ -126,6 +126,12 @@ export interface UiState {
    * that was removed) = the first project folder. Persisted.
    */
   teamFolderId: string | null;
+  /**
+   * `config.notifications.system`: health alerts that need the user are also
+   * posted as macOS notifications while the window is in the background.
+   * Default on. Persisted.
+   */
+  systemNotifications: boolean;
   hydrated: boolean;
 }
 
@@ -138,6 +144,8 @@ export interface UiSlice {
   /** A language, or `system` to follow the OS. Persisted as given. */
   setLocale: (locale: LocalePreference) => void;
   setTheme: (theme: ThemePreference) => void;
+  /** Turn system notifications on or off. Persisted. */
+  setSystemNotifications: (on: boolean) => void;
   toggleSidebar: () => void;
   setSidebarWidth: (width: number) => void;
   toggleInspector: () => void;
@@ -287,6 +295,7 @@ export function initialUiState(): UiState {
     teamScope: 'all',
     teamGroupBy: 'repository',
     teamFolderId: null,
+    systemNotifications: true,
     hydrated: false,
   };
 }
@@ -431,6 +440,11 @@ export const createUiSlice: StateCreator<
     setTheme: (theme) => {
       patchUi({ theme });
       void cmd.appSettingsSet({ theme }).catch(() => undefined);
+    },
+
+    setSystemNotifications: (on) => {
+      patchUi({ systemNotifications: on });
+      void cmd.appSettingsSet({ notifications: { system: on } }).catch(() => undefined);
     },
 
     toggleSidebar: () => patchUi({ sidebarVisible: !get().ui.sidebarVisible }, true),
@@ -706,6 +720,8 @@ export const createUiSlice: StateCreator<
             typeof panes.teamFolderId === 'string' && panes.teamFolderId !== ''
               ? panes.teamFolderId
               : ui.teamFolderId,
+          // Only an explicit `false` turns it off; an old config without the key reads as on.
+          systemNotifications: config.notifications?.system !== false,
           hydrated: true,
         },
       });
