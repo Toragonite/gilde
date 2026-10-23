@@ -1,13 +1,16 @@
 /*
  * Design tokens — the ONLY file in src/ allowed to contain colour literals.
- * Values are copied verbatim from docs/UI-GUIDELINES.md §2-1a (v2, pure
- * greyscale) and docs/ui-mockups/shared.css.
+ * Values come from docs/UI-GUIDELINES.md §2-1a (v2, pure greyscale), with the
+ * light accent darkened for contrast (A9.5), plus the identity swatches [M12]
+ * and the Floor pixel palette copied from the prototype (A23.1).
  *
- * Shape (DESIGN §9-10 + UI-GUIDELINES §2-1):
+ * Shape (UI-GUIDELINES §2-1):
  *   - one neutral scale  --n0 … --n12
  *   - one accent         --accent           (focus ring, links, text cursor only)
  *   - four semantic      --ok --warn --error --info
- *   - one border, one popover shadow, two radii
+ *   - one border, one popover shadow, one scrim, two radii
+ *   - eight identity swatches --id-*        (swatches and the Floor only)
+ *   - the Floor palette  --px-*              (src/floor only)
  *
  * Theme resolution:
  *   :root                                  → complete light palette
@@ -15,6 +18,7 @@
  *   :root[data-theme="dark"|"light"]       → explicit override wins both ways
  *
  * Components never know which theme is active; they only read var(--…).
+ * scripts/gates/contrast.mjs computes the ux-ia §10 pairs from this file.
  */
 
 :root {
@@ -36,7 +40,9 @@
   /* -- primary / accent ------------------------------------------------ */
   --primary: #0a0a0a;
   --on-primary: #ffffff;
-  --accent: #1f6feb;
+  /* A9.5: #1f6feb measured 4.44:1 on --n1; #1c69dd keeps the hue at 4.89:1
+     on --n1 and 4.64:1 on --n2 (links on raised surfaces). */
+  --accent: #1c69dd;
 
   /* -- semantic (exactly four) ----------------------------------------- */
   --ok: #1a7f37;
@@ -47,8 +53,75 @@
   /* -- surfaces -------------------------------------------------------- */
   --border: rgba(0, 0, 0, 0.1);
   --shadow-popover: 0 8px 24px rgba(0, 0, 0, 0.12);
+  --scrim: rgba(0, 0, 0, 0.16);
+
+  /* -- identity swatches [M12, A23.1]: swatches and Floor characters only */
+  --id-red: #c9483d;
+  --id-blue: #2f6ccf;
+  --id-green: #2c8c50;
+  --id-yellow: #b48a12;
+  --id-purple: #7f55c4;
+  --id-orange: #cf6f26;
+  --id-pink: #c24d8a;
+  --id-cyan: #1a8a9e;
+
+  /* -- Floor drawing [A23.1]: the prototype pixel palette */
+  --px-bg: #ffffff;
+  --px-floor-a: #eeeeee;
+  --px-floor-b: #e8e8e8;
+  --px-wall: #d9d9d9;
+  --px-wall-top: #cfcfcf;
+  --px-trim: #bdbdbd;
+  --px-door: #b9a993;
+  --px-door-dark: #5a5a5a;
+  --px-knob: #3a3a3a;
+  --px-desk: #c6b29a;
+  --px-desk-top: #d8c7b0;
+  --px-desk-edge: #9c8870;
+  --px-chair: #8d939b;
+  --px-chair-dark: #757b83;
+  --px-monitor: #4a4f57;
+  --px-screen-on: #bcd3ea;
+  --px-screen-line: #ffffff;
+  --px-screen-off: #2a2d31;
+  --px-glass: rgba(70, 120, 160, 0.55);
+  --px-glint: rgba(255, 255, 255, 0.95);
+  --px-board: #fbf9f3;
+  --px-board-edge: #8f8573;
+  --px-board-line: #c9c1ae;
+  --px-paper: #ffffff;
+  --px-paper-edge: #9c978a;
+  --px-ink: #3a3a3a;
+  --px-outline: #2a2a2a;
+  --px-pants: #4a5160;
+  --px-shoes: #2a2a30;
+  --px-acc: #55555f;
+  --px-acc-light: #7a7a86;
+  --px-smoke: #9a9a9a;
+  --px-text: #525252;
+  --px-text-strong: #0a0a0a;
+  --px-bubble: #ffffff;
+  --px-glyph: #0a0a0a;
 
   color-scheme: light;
+
+  /* -- sprite identity data (the same in both themes, so only here) ---- */
+  --px-eye: #1a1410;
+  --px-shirt-1: #7d7d7d;
+  --px-shirt-2: #5f6874;
+  --px-shirt-3: #8a806c;
+  --px-shirt-4: #4f5762;
+  --px-skin-1: #f1c7a5;
+  --px-skin-2: #e0a982;
+  --px-skin-3: #c68a62;
+  --px-skin-4: #9a6544;
+  --px-skin-5: #6e4630;
+  --px-hair-1: #2b2420;
+  --px-hair-2: #5a3a24;
+  --px-hair-3: #8a5a32;
+  --px-hair-4: #c8a060;
+  --px-hair-5: #46464f;
+  --px-hair-6: #a04a2a;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -78,6 +151,55 @@
 
     --border: rgba(255, 255, 255, 0.08);
     --shadow-popover: 0 8px 24px rgba(0, 0, 0, 0.5);
+    --scrim: rgba(0, 0, 0, 0.45);
+
+    /* -- identity swatches [M12, A23.1]: swatches and Floor characters only */
+    --id-red: #f06a5f;
+    --id-blue: #5d9bff;
+    --id-green: #4cc27a;
+    --id-yellow: #e2bf4c;
+    --id-purple: #a888f0;
+    --id-orange: #f29a52;
+    --id-pink: #ec7cb8;
+    --id-cyan: #45c0d4;
+
+    /* -- Floor drawing [A23.1]: the prototype pixel palette */
+    --px-bg: #0f0f0f;
+    --px-floor-a: #1c1c1c;
+    --px-floor-b: #202020;
+    --px-wall: #2a2a2a;
+    --px-wall-top: #343434;
+    --px-trim: #3f3f3f;
+    --px-door: #3a3530;
+    --px-door-dark: #121212;
+    --px-knob: #8a8a8a;
+    --px-desk: #4a4038;
+    --px-desk-top: #5e5247;
+    --px-desk-edge: #2c2622;
+    --px-chair: #2f3338;
+    --px-chair-dark: #24272b;
+    --px-monitor: #30343a;
+    --px-screen-on: #9fb3c8;
+    --px-screen-line: #e6eef6;
+    --px-screen-off: #16181b;
+    --px-glass: rgba(169, 196, 214, 0.55);
+    --px-glint: rgba(230, 242, 250, 0.8);
+    --px-board: #d9d4c6;
+    --px-board-edge: #6b6355;
+    --px-board-line: #a59e8e;
+    --px-paper: #e9e6dc;
+    --px-paper-edge: #9c978a;
+    --px-ink: #3a3a3a;
+    --px-outline: #080808;
+    --px-pants: #3a3f4a;
+    --px-shoes: #1b1b1f;
+    --px-acc: #9a9aa4;
+    --px-acc-light: #c4c4cc;
+    --px-smoke: #8f8f8f;
+    --px-text: #a3a3a3;
+    --px-text-strong: #ededed;
+    --px-bubble: #1a1a1a;
+    --px-glyph: #ededed;
 
     color-scheme: dark;
   }
@@ -109,6 +231,55 @@
 
   --border: rgba(255, 255, 255, 0.08);
   --shadow-popover: 0 8px 24px rgba(0, 0, 0, 0.5);
+  --scrim: rgba(0, 0, 0, 0.45);
+
+  /* -- identity swatches [M12, A23.1]: swatches and Floor characters only */
+  --id-red: #f06a5f;
+  --id-blue: #5d9bff;
+  --id-green: #4cc27a;
+  --id-yellow: #e2bf4c;
+  --id-purple: #a888f0;
+  --id-orange: #f29a52;
+  --id-pink: #ec7cb8;
+  --id-cyan: #45c0d4;
+
+  /* -- Floor drawing [A23.1]: the prototype pixel palette */
+  --px-bg: #0f0f0f;
+  --px-floor-a: #1c1c1c;
+  --px-floor-b: #202020;
+  --px-wall: #2a2a2a;
+  --px-wall-top: #343434;
+  --px-trim: #3f3f3f;
+  --px-door: #3a3530;
+  --px-door-dark: #121212;
+  --px-knob: #8a8a8a;
+  --px-desk: #4a4038;
+  --px-desk-top: #5e5247;
+  --px-desk-edge: #2c2622;
+  --px-chair: #2f3338;
+  --px-chair-dark: #24272b;
+  --px-monitor: #30343a;
+  --px-screen-on: #9fb3c8;
+  --px-screen-line: #e6eef6;
+  --px-screen-off: #16181b;
+  --px-glass: rgba(169, 196, 214, 0.55);
+  --px-glint: rgba(230, 242, 250, 0.8);
+  --px-board: #d9d4c6;
+  --px-board-edge: #6b6355;
+  --px-board-line: #a59e8e;
+  --px-paper: #e9e6dc;
+  --px-paper-edge: #9c978a;
+  --px-ink: #3a3a3a;
+  --px-outline: #080808;
+  --px-pants: #3a3f4a;
+  --px-shoes: #1b1b1f;
+  --px-acc: #9a9aa4;
+  --px-acc-light: #c4c4cc;
+  --px-smoke: #8f8f8f;
+  --px-text: #a3a3a3;
+  --px-text-strong: #ededed;
+  --px-bubble: #1a1a1a;
+  --px-glyph: #ededed;
 
   color-scheme: dark;
 }
@@ -128,26 +299,79 @@
   --n11: #1f1f1f;
   --n12: #0a0a0a;
 
+  /* -- primary / accent ------------------------------------------------ */
   --primary: #0a0a0a;
   --on-primary: #ffffff;
-  --accent: #1f6feb;
+  /* A9.5: #1f6feb measured 4.44:1 on --n1; #1c69dd keeps the hue at 4.89:1
+     on --n1 and 4.64:1 on --n2 (links on raised surfaces). */
+  --accent: #1c69dd;
 
+  /* -- semantic (exactly four) ----------------------------------------- */
   --ok: #1a7f37;
   --warn: #9a6700;
   --error: #cf222e;
   --info: #6b6b6b;
 
+  /* -- surfaces -------------------------------------------------------- */
   --border: rgba(0, 0, 0, 0.1);
   --shadow-popover: 0 8px 24px rgba(0, 0, 0, 0.12);
+  --scrim: rgba(0, 0, 0, 0.16);
+
+  /* -- identity swatches [M12, A23.1]: swatches and Floor characters only */
+  --id-red: #c9483d;
+  --id-blue: #2f6ccf;
+  --id-green: #2c8c50;
+  --id-yellow: #b48a12;
+  --id-purple: #7f55c4;
+  --id-orange: #cf6f26;
+  --id-pink: #c24d8a;
+  --id-cyan: #1a8a9e;
+
+  /* -- Floor drawing [A23.1]: the prototype pixel palette */
+  --px-bg: #ffffff;
+  --px-floor-a: #eeeeee;
+  --px-floor-b: #e8e8e8;
+  --px-wall: #d9d9d9;
+  --px-wall-top: #cfcfcf;
+  --px-trim: #bdbdbd;
+  --px-door: #b9a993;
+  --px-door-dark: #5a5a5a;
+  --px-knob: #3a3a3a;
+  --px-desk: #c6b29a;
+  --px-desk-top: #d8c7b0;
+  --px-desk-edge: #9c8870;
+  --px-chair: #8d939b;
+  --px-chair-dark: #757b83;
+  --px-monitor: #4a4f57;
+  --px-screen-on: #bcd3ea;
+  --px-screen-line: #ffffff;
+  --px-screen-off: #2a2d31;
+  --px-glass: rgba(70, 120, 160, 0.55);
+  --px-glint: rgba(255, 255, 255, 0.95);
+  --px-board: #fbf9f3;
+  --px-board-edge: #8f8573;
+  --px-board-line: #c9c1ae;
+  --px-paper: #ffffff;
+  --px-paper-edge: #9c978a;
+  --px-ink: #3a3a3a;
+  --px-outline: #2a2a2a;
+  --px-pants: #4a5160;
+  --px-shoes: #2a2a30;
+  --px-acc: #55555f;
+  --px-acc-light: #7a7a86;
+  --px-smoke: #9a9a9a;
+  --px-text: #525252;
+  --px-text-strong: #0a0a0a;
+  --px-bubble: #ffffff;
+  --px-glyph: #0a0a0a;
 
   color-scheme: light;
 }
 
 /*
- * Status tokens (DESIGN §9-6). These are ALIASES onto the four semantic
- * colours plus the neutral scale — UI-GUIDELINES §2-1a forbids inventing a
- * colour per status. One name per status so the graph, the sidebar dots, the
- * tab pills and the monitor chips cannot drift apart.
+ * Status aliases onto the four semantic colours plus the neutral scale —
+ * UI-GUIDELINES §2-1a forbids a colour per status. Kept for the primitives
+ * that still read them (global.css `.dot`).
  */
 :root {
   --st-idle: var(--info);
@@ -186,17 +410,14 @@
   --sp-24: 24px;
   --sp-32: 32px;
 
-  /* -- fixed shell metrics --------------------------------------------- */
-  --rail-w: 48px;
-  --titlebar-h: 32px;
+  /* -- shell metrics (ux-ia §2.4, §2.8) ------------------------------- */
+  --topbar-h: 40px;
   --hdr-h: 32px;
   --tab-h: 32px;
   --row-h: 26px;
-  --statusbar-h: 24px;
-  --sidebar-min: 260px;
-  --sidebar-max: 420px;
-  --inspector-min: 300px;
-  --inspector-max: 480px;
+  --sidebar-w: 300px;
+  --sidebar-w-narrow: 248px;
+  --home-col: 720px;
 
   /* -- motion (UI-GUIDELINES §2-5: 120–160ms, ease-out, no springs) ----- */
   --motion-fast: 120ms;

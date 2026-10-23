@@ -1,453 +1,764 @@
 /**
- * Team preview tests (T8, team contract v2 §8.2).
- *
- * The fixture is not hand-written: it is a `cco.team.snapshot` exactly as the
- * sidecar's observer composed it against a fake dispatch host
- * (`src-tauri/sidecar/test/cco-team.mjs` with `CCO_FIXTURE_OUT`), the same file
- * the Rust relay tests decode. Rust adds `generation` and `believed` on the way;
- * the tests add them the same way.
- *
- * What is pinned:
- *
- *  1. the pane renders a real snapshot: roster with engine state pills and the
- *     blocked reason, the board grouped into the five columns, the messages,
- *     and a selected member's activity;
- *  2. it is READ-ONLY: no input, no textarea, and no button but the local ones
- *     (refresh, member selection) — no composer, no member action, no take-over;
- *  3. L7: a team read from disk whose host is gone shows "host gone" and
- *     "was running", never `running`;
- *  4. the empty states say why (team mode off, sidecar down);
- *  5. hostile strings are flattened, capped and escaped;
- *  6. the slice keeps the newest `(generation, rev)` and withdraws on `null`;
- *  7. CCO 0b7b1b8 `TeamListEntry.reason` (relayed in the list summary): shown in
- *     the selected team's header and on its team chip (full line as the chip's
- *     title), flattened and capped; absent or blank, nothing is shown.
+ * Team screen tests (contract §15.2 T16: tile focus/keys, never steal focus,
+ * layout persistence, ownership bars for external teams, prefill never sends;
+ * §15.5 Board on the no-task-tools fixture; §15.6 F-04, F-15, F-49; A21.4,
+ * A23.2; A44.1 a tile's guard restarts for a replaced request; ux-ia §3.8–§3.10, J5).
  */
 
-import { renderToStaticMarkup } from 'react-dom/server';
+import { act, cleanup, fireEvent, render } from '@testing-library/react';
 
-import fixture from '../../src-tauri/tests/fixtures/cco/team-snapshot.json';
+import { resetAnswersForTests } from '../approval/answer';
+import { GUARD_MS, refreshGuards, resetAnswerGuardForTests } from '../hooks/useAnswerGuard';
+import { resetHotkeysForTests } from '../hooks/useHotkeys';
+import { manualClock, setClockForTests } from '../lib/clock';
+import type { PaneTile } from '../lib/gen/PaneTile';
+import type { PendingInteraction } from '../lib/gen/PendingInteraction';
+import type { PtyId } from '../lib/gen/PtyId';
+import { setTerminalFactory } from '../terminal/terminalPool';
+import type { PooledTerminal } from '../terminal/terminalPool';
 import { translate } from '../i18n';
-import type { CcoTeamListResult, CcoTeamView, TeamSnapshotEvent } from '../lib/ipc';
-import { assert, assertEqual, test } from '../test/harness';
-import { initialTeamState, isNewerRevision, pruneUnlisted, reduceTeamSnapshot } from '../store/teamSlice';
-import type { TeamPreviewState } from '../store/teamSlice';
+import type { Member } from '../lib/gen/Member';
+import type { ScreenPromptKeyReq } from '../lib/gen/ScreenPromptKeyReq';
+import type { Session } from '../lib/gen/Session';
+import type { StoreSnapshot } from '../lib/gen/StoreSnapshot';
+import type { Team } from '../lib/gen/Team';
+import type { TeamViewMode } from '../lib/gen/TeamViewMode';
+import type { ViewState } from '../lib/gen/ViewState';
+import { getAnnouncements, resetAnnouncerForTests } from '../lib/notify';
+import { resetFocusForTests } from '../split/focus';
+import { resetReplaceForTests } from '../split/replace';
+import { PERSIST_DEBOUNCE_MS, startUiPersistence } from '../store/persist';
+import { appStore, useAppStore } from '../store/useAppStore';
 import { initialUiState } from '../store/uiSlice';
-import { useAppStore } from '../store/useAppStore';
+import { startViewStateReporter } from '../store/viewState';
+import { emptyWorld } from '../store/worldSlice';
+import { flush, withFakeCore } from '../test/backend';
+import type { FakeCore, Handler } from '../test/backend';
+import { pending, session, snapshot, uid } from '../test/fixtures';
+import { assert, assertDeepEqual, assertEqual, domTest } from '../test/harness';
+import { Board, resetBoardForTests } from './Board';
+import { ClosePaneSheet } from './ClosePaneSheet';
+import { resetPanesForTests } from './Panes';
+import { TeamScreen } from './TeamScreen';
 import {
-  boardColumns,
-  flat,
-  mailboxKey,
-  memberPill,
-  messageKindKey,
-  outcomeLabel,
-  providerBadge,
-  reasonLabel,
-  teamPill,
-  warningLabel,
-} from './model';
-import { AddProjectFolderButton, TeamPane, listReasons, noTeamCase } from './TeamPane';
-import { TeamMemberInspector } from './TeamMemberInspector';
+  TK,
+  boardTask,
+  hostedCaps,
+  inferredItem,
+  lead,
+  member,
+  message,
+  mkey,
+  paneSession,
+  team,
+  watchedSession,
+} from './testing';
 
-// ---------------------------------------------------------------------------
-// Fixtures
-// ---------------------------------------------------------------------------
+let rev = 5000;
 
-/** The real snapshot, with the two fields Rust stamps. */
-function realView(patch: Partial<CcoTeamView> = {}): CcoTeamView {
-  const raw = (fixture as unknown as { view: CcoTeamView }).view;
-  const view: CcoTeamView = JSON.parse(JSON.stringify(raw));
-  return { ...view, generation: 1, believed: true, ...patch };
+function setWorld(parts: Partial<StoreSnapshot>) {
+  act(() => {
+    appStore.getState().applyStoreSnapshot(snapshot(++rev, parts));
+  });
 }
 
-function listOf(views: CcoTeamView[], patch: Partial<CcoTeamListResult> = {}): CcoTeamListResult {
-  return {
-    available: true,
-    supported: true,
-    dataRoot: '/h/.claude-code-orchestrator',
-    teamMode: 'on',
-    hosts: [],
-    teams: views.map((v) => ({
-      teamId: v.teamId,
-      name: v.state.name,
-      title: v.state.title,
-      status: v.state.status,
-      source: v.source,
-      live: v.live,
-      members: v.state.members.length,
-      running: 0,
-      blocked: 0,
-      userUnread: 0,
-      leadUnread: 0,
-      createdAt: v.state.createdAt,
-      owner: v.state.owner,
-      rev: v.rev,
-      believed: v.believed,
-    })),
-    generation: 1,
-    ...patch,
+/** A hosted team: lead (1) + api-agent (2) + db-agent (3), all In Gilde. */
+function hostedWorld(extra: { team?: Partial<Team>; members?: Member[]; sessions?: Session[]; parts?: Partial<StoreSnapshot> } = {}) {
+  setWorld({
+    teams: [team(extra.team)],
+    members: extra.members ?? [lead(), member(2, 'api-agent'), member(3, 'db-agent', { colour: 'green' })],
+    sessions: extra.sessions ?? [paneSession(1, {}, 'lead'), paneSession(2), paneSession(3)],
+    ...extra.parts,
+  });
+}
+
+function openTeam(mode: TeamViewMode) {
+  act(() => {
+    const ui = appStore.getState().ui;
+    appStore.setState({ ui: { ...ui, view: { screen: 'team', teamKey: TK, mode } } });
+  });
+}
+
+/** The screen as the shell mounts it: props follow the main view. */
+function Mounted() {
+  const view = useAppStore((s) => s.ui.view);
+  if (view.screen !== 'team') return null;
+  return (
+    <>
+      <TeamScreen teamKey={view.teamKey} mode={view.mode} band="wide" />
+      <ClosePaneSheet />
+    </>
+  );
+}
+
+const base: Record<string, Handler> = {
+  convo_subscribe: () => ({ subId: 'v_00000000000000f1', source: 'stream', note: null }),
+  convo_unsubscribe: () => ({}),
+  session_mark_seen: () => ({}),
+  app_view_state: () => ({}),
+  ui_state_set: () => ({}),
+  owner_focus: () => ({ precision: 'app' }),
+  interaction_answer: () => ({ outcome: 'answered' }),
+  screen_prompt_key: () => ({ outcome: 'sent' }),
+  team_send: () => ({ route: 'memberPane' }),
+  team_message_body: () => ({ text: 'Take token verification.\nKeep the exported names.', summary: 'token work', source: 'recipientTranscript' }),
+  team_messages_page: () => ({ messages: [], hasMore: false }),
+  team_task_title: () => ({ title: null }),
+  team_member_close_preview: (req) => ({
+    lines: [
+      { key: 'team.closePane', params: {} },
+      { key: 'team.closePaneUnread', params: { member: (req as { memberKey: string }).memberKey === mkey(2) ? 'api-agent' : 'x' } },
+    ],
+    confirmToken: 'c_00000000000000000000000000000001',
+  }),
+  team_member_close: () => ({}),
+};
+
+const NEVER_SENT = ['turn_send', 'team_send', 'interaction_answer', 'screen_prompt_key'] as const;
+
+function harness(run: (core: FakeCore) => Promise<void>, extra: Record<string, Handler> = {}) {
+  return async () => {
+    resetHotkeysForTests();
+    resetAnswerGuardForTests();
+    resetAnswersForTests();
+    resetAnnouncerForTests();
+    resetFocusForTests();
+    resetReplaceForTests();
+    resetPanesForTests();
+    resetBoardForTests();
+    appStore.setState({ world: emptyWorld(), ui: { ...initialUiState(), locale: 'en', hydrated: true } });
+    try {
+      await withFakeCore({ ...base, ...extra }, async (core) => {
+        try {
+          await run(core);
+        } finally {
+          cleanup();
+        }
+      });
+    } finally {
+      resetHotkeysForTests();
+      setClockForTests(null);
+      setTerminalFactory(null);
+      appStore.setState({ world: emptyWorld(), ui: initialUiState() });
+    }
   };
 }
 
-function seedTeam(team: Partial<TeamPreviewState>): void {
-  useAppStore.setState({
-    ui: initialUiState(),
-    team: { ...initialTeamState(), watching: true, ...team },
-    // The pane starts watching on mount; on the server that effect never runs,
-    // but the store action must still be a harmless function.
-    startTeamWatch: () => () => undefined,
+async function settle(ms = 40) {
+  await act(async () => {
+    await flush(10);
+    await new Promise((r) => setTimeout(r, ms));
   });
 }
 
-function render(): string {
-  // Static rendering reads zustand's initial state (see test/render.test.tsx).
-  Object.assign(useAppStore.getInitialState(), useAppStore.getState());
-  return renderToStaticMarkup(
-    <TeamPane
-      descriptor={{ view: 'team' }}
-      tab={{ id: 't1', title: 'team', descriptor: { view: 'team' }, closable: true }}
-      paneId="pane-1"
-      active
-    />,
-  );
+const key = (k: string, mods: { meta?: boolean; alt?: boolean; shift?: boolean } = {}) => {
+  const code = /^[0-9]$/.test(k) ? `Digit${k}` : k.length === 1 ? `Key${k.toUpperCase()}` : k;
+  fireEvent.keyDown(document.activeElement ?? document.body, { key: k, code, metaKey: !!mods.meta, altKey: !!mods.alt, shiftKey: !!mods.shift });
+};
+
+const tiles = (c: HTMLElement) => [...c.querySelectorAll<HTMLElement>('section.g-tile')];
+const composerOf = (c: HTMLElement) => c.querySelector<HTMLTextAreaElement>('textarea.g-composer-input');
+const layout = () => appStore.getState().ui.teamLayouts[TK];
+
+domTest(
+  'Header and modes: Team name, lead + 2, In Gilde; ⌥⌘2 shows the Board without a history entry and keeps the mode in the layout',
+  harness(async () => {
+    hostedWorld();
+    openTeam('panes');
+    const view = render(<Mounted />);
+    await settle();
+    assert(view.getByRole('heading', { name: translate('en', 'team.title', { name: 'auth-split' }) }) !== null, 'title');
+    const meta = view.container.querySelector('.g-team-meta')?.textContent ?? '';
+    assert(meta.includes(translate('en', 'team.leadPlus', { members: 2 })) && meta.includes(translate('en', 'ownership.inGilde')), `meta: ${meta}`);
+    const tabs = view.getAllByRole('tab').map((t) => t.textContent);
+    assertDeepEqual(tabs, ['Panes', 'Board', 'Floor'], 'Panes · Board · Floor');
+    const backBefore = appStore.getState().ui.back.length;
+    key('2', { meta: true, alt: true });
+    await settle();
+    const v = appStore.getState().ui.view;
+    assertEqual(v.screen === 'team' ? v.mode : null, 'board', '⌥⌘2 = Board');
+    assertEqual(appStore.getState().ui.back.length, backBefore, 'no history entry (a sub-view)');
+    assertEqual(layout()?.mode, 'board', 'kept in teamLayout');
+    assert(view.getByRole('heading', { name: translate('en', 'team.board.members') }) !== null, 'the Board shows');
+  }),
+);
+
+domTest(
+  'Panes: lead + teammates as tiles; ⌘2 focuses the first teammate (store + composer); app_view_state names its session [F-04]',
+  harness(async (core) => {
+    hostedWorld();
+    openTeam('panes');
+    const stop = startViewStateReporter(
+      (l) => appStore.subscribe((s) => l(s.ui, s.world)),
+      { ui: appStore.getState().ui, world: appStore.getState().world },
+    );
+    try {
+      const view = render(<Mounted />);
+      await settle();
+      const list = tiles(view.container);
+      assertEqual(list.length, 3, 'three tiles');
+      assertEqual(list[0]?.getAttribute('data-uid'), uid(1), 'the lead first');
+      assert(list[0]?.textContent?.includes(translate('en', 'team.lead')) ?? false, 'Lead label');
+      key('2', { meta: true });
+      await settle();
+      assertEqual(layout()?.focused, mkey(2), 'store focus = api-agent');
+      assertEqual(document.activeElement?.closest('section')?.getAttribute('data-uid'), uid(2), 'DOM focus in its tile');
+      assertEqual(document.activeElement?.tagName, 'TEXTAREA', 'its composer');
+      const reports = core.calls('app_view_state').map((c) => c.req as ViewState);
+      const last = reports[reports.length - 1] as ViewState;
+      assertEqual(last.screen, 'team', 'team screen');
+      assertEqual(last.focusedUid, uid(2), 'focused member session reported');
+      assertEqual(last.teamKey, TK, 'team key');
+    } finally {
+      stop();
+    }
+  }),
+);
+
+domTest(
+  'A new teammate\'s tile appears with a pulse and one polite announcement; focus stays in the lead\'s composer',
+  harness(async () => {
+    hostedWorld();
+    openTeam('panes');
+    const view = render(<Mounted />);
+    await settle();
+    const leadComposer = composerOf(tiles(view.container)[0] as HTMLElement) as HTMLTextAreaElement;
+    act(() => leadComposer.focus());
+    hostedWorld({
+      members: [lead(), member(2, 'api-agent'), member(3, 'db-agent'), member(4, 'test-agent', { colour: 'pink' })],
+      sessions: [paneSession(1, {}, 'lead'), paneSession(2), paneSession(3), paneSession(4)],
+    });
+    await settle();
+    const fresh = view.container.querySelector('section.g-tile[data-new="true"]');
+    assertEqual(fresh?.getAttribute('data-uid'), uid(4), 'the new tile pulses');
+    assertEqual(document.activeElement, leadComposer, 'focus never moved');
+    const said = getAnnouncements().polite?.text ?? '';
+    assert(said.includes('test-agent'), `announced: ${said}`);
+  }),
+);
+
+domTest(
+  'Prefill never sends: "Ask the lead to stop db-agent" fills the lead\'s composer and puts the cursor there; nothing is sent',
+  harness(async (core) => {
+    hostedWorld();
+    openTeam('panes');
+    const view = render(<Mounted />);
+    await settle();
+    const dbTile = tiles(view.container)[2] as HTMLElement;
+    fireEvent.click(dbTile.querySelector(`[aria-label="${translate('en', 'tile.menu')}"]`) as HTMLElement);
+    await settle();
+    fireEvent.click(view.getByRole('menuitem', { name: translate('en', 'team.action.askStop', { member: 'db-agent' }) }));
+    await settle();
+    assertEqual(appStore.getState().ui.drafts[uid(1)], translate('en', 'team.prefill.askStop', { member: 'db-agent' }), 'the lead draft');
+    assertEqual(layout()?.focused, mkey(1), 'the lead tile is focused');
+    assertEqual(document.activeElement?.closest('section')?.getAttribute('data-uid'), uid(1), 'cursor in the lead tile');
+    for (const name of NEVER_SENT) assertEqual(core.calls(name).length, 0, `${name} never called`);
+  }),
+);
+
+domTest(
+  'Board To: composer — a hosted pane member gets team_send; a member reached through the lead is prefilled there and never sent',
+  harness(async (core) => {
+    hostedWorld({
+      members: [lead(), member(2, 'api-agent'), member(4, 'helper', { backend: 'inProcess', pane: null })],
+      sessions: [paneSession(1, {}, 'lead'), paneSession(2)],
+    });
+    openTeam('board');
+    const view = render(<Mounted />);
+    await settle();
+    const select = view.getByLabelText(translate('en', 'team.msg.to')) as HTMLSelectElement;
+    const input = view.getByLabelText(translate('en', 'team.msg.input')) as HTMLTextAreaElement;
+    fireEvent.change(select, { target: { value: mkey(2) } });
+    fireEvent.change(input, { target: { value: 'take the refresh path' } });
+    fireEvent.keyDown(input, { key: 'Enter', code: 'Enter' });
+    await settle();
+    const sent = core.calls('team_send')[0]?.req as { memberKey: string; text: string } | undefined;
+    assertEqual(sent?.memberKey, mkey(2), 'typed into api-agent');
+    assertEqual(sent?.text, 'take the refresh path', 'the text');
+    assertEqual(input.value, '', 'cleared');
+    assert(view.getByText(translate('en', 'team.msg.sentNote')) !== null, 'only the fact is kept');
+
+    fireEvent.change(select, { target: { value: mkey(4) } });
+    await settle();
+    assert(view.getByText(translate('en', 'team.msg.viaLeadNote')) !== null, 'says it goes through the lead');
+    fireEvent.change(view.getByLabelText(translate('en', 'team.msg.input')), { target: { value: 'check the cache keys' } });
+    fireEvent.keyDown(view.getByLabelText(translate('en', 'team.msg.input')), { key: 'Enter', code: 'Enter' });
+    await settle();
+    assertEqual(
+      appStore.getState().ui.drafts[uid(1)],
+      `${translate('en', 'team.prefill.tell', { member: 'helper' })} check the cache keys`,
+      'prefilled at the lead',
+    );
+    assertEqual(core.calls('team_send').length, 1, 'no second team_send');
+    assertEqual(core.calls('turn_send').length, 0, 'nothing sent to the lead');
+    const v = appStore.getState().ui.view;
+    assertEqual(v.screen === 'team' ? v.mode : null, 'panes', 'shown at the lead tile');
+  }),
+);
+
+domTest(
+  'F-49: "Ask the lead to add a task…" is hidden without task tools and offered (prefill only) when they exist',
+  harness(async (core) => {
+    hostedWorld();
+    openTeam('board');
+    const view = render(<Mounted />);
+    await settle();
+    assertEqual(view.queryByText(translate('en', 'team.action.addTask')), null, 'hidden on the inferred board');
+    cleanup();
+    hostedWorld({ team: { caps: hostedCaps({ observeTasks: 'yes' }) }, parts: { tasks: [boardTask(1, 'Extract verifyToken()', 'inProgress')] } });
+    const again = render(<Mounted />);
+    await settle();
+    const ask = again.getAllByText(translate('en', 'team.action.addTask'));
+    fireEvent.click(ask[0] as HTMLElement);
+    await settle();
+    assertEqual(appStore.getState().ui.drafts[uid(1)], `${translate('en', 'team.prefill.addTask')} `, 'prefilled');
+    for (const name of NEVER_SENT) assertEqual(core.calls(name).length, 0, `${name} never called`);
+  }),
+);
+
+domTest(
+  'Board on the no-task-tools fixture: inferred items are the board (never "no shared task list"); counts "≈" or unknown; "never read" to a closed pane',
+  harness(async () => {
+    hostedWorld({
+      team: { progress: { done: 1, total: 2, inferred: true, approx: true, inFlight: null, bottlenecks: [] } },
+      members: [lead(), member(2, 'api-agent'), member(3, 'db-agent', { presence: { kind: 'gone', reason: 'processExited', at: 5 } })],
+      parts: {
+        tasks: [inferredItem(1, mkey(2), 1), inferredItem(2, mkey(2), 2, 'reported')],
+        messages: [message(1, mkey(1), mkey(3), { status: 'queued' })],
+      },
+    });
+    openTeam('board');
+    const view = render(<Board team={appStore.getState().world.teams.get(TK) as Team} band="wide" tabs={false} />);
+    await settle();
+    assertEqual(view.queryByText(translate('en', 'team.noTasks')), null, 'never "no shared task list"');
+    assert(view.getByText(translate('en', 'floor.request', { k: 1 })) !== null, '"Request 1"');
+    assert(view.getAllByText(translate('en', 'floor.inferred')).length >= 2, 'marked inferred');
+    assert(view.getByText(translate('en', 'team.count.approx', { value: '2' })) !== null, 'tasks ≈ 2');
+    assert(view.getByText(translate('en', 'team.neverRead')) !== null, '"never read"');
+    assert(view.getByText(translate('en', 'team.count.approx', { value: '1' })) !== null, 'messages ≈ 1 (partial)');
+    cleanup();
+    hostedWorld({ parts: { tasks: [], messages: [] } });
+    const empty = render(<Board team={appStore.getState().world.teams.get(TK) as Team} band="wide" tabs={false} />);
+    await settle();
+    assert(empty.getByText(translate('en', 'team.messagesUnknown')) !== null, 'empty log: "Message count unknown", never "no messages"');
+    assertEqual(empty.queryByText(translate('en', 'team.noTasks')), null, 'an empty inferred board is not "no work"');
+  }),
+);
+
+domTest(
+  'Message bodies on demand: Show text reads team_message_body; Hide text drops it; the store never holds it',
+  harness(async (core) => {
+    hostedWorld({ parts: { messages: [message(1, mkey(1), mkey(2), { hasSummary: true })] } });
+    openTeam('board');
+    const view = render(<Mounted />);
+    await settle();
+    assertEqual(core.calls('team_message_body').length, 0, 'not read until asked');
+    fireEvent.click(view.getByText(translate('en', 'team.msg.showText')));
+    await settle();
+    assertEqual((core.calls('team_message_body')[0]?.req as { messageKey: string }).messageKey, message(1, mkey(1), mkey(2)).key, 'by message key');
+    assert(view.container.textContent?.includes('Keep the exported names.') ?? false, 'the text shows');
+    assert(!JSON.stringify([...appStore.getState().world.messages.values()]).includes('exported names'), 'never in the store');
+    fireEvent.click(view.getByText(translate('en', 'team.msg.hideText')));
+    await settle();
+    assert(!(view.container.textContent?.includes('Keep the exported names.') ?? true), 'dropped when hidden');
+  }),
+);
+
+domTest(
+  'Board rows: M focuses the To: composer with that member; ⏎ on a row shows its pane focused',
+  harness(async () => {
+    hostedWorld();
+    openTeam('board');
+    const view = render(<Mounted />);
+    await settle();
+    const rows = [...view.container.querySelectorAll<HTMLElement>('[data-member-row]')];
+    assertEqual(rows.length, 3, 'a row per member');
+    act(() => (rows[2] as HTMLElement).focus());
+    key('m');
+    await settle();
+    assertEqual((view.getByLabelText(translate('en', 'team.msg.to')) as HTMLSelectElement).value, mkey(3), 'To: db-agent');
+    assertEqual(document.activeElement?.getAttribute('aria-label'), translate('en', 'team.msg.input'), 'the To: input has focus');
+    act(() => (view.container.querySelectorAll<HTMLElement>('[data-member-row]')[1] as HTMLElement).focus());
+    key('Enter');
+    await settle();
+    const v = appStore.getState().ui.view;
+    assertEqual(v.screen === 'team' ? v.mode : null, 'panes', 'Panes');
+    assertEqual(layout()?.focused, mkey(2), 'api-agent focused');
+    assertEqual(document.activeElement?.closest('section')?.getAttribute('data-uid'), uid(2), 'its tile has focus');
+  }),
+);
+
+domTest(
+  'Ownership bars: an iTerm2 team gets the sentence and Go to iTerm2 in the To: slot; an orchestrator team "Message it from its lead."; tiles keep T15\'s bar',
+  harness(async (core) => {
+    setWorld({
+      teams: [team({ hosted: false, externalHost: 'iTerm2', paneHosting: 'outsideGilde', caps: hostedCaps({ actSend: ['viaLead'], actStop: ['viaLead'] }) })],
+      members: [lead(), member(2, 'api-agent', { backend: 'inProcess', pane: null })],
+      sessions: [watchedSession(1), watchedSession(2)],
+    });
+    openTeam('board');
+    const view = render(<Mounted />);
+    await settle();
+    assertEqual(view.queryByLabelText(translate('en', 'team.msg.input')), null, 'no To: composer');
+    assert(view.getByText(translate('en', 'team.external')) !== null, 'iTerm2 sentence');
+    assertEqual(view.queryByText(translate('en', 'action.askLead')), null, 'no Ask the lead (lead not in Gilde)');
+    fireEvent.click(view.getByText(translate('en', 'action.goToOwner', { owner: 'iTerm2' })));
+    await settle();
+    assertEqual((core.calls('owner_focus')[0]?.req as { uid: string }).uid, uid(1), 'Go to iTerm2 (the lead)');
+    fireEvent.click(view.getByRole('tab', { name: 'Panes' }));
+    await settle();
+    assertEqual(composerOf(view.container), null, 'no tile composer for watched members');
+    assert(view.container.querySelectorAll('.g-tile .g-bar').length >= 2, 'each tile shows the ownership bar');
+    cleanup();
+    setWorld({
+      teams: [team({ source: 'orchestrator', hosted: false, paneHosting: 'notApplicable', caps: hostedCaps({ actSend: [], actBroadcast: [], actSpawn: [], actStop: [], observeTasks: 'yes' }) })],
+      members: [lead({ backend: 'orchestrator' }), member(2, 'codex-writer', { backend: 'orchestrator', pane: null, vendor: 'codex' })],
+      sessions: [watchedSession(1), watchedSession(2)],
+    });
+    openTeam('board');
+    const orch = render(<Mounted />);
+    await settle();
+    assert(orch.getByText(translate('en', 'orchestrator.messageFromLead')) !== null, 'orchestrator sentence');
+    assertEqual(orch.queryByText(translate('en', 'team.action.addTask')), null, 'no actions in v1');
+  }),
+);
+
+domTest(
+  'In-process fallback: Board and Floor only; Panes asked for shows the Board and says why',
+  harness(async () => {
+    hostedWorld({ team: { paneHosting: 'inProcessFallback' } });
+    openTeam('panes');
+    const view = render(<Mounted />);
+    await settle();
+    assertDeepEqual(view.getAllByRole('tab').map((t) => t.textContent), ['Board', 'Floor'], 'no Panes');
+    const v = appStore.getState().ui.view;
+    assertEqual(v.screen === 'team' ? v.mode : null, 'board', 'the view says board');
+    assert(view.getByText(translate('en', 'team.inProcess')) !== null, '"Teammates run inside the lead in this version."');
+    assertEqual(tiles(view.container).length, 0, 'no tiles');
+  }),
+);
+
+domTest(
+  'Team › Floor mounts TeamFloor under the team header and mode switch (A23.2)',
+  harness(async () => {
+    hostedWorld();
+    openTeam('floor');
+    const view = render(<Mounted />);
+    await settle();
+    const floor = view.container.querySelector('.g-team-floor');
+    assert(floor !== null, 'the Floor body');
+    assert((floor?.children.length ?? 0) > 0, 'TeamFloor rendered inside it');
+    assert(view.getByRole('tab', { name: 'Floor', selected: true }) !== null, 'Floor tab selected');
+  }),
+);
+
+domTest(
+  'Close pane…: preview lines through i18n (A21.4), focus on Cancel, ⌘⏎ never confirms, Close pane closes with the token',
+  harness(async (core) => {
+    hostedWorld();
+    openTeam('panes');
+    const view = render(<Mounted />);
+    await settle();
+    const apiTile = tiles(view.container)[1] as HTMLElement;
+    fireEvent.click(apiTile.querySelector(`[aria-label="${translate('en', 'tile.menu')}"]`) as HTMLElement);
+    await settle();
+    fireEvent.click(view.getByRole('menuitem', { name: translate('en', 'team.action.closePane') }));
+    await settle();
+    assertEqual(appStore.getState().ui.sheet, 'closePane', 'the sheet');
+    assert(document.body.textContent?.includes(translate('en', 'team.closePane')) ?? false, 'line 1');
+    assert(document.body.textContent?.includes(translate('en', 'team.closePaneUnread', { member: 'api-agent' })) ?? false, 'line 2 with the member');
+    assertEqual(document.activeElement?.textContent, translate('en', 'common.cancel'), 'focus on Cancel');
+    fireEvent.keyDown(document.activeElement as HTMLElement, { key: 'Enter', code: 'Enter', metaKey: true });
+    await settle();
+    assertEqual(core.calls('team_member_close').length, 0, '⌘⏎ does not confirm');
+    const confirm = [...document.querySelectorAll<HTMLButtonElement>('[role="dialog"] button')].find((b) => b.textContent === translate('en', 'team.closePaneTitle'));
+    fireEvent.click(confirm as HTMLElement);
+    await settle();
+    const req = core.calls('team_member_close')[0]?.req as { memberKey: string; confirmToken: string } | undefined;
+    assertEqual(req?.memberKey, mkey(2), 'api-agent');
+    assertEqual(req?.confirmToken, 'c_00000000000000000000000000000001', 'the token');
+    assertEqual(appStore.getState().ui.sheet, null, 'closed');
+  }),
+);
+
+domTest(
+  'A crashed teammate keeps its tile ("Crashed · exit 1") until Close tile; an exited-0 teammate has none',
+  harness(async () => {
+    hostedWorld({
+      members: [
+        lead(),
+        member(2, 'api-agent', { presence: { kind: 'gone', reason: 'processExited', at: 5 } }),
+        member(3, 'db-agent', { presence: { kind: 'gone', reason: 'shutdownApproved', at: 5 } }),
+      ],
+      sessions: [
+        paneSession(1, {}, 'lead'),
+        paneSession(2, { activity: { ...session(2).activity, state: { kind: 'crashed', exit: { code: 1, signal: null } } } }),
+        paneSession(3, { activity: { ...session(3).activity, state: { kind: 'ended' } } }),
+      ],
+    });
+    openTeam('panes');
+    const view = render(<Mounted />);
+    await settle();
+    assertDeepEqual(tiles(view.container).map((t) => t.getAttribute('data-uid')), [uid(1), uid(2)], 'lead + the crashed tile');
+    assert(view.getByText(translate('en', 'tile.crashed', { code: 1 })) !== null, '"Crashed · exit 1"');
+    fireEvent.click(view.getByText(translate('en', 'action.closeTile')));
+    await settle();
+    assertEqual(tiles(view.container).length, 1, 'closed by the user');
+  }),
+);
+
+domTest(
+  'T-ui-answerInRouting: a teammate\'s prompt that renders in the lead — the member tile\'s mirrored card answers in the lead [F-15]',
+  harness(async (core) => {
+    // A pane teammate's permission prompt renders in the lead's TUI (§7.2.6): a screen prompt on the lead, mirrored on the member.
+    const card = {
+      kind: 'screenPrompt' as const,
+      onBehalfOf: mkey(3),
+      title: 'Edit schema.sql',
+      promptRev: 'p-1',
+      options: [
+        { key: '1', label: 'Yes', role: 'allowOnce' as const },
+        { key: '2', label: 'Yes, allow all edits during this session', role: 'allowSession' as const },
+        { key: '3', label: 'No', role: 'deny' as const },
+      ],
+    };
+    hostedWorld({
+      sessions: [
+        paneSession(1, { pending: [pending('sp_p-1', card)] }, 'lead'),
+        paneSession(2),
+        paneSession(3, { pending: [pending('sp_p-1', { ...card, answerIn: uid(1) })] }),
+      ],
+    });
+    openTeam('panes');
+    const view = render(<Mounted />);
+    await settle(800);
+    const dbTile = tiles(view.container)[2] as HTMLElement;
+    assert(dbTile.textContent?.includes(translate('en', 'team.answeredAtLead')) ?? false, 'mirrored, "answered at the lead"');
+    fireEvent.click(dbTile.querySelector('[data-role="allowOnce"]') as HTMLElement);
+    await settle();
+    const call = core.calls('screen_prompt_key')[0]?.req as { uid: string; requestId: string; action: { kind: string; key: string } } | undefined;
+    assertEqual(call?.uid, uid(1), 'answered in the lead');
+    assertEqual(call?.requestId, 'sp_p-1', 'that request');
+    assertDeepEqual(call?.action, { kind: 'key', key: '1' }, 'the prompt\'s own key');
+    assertEqual(core.calls('interaction_answer').length, 0, 'never a structured answer to a screen prompt');
+  }),
+);
+
+domTest(
+  'Team layout persistence: mode, focus and zoom are saved as teamLayout:<TeamKey>',
+  harness(async (core) => {
+    hostedWorld();
+    openTeam('panes');
+    const stop = startUiPersistence((l) => appStore.subscribe((s) => l(s.ui)), appStore.getState().ui);
+    try {
+      render(<Mounted />);
+      await settle();
+      key('3', { meta: true });
+      await settle();
+      key('Enter', { meta: true, shift: true });
+      await settle(PERSIST_DEBOUNCE_MS + 60);
+      const saved = core.calls('ui_state_set').map((c) => c.req as { key: string; value: unknown }).filter((r) => r.key === `teamLayout:${TK}`);
+      assert(saved.length > 0, 'saved');
+      assertDeepEqual(saved[saved.length - 1]?.value, { mode: 'panes', focused: mkey(3), zoomed: mkey(3), leadRatio: null, tileOrder: null }, 'mode, focus, zoom (A30.3 fields too)');
+    } finally {
+      stop();
+    }
+  }),
+);
+
+// ---------------------------------------------------------------------------
+// A30 (T16b): pane tiles, visible sets, saved divider and tile order
+// ---------------------------------------------------------------------------
+
+const PANE_PTY = 'y_0192f000-0000-7000-8000-0000000000aa' as PtyId;
+
+function paneTile(n: number, state: PaneTile['state'], extra: Partial<PaneTile> = {}): PaneTile {
+  return { paneId: `%${n}` as PaneTile['paneId'], state, title: null, pty: null, createdAt: 1_000 + n, ...extra };
 }
 
-function renderInspector(): string {
-  Object.assign(useAppStore.getInitialState(), useAppStore.getState());
-  return renderToStaticMarkup(<TeamMemberInspector />);
+function fakeTerminals() {
+  setTerminalFactory(() => ({
+    term: {
+      write: () => {},
+      dispose: () => {},
+      open: () => {},
+      focus: () => {},
+      loadAddon: () => {},
+      onData: () => ({ dispose: () => {} }),
+      onBinary: () => ({ dispose: () => {} }),
+      cols: 80,
+      rows: 24,
+      options: {},
+    } as unknown as PooledTerminal['term'],
+    fit: { fit: () => {} },
+    container: document.createElement('div'),
+  }));
 }
 
-const ko = (key: Parameters<typeof translate>[1], params?: Record<string, string | number>) =>
-  translate('ko', key, params);
+const paneTiles = (c: HTMLElement) => [...c.querySelectorAll<HTMLElement>('section.g-pane-tile')];
 
-/** Text of the markup, tags removed and entities decoded (enough for these assertions). */
-function textOf(html: string): string {
-  return html
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#x27;/g, "'")
-    .replace(/\s+/g, ' ');
-}
+domTest(
+  'A30.1 Starting: "starting…", then "Teammate did not start" at since + 30 s by the UI clock (no core timer); a failed spawn at once',
+  harness(async () => {
+    const clock = manualClock(9_000_000);
+    setClockForTests(clock);
+    hostedWorld({
+      members: [lead(), member(2, 'api-agent')],
+      sessions: [paneSession(1, {}, 'lead'), paneSession(2)],
+      team: {
+        paneTiles: [
+          paneTile(3, { kind: 'starting', since: 9_000_000 - 29_900, spawnFailed: false }),
+          paneTile(4, { kind: 'starting', since: 9_000_000, spawnFailed: true }),
+        ],
+      },
+    });
+    openTeam('panes');
+    const view = render(<Mounted />);
+    await settle();
+    const [starting, failed] = paneTiles(view.container);
+    assertEqual(starting?.getAttribute('data-phase'), 'starting', 'still starting at 29.9 s');
+    assert(starting?.textContent?.includes(translate('en', 'tile.starting')) ?? false, '"starting…"');
+    assertEqual(failed?.getAttribute('data-phase'), 'didNotStart', 'a failed spawn: at once');
+    assert(failed?.textContent?.includes(translate('en', 'team.didNotStart')) ?? false, '"Teammate did not start"');
+    clock.advance(200); // past since + 30 s on the UI clock
+    await settle(160); // the tile's one timer fires and re-reads the clock
+    assertEqual(paneTiles(view.container)[0]?.getAttribute('data-phase'), 'didNotStart', 'switched at 30 s');
+    fireEvent.click(paneTiles(view.container)[1]?.querySelector('button') as HTMLElement);
+    await settle();
+    assertEqual(paneTiles(view.container).length, 1, '[Close tile] closes the view of a dead pane');
+  }),
+);
 
-// ---------------------------------------------------------------------------
-// 1 + 2. The pane renders a real snapshot, read-only
-// ---------------------------------------------------------------------------
+domTest(
+  'A30.1 Unknown panes: "Unknown pane started by {lead}", never numbered, focused or zoomed, never visible to notifications; a running one is a read-only terminal',
+  harness(async (core) => {
+    fakeTerminals();
+    hostedWorld({
+      members: [lead(), member(2, 'api-agent')],
+      sessions: [paneSession(1, {}, 'lead'), paneSession(2)],
+      team: {
+        paneTiles: [
+          paneTile(5, { kind: 'unknown', running: true, exitCode: null }, { title: 'dev-server', pty: PANE_PTY }),
+          paneTile(6, { kind: 'unknown', running: false, exitCode: 2 }),
+        ],
+      },
+    });
+    openTeam('panes');
+    const view = render(<Mounted />);
+    await settle();
+    const [running, exited] = paneTiles(view.container);
+    assert(running?.textContent?.includes(translate('en', 'team.unknownPane', { lead: 'team-lead' })) ?? false, 'unknown pane line');
+    assert(running?.querySelector('[inert]') !== null, 'its terminal is inert (read-only)');
+    assertEqual((core.calls('pty_attach')[0]?.req as { ptyId: string } | undefined)?.ptyId, PANE_PTY, 'attached to the pane PTY');
+    assertEqual(core.calls('pty_write').length, 0, 'nothing typed into it');
+    assert(exited?.textContent?.includes(translate('en', 'tile.crashed', { code: 2 })) ?? false, 'exited: "Crashed · exit 2"');
+    assertEqual(running?.querySelector('textarea, [aria-label="' + translate('en', 'tile.zoom') + '"]'), null, 'no composer, no zoom');
+    assert(!(running?.textContent ?? '').includes('⌘'), 'never numbered');
+    key('3', { meta: true });
+    await settle();
+    assertEqual(layout()?.focused ?? null, null, '⌘3 does not reach a pane tile (only two members)');
+    act(() => (running?.querySelector('button') ?? running)?.dispatchEvent(new FocusEvent('focusin', { bubbles: true })));
+    assertEqual(layout()?.focused ?? null, null, 'focus inside it never makes it the focused tile');
+    assertDeepEqual(appStore.getState().ui.visibleUids, [uid(1), uid(2)], 'visible set: member sessions only');
+    assertEqual(core.calls('interaction_answer').length + core.calls('turn_send').length, 0, 'nothing sent');
+  }),
+);
 
-test('the team pane renders a real sidecar snapshot: roster, board, messages, activity', () => {
-  const view = realView();
-  seedTeam({
-    list: listOf([view]),
-    views: new Map([[view.teamId, view]]),
-    selectedTeamId: view.teamId,
-    selectedMember: 'alice',
-  });
-  const html = render();
-  const text = textOf(html);
+domTest(
+  'A30.2 Panes publishes the sessions it renders (not the strip); the Board publishes the members whose cards show; both clear on unmount',
+  harness(async () => {
+    const mates = [2, 3, 4, 5, 6].map((n) => member(n, `mate-${n}`));
+    hostedWorld({
+      members: [lead(), ...mates],
+      sessions: [paneSession(1, {}, 'lead'), ...[2, 3, 4, 5].map((n) => paneSession(n)), paneSession(6, { pending: [pending('r-6')] })],
+    });
+    openTeam('panes');
+    const view = render(<Mounted />);
+    await settle();
+    assertDeepEqual(appStore.getState().ui.visibleUids, [uid(1), uid(2), uid(3), uid(4), uid(5)], 'lead + 4 tiles; mate-6 is in the strip');
+    key('2', { meta: true, alt: true });
+    await settle();
+    assertDeepEqual(appStore.getState().ui.visibleUids, [uid(6)], 'Board: only the row whose card shows');
+    view.unmount();
+    await settle();
+    assertEqual(appStore.getState().ui.visibleUids, null, 'cleared on unmount');
+    const tabs = render(<Board team={appStore.getState().world.teams.get(TK) as Team} band="medium" tabs />);
+    await settle();
+    assertDeepEqual(appStore.getState().ui.visibleUids, [uid(6)], 'tabs: Members tab shows the card');
+    fireEvent.click(tabs.getByRole('tab', { name: translate('en', 'team.board.tasks') }));
+    await settle();
+    assertDeepEqual(appStore.getState().ui.visibleUids, [], 'Tasks tab: no card is visible');
+  }),
+);
 
-  assert(text.includes(ko('team.preview')), 'the preview line is on the pane');
-  assert(text.includes('demo') && text.includes('Demo team'), 'team name and title');
-  assert(text.includes(ko('team.status.active')), 'the team status pill');
-  assert(text.includes(ko('team.source.live')), 'a live view says so');
-  assert(text.includes('Ship the thing'), 'the goal');
-  // Roster: both members, the engine's states, and bob's blocked reason.
-  assert(text.includes('alice') && text.includes('bob'), 'both members are listed');
-  assert(text.includes(ko('team.member.idle')), 'alice is idle (the engine state)');
-  assert(text.includes(ko('team.member.blocked')), 'bob is blocked');
-  // F7: the reason code is a sentence; the engine's text and the code are in the tooltip.
-  assert(text.includes(ko('team.reason.quota')), 'bob\'s blocked reason is a sentence');
-  assert(html.includes('quota wall'), 'the engine text is kept, in the tooltip');
-  assert(text.includes('Claude Code'), 'the provider as a text badge, by its product name');
-  // Board: five columns, the claimed task in its column.
-  for (const key of ['team.board.open', 'team.board.claimed', 'team.board.blocked', 'team.board.review', 'team.board.done'] as const) {
-    assert(text.includes(ko(key)), `the ${key} column is there`);
-  }
-  assert(text.includes('Write the parser'), 'the board task title');
-  // Messages; the selected member's details are in the inspector, not the pane.
-  assert(text.includes('done with b1'), 'the message body');
-  assert(!text.includes(ko('team.section.activity', { name: 'alice' })), 'no inline member panel');
+domTest(
+  'A30.3 The divider and the tile order are saved in the team layout and come back after a remount',
+  harness(async () => {
+    const mates = [2, 3, 4, 5, 6].map((n) => member(n, `mate-${n}`));
+    hostedWorld({ members: [lead(), ...mates], sessions: [paneSession(1, {}, 'lead'), ...[2, 3, 4, 5, 6].map((n) => paneSession(n))] });
+    openTeam('panes');
+    const view = render(<Mounted />);
+    await settle();
+    const divider = view.getByRole('separator', { name: translate('en', 'team.divider') });
+    fireEvent.keyDown(divider, { key: 'ArrowRight', code: 'ArrowRight', shiftKey: true });
+    await settle();
+    assertEqual(layout()?.leadRatio, 0.5, '⇧→ moves the divider 10 % and saves it');
+    fireEvent.click(view.getByRole('toolbar', { name: translate('en', 'tile.strip') }).querySelector('button') as HTMLElement);
+    await settle();
+    const order = layout()?.tileOrder ?? [];
+    assert(order.slice(0, 4).includes(mkey(6)), `mate-6 swapped into view and saved: ${order.join(',')}`);
+    view.unmount();
+    const again = render(<Mounted />);
+    await settle();
+    assertEqual(again.getByRole('separator', { name: translate('en', 'team.divider') }).getAttribute('aria-valuenow'), '50', 'the divider comes back');
+    assert(tiles(again.container).some((t) => t.getAttribute('data-uid') === uid(6)), 'mate-6 is still on screen');
+  }),
+);
 
-  const inspector = textOf(renderInspector());
-  assert(inspector.includes(ko('team.section.activity', { name: 'alice' })), 'the inspector shows the member panel');
-  assert(inspector.includes('Edit · src/a.ts'), 'the activity line from cco/team.activity');
-  assert(inspector.includes(ko('team.mailbox.tools')), 'how it gets messages, in words');
-  assert(inspector.includes(ko('team.runsCommands')), 'whether it runs commands');
-});
-
-test('member rows are at most two lines, with no pid or raw code in the text', () => {
-  const live = realView();
-  const members = live.state.members.map((m, i) =>
-    i === 0
-      ? { ...m, state: 'running', turn: { id: 't1', n: 7, startedAt: 1, pid: 4242 }, mailbox: 'turns-only' }
-      : m,
-  );
-  const view = realView({ state: { ...live.state, members } });
-  seedTeam({ list: listOf([view]), views: new Map([[view.teamId, view]]), selectedTeamId: view.teamId });
-  const html = render();
-  const rows = html.match(/<button[^>]*class="team-member"[\s\S]*?<\/button>/g) ?? [];
-  assertEqual(rows.length, members.length, 'one row per member');
-  for (const row of rows) {
-    const lines = row.match(/<span class="row gap-6 team-member-line">|<span class="s12[^"]*(team-reason|team-member-activity|team-member-meta)/g) ?? [];
-    assert(lines.length <= 2, `a member row has at most two lines (got ${lines.length})`);
-  }
-  const text = textOf(html);
-  assert(!text.includes('4242'), 'no pid in the pane text');
-  assert(!text.includes('turns-only'), 'no raw mailbox mode');
-});
-
-test('the team pane is read-only: no input, no composer, only local buttons', () => {
-  const view = realView();
-  seedTeam({
-    list: listOf([view]),
-    views: new Map([[view.teamId, view]]),
-    selectedTeamId: view.teamId,
-  });
-  const html = render();
-  assert(!/<input\b/.test(html), 'no <input>');
-  assert(!/<textarea\b/.test(html), 'no <textarea>');
-  const buttons = html.match(/<button\b[^>]*>/g) ?? [];
-  // One refresh, one per member (selection). One team: no team chips.
-  assertEqual(buttons.length, 1 + view.state.members.length, 'refresh + member selection only');
-  const text = textOf(html).toLowerCase();
-  for (const word of ['interrupt', 'take over', 'restart', 'send', 'pause']) {
-    assert(!text.includes(word), `no "${word}" action on the pane`);
-  }
-});
-
-// ---------------------------------------------------------------------------
-// 3. L7
-// ---------------------------------------------------------------------------
-
-test('a team read from disk whose host is gone shows host gone and was running', () => {
-  const live = realView();
-  const members = live.state.members.map((m, i) => (i === 0 ? { ...m, state: 'running' } : m));
-  const view = realView({
-    live: false,
-    source: 'disk',
-    believed: false,
-    state: { ...live.state, members },
-  });
-  seedTeam({ list: listOf([view]), views: new Map([[view.teamId, view]]), selectedTeamId: view.teamId });
-  const text = textOf(render());
-  assert(text.includes(ko('team.hostGone')), 'host gone, not active');
-  assert(text.includes(ko('team.wasRunning')), 'was running, not running');
-  assert(!text.includes(` ${ko('team.member.running')} `), 'never a running pill without a live owner');
-  assert(text.includes(ko('team.source.disk')), 'it says the view is the saved state');
-
-  assertEqual(memberPill(members[0]!, false).key, 'team.wasRunning', 'model: was running');
-  assertEqual(memberPill(members[0]!, true).key, 'team.member.running', 'model: running when believed');
-  assertEqual(teamPill(view.state, false).key, 'team.hostGone', 'model: host gone');
-  assertEqual(teamPill({ ...view.state, status: 'suspended' }, false).key, 'team.status.suspended', 'a suspended team is suspended');
-});
-
-// ---------------------------------------------------------------------------
-// 4. Empty states
-// ---------------------------------------------------------------------------
-
-test('F3: not set up, Teammate mode off, and on-but-empty are three different sentences', () => {
-  seedTeam({ list: listOf([], { teamMode: 'unknown' }) });
-  let html = render();
-  let text = textOf(html);
-  assertEqual(noTeamCase(listOf([], { teamMode: 'unknown' })), 'notSetUp', 'no readable registry = not set up');
-  assert(text.includes(ko('team.notSetUp')) && text.includes(ko('team.notSetUp.how')), 'not set up says what to install');
-  assert(!text.includes(ko('team.modeOff')), 'and does not claim the mode is off');
-
-  seedTeam({ list: listOf([], { teamMode: 'off' }) });
-  html = render();
-  text = textOf(html);
-  assertEqual(noTeamCase(listOf([], { teamMode: 'off' })), 'modeOff', 'off');
-  assert(text.includes(ko('team.modeOff')), 'Teammate mode off, in plain words');
-  assert(text.includes(ko('team.modeOff.how')), 'with how to turn it on on a secondary line');
-  assert(!ko('team.modeOff').includes('teamMode') && !translate('en', 'team.modeOff').includes('teamMode'), 'no raw setting key in the main text');
-  assert(translate('en', 'team.modeOff.how').includes('Claude Code Orchestrator: Team Mode'), 'the setting is named as VS Code shows it');
-
-  seedTeam({ list: listOf([], { teamMode: 'on' }) });
-  text = textOf(render());
-  assertEqual(noTeamCase(listOf([], { teamMode: 'on' })), 'empty', 'on, nothing');
-  assert(text.includes(ko('team.empty')), 'team mode on, no team');
-  assert(!text.includes(ko('team.modeOff')) && !text.includes(ko('team.notSetUp')), 'and neither of the other two');
-  seedTeam({ list: listOf([], { available: false }) });
-  assert(textOf(render()).includes(ko('team.sidecarDown')), 'sidecar down');
-  seedTeam({
-    list: listOf([], {
-      hosts: [{ key: 's9', sessionPid: 9, hostPid: 77, workspace: '/w', pane: false, state: 'no-teams' }],
-    }),
-  });
-  html = render();
-  assert(textOf(html).includes(ko('team.host.noTeams')), 'a host without teams is explained');
-  assert(!textOf(html).includes('77') && html.includes(ko('team.host.pid', { pid: 77 })), 'its pid only in a tooltip');
-  assertEqual(
-    translate('en', 'team.preview'),
-    'Preview — read-only. Steer the team from the lead session or VS Code.',
-    'the en preview line is the engine sentence (host-protocol TEAM_PREVIEW_READ_ONLY_TEXT)',
-  );
-});
-
-test('F2: every no-team case offers "Add project folder", and it uses the folder picker flow', () => {
-  for (const teamMode of ['unknown', 'off', 'on']) {
-    seedTeam({ list: listOf([], { teamMode }) });
-    const html = render();
-    assert(textOf(html).includes(ko('team.addFolder')), `${teamMode}: the button is there`);
-  }
-  // The button runs the store's addProject (plugin-dialog picker → project_add).
-  let picked = 0;
-  useAppStore.setState({ addProject: async () => { picked += 1; return null; } });
-  assert(typeof AddProjectFolderButton === 'function', 'the button is a component');
-  void useAppStore.getState().addProject();
-  assertEqual(picked, 1, 'and the flow it calls is the existing project_add one');
-});
-
-test('F7: engine codes become words; an unknown code falls back with the code in a tooltip', () => {
-  assertEqual(reasonLabel('quota').key, 'team.reason.quota', 'a known reason');
-  assertEqual(reasonLabel('quota-wait').key, 'team.reason.quota-wait', 'a paused reason');
-  const unknown = reasonLabel('flux-capacitor');
-  assertEqual(unknown.key, 'team.reason.other', 'an unknown reason → the generic sentence');
-  assertEqual(unknown.code, 'flux-capacitor', 'with its code kept for the tooltip');
-  assertEqual(unknown.known, false, 'and marked unknown');
-  assertEqual(warningLabel('overlap').key, 'team.warning.overlap', 'a known warning kind');
-  assertEqual(warningLabel('new-kind').key, 'team.warning.other', 'an unknown warning kind');
-  assertEqual(mailboxKey('turns-only'), 'team.mailbox.turnsOnly', 'turns-only');
-  assertEqual(ko('team.mailbox.turnsOnly'), '메시지를 턴 사이에 받음', 'in words');
-  assertEqual(translate('en', 'team.mailbox.turnsOnly'), 'Gets messages between turns', 'in words (en)');
-  assertEqual(translate('en', 'team.pingPong'), 'Paused: members kept replying to each other.', 'ping-pong in words');
-  assertEqual(messageKindKey('question'), 'team.messageKind.question', 'a message kind');
-  assertEqual(messageKindKey('text'), null, 'a plain text message needs no badge');
-  assertEqual(messageKindKey('mystery'), null, 'an unknown kind gets no badge');
-  assertEqual(outcomeLabel('ok').key, 'team.outcome.ok', 'a turn outcome');
-  assertEqual(outcomeLabel('weird').key, 'team.outcome.other', 'an unknown outcome');
-  assertEqual(providerBadge('gemini'), 'Antigravity', 'the engine\'s gemini is Antigravity');
-  assertEqual(providerBadge('cursor'), 'Cursor', 'cursor is Cursor');
-
-  // Rendered: an unknown reason shows the generic sentence, the code only in the tooltip.
-  const live = realView();
-  const members = live.state.members.map((m, i) =>
-    i === 0 ? { ...m, state: 'blocked', reason: { code: 'flux-capacitor', text: 'engine words' } } : m,
-  );
-  const warnings = [{ kind: 'new-kind', text: 'something happened' }];
-  const view = realView({ state: { ...live.state, members, warnings } });
-  seedTeam({ list: listOf([view]), views: new Map([[view.teamId, view]]), selectedTeamId: view.teamId });
-  const html = render();
-  const text = textOf(html);
-  assert(text.includes(ko('team.reason.other')), 'the generic sentence is shown');
-  assert(!text.includes('flux-capacitor'), 'the unknown code is not the main text');
-  assert(html.includes(ko('team.code', { code: 'flux-capacitor' })), 'it is in the tooltip');
-  assert(text.includes(ko('team.warning.other')) && !text.includes('new-kind'), 'an unknown warning kind reads "Warning"');
-});
-
-// ---------------------------------------------------------------------------
-// 5. Hostile strings
-// ---------------------------------------------------------------------------
-
-test('hostile strings are flattened, capped and escaped', () => {
-  const live = realView();
-  const nasty = '<script>alert(1)</script>\n\u202Eevil\u0007 ' + 'x'.repeat(5_000);
-  const members = live.state.members.map((m, i) => (i === 0 ? { ...m, role: nasty } : m));
-  const view = realView({ state: { ...live.state, members } });
-  seedTeam({ list: listOf([view]), views: new Map([[view.teamId, view]]), selectedTeamId: view.teamId });
-  const html = render();
-  assert(!html.includes('<script>'), 'markup in a role is escaped, never rendered');
-  assert(!html.includes('\u202E') && !html.includes('\u0007'), 'bidi overrides and controls are removed');
-  assert(!html.includes('x'.repeat(200)), 'a long role is capped');
-
-  assertEqual(flat('a\n\tb\u202Ec', 10), 'a bc', 'flat: one line, no bidi');
-  assertEqual(flat('abcdef', 4), 'abc…', 'flat: capped with an ellipsis');
-  assertEqual(flat('ab\uD83D\uDE00cd', 4), 'ab…', 'flat: never splits a surrogate pair');
-  assertEqual(flat(undefined, 4), '', 'flat: nothing is empty');
-});
-
-test('the board groups by state; cancelled is finished, an unknown state is not lost', () => {
-  const base = realView().state.board[0]!;
-  const cols = boardColumns([
-    { ...base, id: 'b1', state: 'open' },
-    { ...base, id: 'b2', state: 'review' },
-    { ...base, id: 'b3', state: 'cancelled' },
-    { ...base, id: 'b4', state: 'someday' },
-  ]);
-  assertEqual(cols.open.map((t) => t.id).join(','), 'b1,b4', 'open + unknown');
-  assertEqual(cols.review.map((t) => t.id).join(','), 'b2', 'review');
-  assertEqual(cols.done.map((t) => t.id).join(','), 'b3', 'cancelled sits under done');
-});
-
-// ---------------------------------------------------------------------------
-// 6. Latest wins
-// ---------------------------------------------------------------------------
-
-test('the slice keeps the newest (generation, rev) and withdraws on null', () => {
-  const view = realView();
-  const ev = (generation: number, rev: number, v: CcoTeamView | null): TeamSnapshotEvent => ({
-    generation,
-    rev,
-    teamId: view.teamId,
-    view: v === null ? null : { ...v, generation, rev },
-  });
-  let state = reduceTeamSnapshot(initialTeamState(), ev(1, 5, view));
-  assertEqual(state.views.get(view.teamId)?.rev, 5, 'first view applied');
-  assertEqual(state.selectedTeamId, view.teamId, 'and selected');
-
-  const older = reduceTeamSnapshot(state, ev(1, 4, { ...view, state: { ...view.state, name: 'old' } }));
-  assert(older === state, 'an older rev is ignored');
-
-  state = reduceTeamSnapshot(state, ev(2, 1, view));
-  assertEqual(state.views.get(view.teamId)?.generation, 2, 'a restarted sidecar (new generation) wins with rev 1');
-
-  state = reduceTeamSnapshot(state, ev(2, 2, null));
-  assert(!state.views.has(view.teamId), 'null withdraws the team');
-  assertEqual(state.selectedTeamId, null, 'and the selection follows');
-
-  const late = reduceTeamSnapshot(state, ev(2, 1, view));
-  assert(!late.views.has(view.teamId), 'a view older than the withdrawal does not resurrect it');
-
-  assert(isNewerRevision({ generation: 1, rev: 1 }, undefined), 'anything beats nothing');
-  const held = reduceTeamSnapshot(initialTeamState(), ev(1, 3, view));
-  const pruned = pruneUnlisted(held, new Set());
-  assert(!pruned.views.has(view.teamId) && !pruned.revisions.has(view.teamId), 'a team the list lost is dropped with its revision');
-  assert(pruneUnlisted(held, new Set([view.teamId])) === held, 'a listed team is kept as is');
-});
-
-// ---------------------------------------------------------------------------
-// 7. TeamListEntry.reason (CCO 0b7b1b8)
-// ---------------------------------------------------------------------------
-
-test('a host\'s reason for listing a team is shown in the header and on its chip', () => {
-  const a = realView();
-  const b = realView({ teamId: 'tmzzzzzzzzz2', live: false, source: 'disk', state: { ...a.state, id: 'tmzzzzzzzzz2', name: 'old', createdAt: a.state.createdAt - 1 } });
-  const list = listOf([a, b]);
-  list.teams[1] = { ...list.teams[1]!, reason: 'host gone' };
-  seedTeam({ list, views: new Map([[a.teamId, a], [b.teamId, b]]), selectedTeamId: b.teamId });
-  const html = render();
-  const text = textOf(html);
-  // `host gone` is a known engine sentence: it reads in the user's language (notices.ts).
-  const gone = ko('team.notice.hostGone');
-  assert(html.includes('data-testid="team-list-reason"') && text.includes(ko('team.listReason', { reason: gone })), 'the selected team\'s header says why');
-  assert(!text.includes('host gone'), 'no raw English reason in the Korean UI');
-  const chips = html.match(/<button[^>]*class="chip"[^>]*>[\s\S]*?<\/button>/g) ?? [];
-  assertEqual(chips.length, 2, 'two teams: two chips');
-  const oldChip = chips.find((c) => c.includes('old')) ?? '';
-  assert(oldChip.includes('data-reason="true"') && oldChip.includes(`title="${ko('team.listReason', { reason: gone })}"`) && textOf(oldChip).includes(gone), 'its chip carries the reason');
-  const demoChip = chips.find((c) => c.includes('demo')) ?? '';
-  assert(!demoChip.includes('data-reason') && !demoChip.includes('title='), 'a team without a reason has none on its chip');
-
-  seedTeam({ list, views: new Map([[a.teamId, a], [b.teamId, b]]), selectedTeamId: a.teamId });
-  assert(!render().includes('data-testid="team-list-reason"'), 'the header of a team without a reason says nothing');
-});
-
-test('a listed reason is host text: flattened, capped at 300 (24 on a chip), escaped; blank is none', () => {
-  const view = realView();
-  const nasty = `<b>gone</b>\u202E\n\u0007 ${'r'.repeat(1_000)}`;
-  const list = listOf([view]);
-  list.teams[0] = { ...list.teams[0]!, reason: nasty };
-  const reasons = listReasons(list, ko);
-  const line = reasons.get(view.teamId) ?? '';
-  assert(line.length <= 300 && !/[\n\u0007\u202E]/.test(line) && line.startsWith('<b>gone</b>'), 'one line, ≤ 300, no controls or bidi');
-  seedTeam({ list, views: new Map([[view.teamId, view]]), selectedTeamId: view.teamId });
-  const html = render();
-  assert(!html.includes('<b>gone</b>') && html.includes('&lt;b&gt;gone&lt;/b&gt;'), 'escaped, never markup');
-  assert(!html.includes('r'.repeat(300)), 'capped on the page');
-  assertEqual(flat(nasty, 24).length, 24, 'the chip cap');
-  const blank = listOf([view]);
-  blank.teams[0] = { ...blank.teams[0]!, reason: ' \n\t ' };
-  assertEqual(listReasons(blank, ko).size, 0, 'a blank reason is no reason');
-  assertEqual(listReasons(null, ko).size, 0, 'no list, no reasons');
-});
+domTest(
+  'A44.1: a team tile — a stacked request that replaces the answered one under the same tile starts a new 700 ms guard',
+  harness(async (core) => {
+    const clock = manualClock(8_000_000);
+    setClockForTests(clock);
+    const prompt = (requestId: string): PendingInteraction =>
+      pending(requestId, {
+        kind: 'screenPrompt',
+        promptRev: `rev-${requestId}`,
+        options: [
+          { key: '1', label: 'Yes', role: 'allowOnce' },
+          { key: '2', label: 'No', role: 'deny' },
+        ],
+      });
+    const api = paneSession(2, { pending: [prompt('sp_a'), prompt('sp_b')] });
+    hostedWorld({ sessions: [paneSession(1, {}, 'lead'), api, paneSession(3)] });
+    openTeam('panes');
+    render(<Mounted />);
+    await settle();
+    key('2', { meta: true });
+    await settle();
+    assertEqual(layout()?.focused, mkey(2), 'api-agent\'s tile is focused');
+    const tick = (ms: number) =>
+      act(() => {
+        clock.advance(ms);
+        refreshGuards();
+      });
+    const ids = () => core.calls('screen_prompt_key').map((c) => (c.req as ScreenPromptKeyReq).requestId);
+    tick(GUARD_MS + 10);
+    key('Enter', { meta: true });
+    await settle();
+    assertDeepEqual(ids(), ['sp_a'], '⌘⏎ answers the tile\'s top card');
+    setWorld({
+      teams: [team()],
+      members: [lead(), member(2, 'api-agent'), member(3, 'db-agent', { colour: 'green' })],
+      sessions: [paneSession(1, {}, 'lead'), { ...api, pending: [prompt('sp_b')] }, paneSession(3)],
+    });
+    tick(150);
+    key('Enter', { meta: true });
+    await settle();
+    assertDeepEqual(ids(), ['sp_a'], 'sp_b took the top 150 ms ago: a second ⌘⏎ answers nothing');
+    tick(GUARD_MS);
+    key('Enter', { meta: true });
+    await settle();
+    assertDeepEqual(ids(), ['sp_a', 'sp_b'], 'after its own 700 ms, sp_b answers');
+  }),
+);

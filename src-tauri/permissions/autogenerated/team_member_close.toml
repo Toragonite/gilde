@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-team-member-close"
+description = "Enables the team_member_close command without any pre-configured scope."
+commands.allow = ["team_member_close"]
+
+[[permission]]
+identifier = "deny-team-member-close"
+description = "Denies the team_member_close command without any pre-configured scope."
+commands.deny = ["team_member_close"]

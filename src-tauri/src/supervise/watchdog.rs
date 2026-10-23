@@ -8,16 +8,16 @@
 //!
 //! Each tick does four things, in this order:
 //!
-//! 1. **scan** — one `ps` snapshot (T07), classified against the live registry
-//!    and the hot-reloaded signature file, published as `gilde://proc/scan` and
-//!    cached so that `procmon_scan` can answer from it instead of forking a
-//!    second `ps`;
+//! 1. **scan** — the shared process scan (discovery's, through
+//!    [`ScanHub`], A12.2; the in-process kernel scan only while discovery is
+//!    not running), classified against the live registry and the
+//!    hot-reloaded signature file, and cached so that `procmon_scan` can
+//!    answer from it instead of scanning again;
 //! 2. **attribute** — every live registry row that belongs to a session gets the
 //!    RSS of its whole **pgid subtree** summed onto it, which is the only number
 //!    that means anything for an agent CLI: the CLI itself is a few hundred MB
 //!    and its `Bash` tool's `cargo build` is the six gigabytes;
-//! 3. **record** — those numbers go to `proc_sample` (the graph's sparkline
-//!    backfill) and onto the graph's 1 Hz metric lane;
+//! 3. **record** — those numbers go to `proc_sample`;
 //! 4. **judge** — [`BudgetTracker`] turns the sample into alarms, and only then
 //!    does anything user-visible happen.
 //!
@@ -55,17 +55,16 @@ use tauri::async_runtime::JoinHandle;
 use crate::agents::AgentRegistry;
 use crate::config::model::SupervisionConfig;
 use crate::error::{GildeError, Result};
-use crate::events::bus::EventBus;
+use crate::events::Events;
 use crate::events::{
     now_ms, BudgetAlertEvent, BudgetLevel, ProcScanEvent, ToastEvent, ToastLevel, BUDGET_ALERT,
     HEALTH, PROC_SCAN, TOAST,
 };
-use crate::model::graph::{node_id, GraphOp, NodeKind, PressureLevel};
-use crate::model::status::NodeMetrics;
 use crate::store::dao;
 use crate::store::models::ProcRow as RegistryRow;
 use crate::supervise::kill::KillOpts;
-use crate::supervise::procscan::{self, cwd_of, ps_snapshot, RowContext, Snapshot};
+use crate::supervise::procscan::{self, cwd_of, ps_snapshot, RowContext, ScanHub, Snapshot};
+use crate::supervise::PressureLevel;
 use crate::supervise::health::{
     HealthBuilder, HealthConfig, HealthInput, HealthSnapshot, LiveProbe, TeamFacts, TeamSource,
 };
@@ -79,6 +78,13 @@ use crate::supervise::{ProcGroupKind, ProcRow, ProcTotals, RegistryIndex, ScanFi
 
 /// The watchdog's own cadence (DESIGN §8-8: "5초 주기(스캐너와 독립)").
 pub const TICK: Duration = Duration::from_secs(5);
+
+/// The oldest shared scan the watchdog reads (discovery scans every 3 s while
+/// frontmost and every 15 s otherwise); older → the kernel fallback.
+pub const SHARED_SCAN_MAX_AGE_MS: i64 = 20_000;
+
+/// [`Watchdog::on_memory_pressure`]'s listener.
+pub type MemoryListener = Arc<dyn Fn(bool) + Send + Sync>;
 
 /// How often the kernel is asked about system-wide memory pressure. Slower than
 /// the tick because the answer moves slowly and each probe is a syscall.
@@ -291,10 +297,14 @@ fn pageout_pressure() -> Option<PressureLevel> {
     })
 }
 
-/// Forget the pageout baseline. Tests share one process.
+/// Forget the pageout baseline (a wake, and tests, which share one process).
+fn clear_pageout_mark() {
+    *pageout_mark().lock() = None;
+}
+
 #[cfg(test)]
 fn reset_pageout_mark() {
-    *pageout_mark().lock() = None;
+    clear_pageout_mark();
 }
 
 // ---------------------------------------------------------------------------
@@ -699,7 +709,15 @@ impl Default for PressureCache {
 /// The 5 second budget task, plus the scan cache `procmon_scan` answers from.
 pub struct Watchdog {
     sup: Arc<Supervisor>,
-    bus: EventBus,
+    events: Events,
+    /// The shared process scan (A12.2): discovery publishes, the watchdog
+    /// reads. `None` (tests) or a stale hub → the in-process kernel scan,
+    /// which stays only as the fallback while discovery is not running.
+    scans: Option<Arc<ScanHub>>,
+    /// The memory-pressure edge for notifications (`NotifyService::health_memory`).
+    on_memory: Option<MemoryListener>,
+    /// The hysteresis state behind [`Watchdog::on_memory_pressure`].
+    memory_high: Mutex<bool>,
     /// Only for the hot-reloaded monitor classification patterns (T09). Absent
     /// in tests and in any boot where detection has not run yet, in which case
     /// the built-in defaults are used.
@@ -731,10 +749,13 @@ impl std::fmt::Debug for Watchdog {
 }
 
 impl Watchdog {
-    pub fn new(sup: Arc<Supervisor>, bus: EventBus) -> Watchdog {
+    pub fn new(sup: Arc<Supervisor>, events: Events) -> Watchdog {
         Watchdog {
             sup,
-            bus,
+            events,
+            scans: None,
+            on_memory: None,
+            memory_high: Mutex::new(false),
             agents: None,
             interval: TICK,
             tracker: Mutex::new(BudgetTracker::new()),
@@ -746,6 +767,28 @@ impl Watchdog {
             health: Arc::new(Mutex::new(HealthBuilder::new(HealthConfig::default()))),
             latest_health: RwLock::new(HealthSnapshot::empty()),
         }
+    }
+
+    /// Read the shared process scan from `hub` (A12.2: one scan, discovery's).
+    pub fn with_scan_hub(mut self, hub: Arc<ScanHub>) -> Watchdog {
+        self.scans = Some(hub);
+        self
+    }
+
+    /// Tell `listener` about each memory-pressure transition: `true` once the
+    /// kernel reports `critical`, `false` once it is back to `normal` (`warn`
+    /// and `unknown` keep the previous state — the hysteresis that keeps a
+    /// laptop with a big page cache from alerting, §8.4).
+    pub fn on_memory_pressure(mut self, listener: MemoryListener) -> Watchdog {
+        self.on_memory = Some(listener);
+        self
+    }
+
+    /// The machine woke (§10.4): the pressure probes start over — a pageout
+    /// delta measured across the sleep says nothing about now.
+    pub fn woke(&self) {
+        *self.pressure.lock() = PressureCache::default();
+        clear_pageout_mark();
     }
 
     /// Read the team facts for the health surface from `teams`.
@@ -775,7 +818,7 @@ impl Watchdog {
             builder.restamp(&mut held);
             held.clone()
         };
-        self.bus.emit(HEALTH, snapshot.clone());
+        self.events.emit(HEALTH, snapshot.clone());
         snapshot
     }
 
@@ -797,8 +840,8 @@ impl Watchdog {
     /// This is the signature M1-PLAN T12 pins; [`Watchdog::start`] is the same
     /// thing for a watchdog the caller wants to keep a handle on (the command
     /// layer reads its scan cache).
-    pub fn spawn(sup: Arc<Supervisor>, bus: EventBus) -> JoinHandle<()> {
-        Arc::new(Watchdog::new(sup, bus)).start()
+    pub fn spawn(sup: Arc<Supervisor>, events: Events) -> JoinHandle<()> {
+        Arc::new(Watchdog::new(sup, events)).start()
     }
 
     /// Start the loop for an already-constructed watchdog.
@@ -886,7 +929,7 @@ impl Watchdog {
             }
         };
 
-        self.bus.emit(
+        self.events.emit(
             PROC_SCAN,
             ProcScanEvent {
                 at: collected.result.at,
@@ -896,7 +939,7 @@ impl Watchdog {
         );
 
         self.record(&collected.sample).await;
-        self.push_metrics(&collected.sample);
+        self.memory_edge(collected.sample.pressure);
 
         let cfg = self.sup.config().get().supervision;
         let alarms = self.tracker.lock().observe(&collected.sample, &cfg);
@@ -948,7 +991,7 @@ impl Watchdog {
         match built {
             Ok(health) => {
                 *self.latest_health.write() = health.clone();
-                self.bus.emit(HEALTH, health);
+                self.events.emit(HEALTH, health);
             }
             Err(err) => {
                 tracing::warn!(target: "supervise", error = %err, "health build failed");
@@ -979,10 +1022,16 @@ impl Watchdog {
                 Vec::new()
             });
 
-        // `ps` forks a child and reads it to EOF — never on the async worker.
-        let snapshot = tokio::task::spawn_blocking(ps_snapshot)
-            .await
-            .map_err(|err| GildeError::internal(format!("watchdog scan task failed: {err}")))??;
+        // A12.2: discovery's scan when a fresh one is shared; the in-process
+        // kernel scan only while discovery is not running. Either way off the
+        // async worker (a pgid read per pid, or the whole kernel table).
+        let shared = self.scans.as_ref().and_then(|hub| hub.fresh(now_ms(), SHARED_SCAN_MAX_AGE_MS));
+        let snapshot = tokio::task::spawn_blocking(move || match shared {
+            Some(scan) => Ok(Snapshot::from_proc_snapshot(&scan)),
+            None => ps_snapshot(),
+        })
+        .await
+        .map_err(|err| GildeError::internal(format!("watchdog scan task failed: {err}")))??;
 
         let (pressure, pressure_source) = self.pressure();
         let index = self.index_of(&rows, &sessions);
@@ -1050,6 +1099,7 @@ impl Watchdog {
 
     /// Sum each session's pgid subtree, and everything that is neither ours nor
     /// the machine's own business.
+    #[allow(clippy::too_many_arguments)]
     fn attribute(
         &self,
         snapshot: &Snapshot,
@@ -1153,22 +1203,22 @@ impl Watchdog {
         }
     }
 
-    /// The 1 Hz metric lane. Metric-only patches for the same node merge, so a
-    /// session costs one op per tick no matter how many pids it owns.
-    fn push_metrics(&self, sample: &WatchdogSample) {
-        for session in &sample.sessions {
-            self.bus.push_metric(GraphOp::PatchNode {
-                id: node_id(NodeKind::Session, &session.session_id),
-                status: None,
-                confidence: None,
-                evidence: None,
-                badges: None,
-                metrics: Some(NodeMetrics {
-                    rss_bytes: Some(session.rss_bytes),
-                    cpu_pct: Some(session.cpu_pct),
-                    ..NodeMetrics::default()
-                }),
-            });
+    /// The memory-pressure edge (see [`Watchdog::on_memory_pressure`]).
+    fn memory_edge(&self, level: PressureLevel) {
+        let Some(listener) = &self.on_memory else { return };
+        let changed = {
+            let mut high = self.memory_high.lock();
+            let next = match level {
+                PressureLevel::Critical => true,
+                PressureLevel::Normal => false,
+                PressureLevel::Warn | PressureLevel::Unknown => *high,
+            };
+            let changed = next != *high;
+            *high = next;
+            changed.then_some(next)
+        };
+        if let Some(high) = changed {
+            listener(high);
         }
     }
 
@@ -1210,7 +1260,7 @@ impl Watchdog {
                     .unwrap_or(0),
             };
 
-            self.bus.emit(
+            self.events.emit(
                 BUDGET_ALERT,
                 BudgetAlertEvent {
                     level: alarm.level(),
@@ -1221,7 +1271,7 @@ impl Watchdog {
                     undo_token: undo_token.clone(),
                 },
             );
-            self.bus
+            self.events
                 .emit(TOAST, self.toast_for(alarm, rss_bytes, cfg, undo_token));
 
             tracing::info!(

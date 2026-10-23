@@ -143,3 +143,12 @@ replaced with `01AAAAAAAAAAAAAAAAAAAAAA`; `claude-model-help.cap` and
 all-zero one — same length in every case, so the frames are byte-identical in
 layout. Nothing else in these files was edited. They contain no credentials; the paths in them are the temp
 directories the capture ran in.
+
+## `tui-pending-wrap.bin` — a synthesized cell-diff stream (Gilde 2, T-pty-pendingWrap)
+
+Not a capture: a byte stream written to the shapes the 2.1.307 TUI uses
+[R6 §4] — the alternate screen, `CSI H` / `CSI <n>B/G/C` cell-diff moves, a
+saved cursor, full-width rules followed by `CR LF` (correct only under xterm's
+pending-wrap rule), wide characters and a wrap on the last column. It contains
+no user path and no account data. `tui-pending-wrap.grid.txt` is the 60×12
+grid it must replay into (`tests/pty_prompts.rs`).

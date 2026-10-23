@@ -29,16 +29,15 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gilde_code_lib::commands::monitor;
 use gilde_code_lib::config::ConfigStore;
-use gilde_code_lib::events::bus::{EventBus, RecordingSink};
-use gilde_code_lib::model::graph::GraphHandle;
+use gilde_code_lib::events::{Events, RecordingEvents};
 use gilde_code_lib::sidecar::{CcoMemberState, CcoTeamState, CcoTeamView, CcoWorktree};
+use gilde_code_lib::store::models::ProcKind;
 use gilde_code_lib::store::Db;
 use gilde_code_lib::supervise::health::{
     HealthAttribution, HealthConfig, HealthSeverity, HealthSnapshot, TeamFact, TeamFacts, TeamSource,
 };
-use gilde_code_lib::supervise::kill::{is_gone, KillOpts, KillTarget};
+use gilde_code_lib::supervise::kill::is_gone;
 use gilde_code_lib::supervise::procscan::{ps_snapshot, start_time_of};
 use gilde_code_lib::supervise::registry::Supervisor;
 use gilde_code_lib::supervise::spawn::is_alive;
@@ -69,9 +68,8 @@ fn block_on<F: std::future::Future>(f: F) -> F::Output {
 
 struct Harness {
     sup: Arc<Supervisor>,
-    sink: Arc<RecordingSink>,
-    bus: EventBus,
-    _graph: GraphHandle,
+    sink: Arc<RecordingEvents>,
+    bus: Events,
     dir: tempfile::TempDir,
 }
 
@@ -88,9 +86,8 @@ async fn harness() -> Harness {
             "softRssMiB": 1000000, "hardRssMiB": 1000000,
         }}))
         .expect("patch settings");
-    let graph = GraphHandle::new();
-    let sink = Arc::new(RecordingSink::default());
-    let bus = EventBus::with_sink(sink.clone(), graph.state().clone());
+    let sink = RecordingEvents::new();
+    let bus = Events::new(sink.clone());
     let sup = Arc::new(
         Supervisor::open_instance(&db, config, "0.0.0-test")
             .await
@@ -101,7 +98,6 @@ async fn harness() -> Harness {
         sup,
         sink,
         bus,
-        _graph: graph,
         dir,
     }
 }
@@ -389,54 +385,14 @@ rusty_fork_test! {
             assert_eq!(alert.severity, HealthSeverity::Action);
             assert_eq!(alert.actions[0].pids.as_deref(), Some(&[leftover.pid][..]));
 
-            // A target that is not a leftover is refused, unsignalled.
-            let refused = monitor::kill_health_orphans(
-                &h.sup,
-                &[KillTarget::pid(sibling.pid), KillTarget::pid(bystander.pid)],
-                KillOpts::default().grace(Duration::from_millis(700)),
-                &second.orphan_identities(),
-            )
-            .await;
-            assert_eq!(refused.len(), 2);
-            for outcome in &refused {
-                assert_eq!(outcome.report.refused_reason.as_deref(), Some("notLeftover"));
-                assert!(outcome.report.requested.is_empty());
+            // The clean-up path of Gilde 2 is `health_stop` (tested in
+            // `gilde2_health_*` below); the old Process Monitor kill command
+            // was dropped with `commands::monitor` (contract §2.2.1). The test
+            // ends the leftover it started itself.
+            // SAFETY: a process this test started.
+            unsafe {
+                libc::kill(leftover.pid, libc::SIGKILL);
             }
-            // A recorded start time that does not match the live pid is refused too.
-            let stale = monitor::kill_health_orphans(
-                &h.sup,
-                &[KillTarget::pid(leftover.pid)],
-                KillOpts::default().dry_run(true),
-                &[(leftover.pid, 1_000)],
-            )
-            .await;
-            assert_eq!(stale[0].report.refused_reason.as_deref(), Some("notLeftover"));
-
-            // The dry run names the leftover and sends nothing.
-            let dry = monitor::kill_health_orphans(
-                &h.sup,
-                &[KillTarget::pid(leftover.pid)],
-                KillOpts::default().dry_run(true),
-                &second.orphan_identities(),
-            )
-            .await;
-            assert!(!dry[0].report.is_refused(), "{:?}", dry[0].report);
-            assert_eq!(dry[0].report.requested, vec![leftover.pid]);
-            assert_eq!(dry[0].report.names.len(), 1, "every pid it would signal is named");
-            assert_eq!(dry[0].report.names[0].pid, leftover.pid);
-            assert_eq!(dry[0].report.names[0].name, "claude");
-            assert!(is_alive(leftover.pid), "a dry run sends no signal");
-
-            // The clean-up itself.
-            let done = monitor::kill_health_orphans(
-                &h.sup,
-                &[KillTarget::pid(leftover.pid)],
-                KillOpts::default().grace(Duration::from_millis(700)),
-                &second.orphan_identities(),
-            )
-            .await;
-            assert!(!done[0].report.is_refused(), "{:?}", done[0].report);
-            assert_eq!(done[0].report.requested, vec![leftover.pid], "only its own process tree");
             wait_until_gone(leftover.pid);
             assert!(is_alive(sibling.pid), "the live sibling was never signalled");
             assert!(is_alive(bystander.pid), "a process in another group was never signalled");
@@ -600,28 +556,400 @@ rusty_fork_test! {
                 }
             }
 
-            // The clean-up plan of the leftover: itself (it has no children), named.
-            let dry = monitor::kill_health_orphans(
-                &h.sup,
-                &[KillTarget::pid(member.pid)],
-                KillOpts::default().dry_run(true),
-                &health.orphan_identities(),
-            )
-            .await;
-            assert_eq!(dry[0].report.requested, vec![member.pid]);
-            assert_eq!(dry[0].report.names[0].name, "claude");
-            // The wrapper and the user's own CLI are refused outright.
-            let refused = monitor::kill_health_orphans(
-                &h.sup,
-                &[KillTarget::pid(wrapper.pid), KillTarget::pid(own.pid), KillTarget::pid(wrapped_pid)],
-                KillOpts::default().dry_run(true),
-                &health.orphan_identities(),
-            )
-            .await;
-            for outcome in &refused {
-                assert_eq!(outcome.report.refused_reason.as_deref(), Some("notLeftover"));
-            }
             assert!(is_alive(wrapper.pid) && is_alive(wrapped_pid) && is_alive(own.pid) && is_alive(member.pid));
         });
+    }
+}
+
+// ===========================================================================
+// Gilde 2: process records, leftovers and the Clean-up flow (contract §3.4.10,
+// §4.2.7) — T-health-leftover, T-health-stop
+// ===========================================================================
+
+mod gilde2 {
+    use super::*;
+    use gilde_code_lib::contract::common::Vendor;
+    use gilde_code_lib::contract::ids::ProcessKey;
+    use gilde_code_lib::contract::process::{LeftoverReason, ProcRole};
+    use gilde_code_lib::contract::services::{ProcInfo, ProcSnapshot, TeammateLabels};
+    use gilde_code_lib::supervise::health::{
+        quantize_bytes, HealthState, LeftoverTracker, RegistryFact, RegistryView,
+    };
+
+    fn proc(pid: i32, ppid: i32, exec: &str, argv: &[&str]) -> ProcInfo {
+        ProcInfo {
+            key: ProcessKey::new(pid as u32, 1_000),
+            pid,
+            ppid,
+            uid: 501,
+            start_sec: 1_000,
+            exec_path: Some(exec.to_string()),
+            argv_redacted: argv.iter().map(|s| s.to_string()).collect(),
+            labels: TeammateLabels::default(),
+            cwd: None,
+            rss_bytes: 123 * 1024 * 1024,
+            cpu_ns: 0,
+            cco_team_member: None,
+            gilde_app_instance: None,
+            vendor: gilde_code_lib::supervise::procscan::vendor_of_exec(exec, argv.get(1).copied())
+                .and_then(Vendor::parse),
+        }
+    }
+
+    fn teammate(pid: i32, ppid: i32) -> ProcInfo {
+        let mut p = proc(pid, ppid, "/x/claude", &["/x/claude", "--agent-id", "a@t"]);
+        p.labels = TeammateLabels {
+            agent_id: Some("a@t".into()),
+            agent_name: Some("a".into()),
+            team_name: Some("t".into()),
+            agent_color: None,
+            parent_session_id: None,
+        };
+        p
+    }
+
+    fn snap(procs: Vec<ProcInfo>, at: i64) -> ProcSnapshot {
+        ProcSnapshot { taken_at: at, procs }
+    }
+
+    #[test]
+    fn t_health_leftover_reasons_hold_two_scans() {
+        let mut t = LeftoverTracker::default();
+        let reg = RegistryView::new();
+        // A teammate whose lead is gone (re-parented to launchd).
+        let s1 = snap(vec![teammate(500, 1)], 1);
+        let r1 = t.observe(&s1, &reg);
+        assert_eq!(r1.len(), 1);
+        assert_eq!(r1[0].role, ProcRole::Teammate);
+        assert!(r1[0].leftover.is_none(), "one scan is not enough");
+        let r2 = t.observe(&snap(vec![teammate(500, 1)], 2), &reg);
+        let l = r2[0].leftover.as_ref().expect("held two scans");
+        assert_eq!(l.reason, LeftoverReason::TeammateOfGoneLead);
+        assert_eq!(l.held_scans, 2);
+        assert_eq!(l.since, 1);
+        // The lead comes back into view: the condition stops, the hold resets.
+        let lead = proc(400, 1, "/x/claude", &["/x/claude"]);
+        let r3 = t.observe(&snap(vec![lead.clone(), teammate(500, 400)], 3), &reg);
+        assert!(r3.iter().all(|r| r.leftover.is_none()));
+        // A swarm server whose lead pid is gone.
+        let tmux = proc(600, 1, "/opt/homebrew/bin/tmux", &["tmux", "-L", "claude-swarm-4242", "new-session"]);
+        t.observe(&snap(vec![tmux.clone()], 4), &reg);
+        let r = t.observe(&snap(vec![tmux], 5), &reg);
+        assert_eq!(r[0].role, ProcRole::PaneServer);
+        assert_eq!(r[0].leftover.as_ref().unwrap().reason, LeftoverReason::PaneServerOfDeadLead);
+        // A user's own CLI is a record, never a leftover; RSS is quantized.
+        let own = proc(700, 300, "/x/codex", &["/x/codex"]);
+        let r = t.observe(&snap(vec![own.clone(), proc(300, 1, "/bin/zsh", &["-zsh"])], 6), &reg);
+        let rec = r.iter().find(|x| x.pid == 700).unwrap();
+        assert_eq!(rec.vendor, Some(Vendor::Codex));
+        assert!(rec.leftover.is_none());
+        assert_eq!(rec.rss_bytes, quantize_bytes(123 * 1024 * 1024));
+        assert_eq!(rec.rss_bytes % (10 * 1024 * 1024), 0);
+        // `claude daemon` is a helper, not a session.
+        let daemon = proc(800, 1, "/x/claude", &["/x/claude", "daemon", "run"]);
+        let r = t.observe(&snap(vec![daemon], 7), &reg);
+        assert_eq!(r[0].role, ProcRole::VendorHelper);
+    }
+
+    #[test]
+    fn own_registry_rows_win_and_crash_leftovers_are_named() {
+        let mut t = LeftoverTracker::default();
+        let mut reg = RegistryView::new();
+        reg.insert(
+            (900, 1_000),
+            RegistryFact {
+                spawn_id: "s".into(),
+                kind: Some(ProcKind::Convo),
+                current_instance: false,
+                parent_uid: Some("s_01890a5d-ac96-774b-bcce-b302099a8057".into()),
+                crash_leftover: true,
+                quit_survivor: false,
+                lead_gone_survivor: false,
+                escapee: false,
+            },
+        );
+        let mut p = proc(900, 1, "/x/claude", &["/x/claude"]);
+        p.gilde_app_instance = Some(true);
+        t.observe(&snap(vec![p.clone()], 1), &reg);
+        let r = t.observe(&snap(vec![p], 2), &reg);
+        assert!(r[0].gilde_owned, "own rows win over OtherGilde (N-05)");
+        assert_eq!(r[0].session_uid.as_ref().map(|u| u.as_str()), Some("s_01890a5d-ac96-774b-bcce-b302099a8057"));
+        assert_eq!(r[0].leftover.as_ref().unwrap().reason, LeftoverReason::GildeCrashLeftover);
+    }
+
+    /// A40.3: a hosted pane whose processes survived its lead's exit (PaneHost
+    /// `lead_gone` recorded it) is Leftover `TeammateOfGoneLead`, although its
+    /// row belongs to this running instance; without the record it is not.
+    #[test]
+    fn a_pane_that_survived_its_leads_exit_is_a_teammate_of_gone_lead_leftover() {
+        let fact = |lead_gone_survivor: bool| RegistryFact {
+            spawn_id: "pane".into(),
+            kind: Some(ProcKind::Pane),
+            current_instance: true,
+            parent_uid: Some("s_01890a5d-ac96-774b-bcce-b302099a8057".into()),
+            crash_leftover: false,
+            quit_survivor: false,
+            lead_gone_survivor,
+            escapee: false,
+        };
+        for (recorded, want) in [(true, Some(LeftoverReason::TeammateOfGoneLead)), (false, None)] {
+            let mut t = LeftoverTracker::default();
+            let mut reg = RegistryView::new();
+            reg.insert((910, 1_000), fact(recorded));
+            let p = proc(910, 1, "/bin/sh", &["/bin/sh", "-c", "x"]);
+            t.observe(&snap(vec![p.clone()], 1), &reg);
+            let r = t.observe(&snap(vec![p], 2), &reg);
+            assert_eq!(r[0].leftover.as_ref().map(|l| l.reason), want, "recorded={recorded}");
+        }
+        gilde_code_lib::supervise::reaper::note_lead_gone_survivor("pane-row");
+        assert!(gilde_code_lib::supervise::reaper::lead_gone_survivor_spawn_ids().contains("pane-row"));
+    }
+
+    #[test]
+    fn t_health_stop_preview_refuses_what_is_not_a_leftover() {
+        let health = HealthState::new();
+        let reg = RegistryView::new();
+        // Our own pid stands in for a live process: it is never a leftover.
+        let me = std::process::id() as i32;
+        let start = start_time_of(me).expect("start");
+        let mut p = proc(me, 1, "/x/claude", &["/x/claude"]);
+        p.key = ProcessKey::new(me as u32, start as u64);
+        p.start_sec = start;
+        let s = Arc::new(snap(vec![p.clone()], 1));
+        health.observe(s.clone(), &reg);
+        health.observe(s, &reg);
+        let res = health.stop_preview(&[p.key.clone(), ProcessKey::new(1, 1)]);
+        assert!(res.targets.is_empty());
+        assert_eq!(res.refused.len(), 2);
+        assert!(res.refused.iter().all(|r| r.reason == "notLeftover"));
+        // The detail is redacted and carries no environment.
+        let d = health.detail(&p.key).expect("detail");
+        assert_eq!(d.started_at, start * 1000);
+        assert!(health.detail(&ProcessKey::new(1, 1)).is_err());
+    }
+}
+
+rusty_fork_test! {
+    #[test]
+    fn t_health_stop_waits_for_the_undo_window_and_rechecks_identity() {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                use gilde_code_lib::contract::ids::ProcessKey;
+                use gilde_code_lib::contract::process::ProcRole;
+                use gilde_code_lib::contract::services::{ProcInfo, ProcSnapshot, TeammateLabels};
+                use gilde_code_lib::supervise::health::{HealthState, RegistryFact, RegistryView};
+
+                let dir = tempfile::tempdir().expect("tempdir");
+                let db = Db::open_in_memory().expect("db");
+                let config = Arc::new(ConfigStore::open_at(&dir.path().join("config.json")).expect("config"));
+                let sup = Arc::new(Supervisor::open_instance(&db, config, "0.0.0-test").await.expect("sup"));
+
+                // A child this test started, presented as a crash leftover.
+                let mut child = Command::new(fixtures::fake_agent_path())
+                    .arg("hang")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .process_group(0)
+                    .spawn()
+                    .expect("spawn");
+                std::thread::sleep(Duration::from_millis(400));
+                let pid = child.id() as i32;
+                let start = start_time_of(pid).expect("start");
+                let key = ProcessKey::new(pid as u32, start as u64);
+                let p = ProcInfo {
+                    key: key.clone(),
+                    pid,
+                    ppid: 1,
+                    uid: 501,
+                    start_sec: start,
+                    exec_path: Some(fixtures::fake_agent_path().to_string_lossy().into_owned()),
+                    argv_redacted: vec!["fake_agent".into(), "hang".into()],
+                    labels: TeammateLabels::default(),
+                    cwd: None,
+                    rss_bytes: 1,
+                    cpu_ns: 0,
+                    cco_team_member: None,
+                    gilde_app_instance: None,
+                    vendor: None,
+                };
+                let mut reg = RegistryView::new();
+                reg.insert(
+                    (pid, start),
+                    RegistryFact {
+                        spawn_id: "x".into(),
+                        kind: Some(ProcKind::Pty),
+                        current_instance: false,
+                        parent_uid: None,
+                        crash_leftover: true,
+                        quit_survivor: false,
+                        lead_gone_survivor: false,
+                        escapee: false,
+                    },
+                );
+                let health = HealthState::new();
+                let s = Arc::new(ProcSnapshot { taken_at: 1, procs: vec![p] });
+                health.observe(s.clone(), &reg);
+                let left = health.observe(s, &reg);
+                assert_eq!(left.len(), 1);
+                assert_ne!(left[0].role, ProcRole::Teammate);
+
+                // Preview → stop → undo inside the window: nothing is signalled.
+                let preview = health.stop_preview(std::slice::from_ref(&key));
+                assert_eq!(preview.targets.len(), 1);
+                let res = health
+                    .stop(&preview.confirm_token, sup.clone(), Duration::from_millis(600))
+                    .expect("stop");
+                let undo = res.undo_token.expect("undo token");
+                assert!(health.undo(undo.as_str()), "the undo arrives in time");
+                // A used confirm token is a conflict.
+                assert!(health.stop(&preview.confirm_token, sup.clone(), Duration::ZERO).is_err());
+                tokio::time::sleep(Duration::from_millis(1_000)).await;
+                assert!(is_alive(pid), "an undone stop sends no signal");
+
+                // Preview → stop, no undo: the window closes, the fenced TERM ends it.
+                let preview = health.stop_preview(std::slice::from_ref(&key));
+                let res = health
+                    .stop(&preview.confirm_token, sup.clone(), Duration::from_millis(200))
+                    .expect("stop");
+                assert_eq!(res.stopped, 1);
+                let deadline = Instant::now() + SETTLE;
+                while !is_gone(pid) && Instant::now() < deadline {
+                    let _ = child.try_wait();
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                assert!(is_gone(pid), "the leftover was stopped after the window");
+                assert!(!health.undo(undo.as_str()), "an expired token cancels nothing");
+                let _ = child.kill();
+                let _ = child.wait();
+            });
+    }
+}
+
+// ===========================================================================
+// A43.1 (G7c-07): own crash leftovers are known at once; A42.1: Clean-up of a
+// non-Gilde leftover is a SIGTERM to that process only, never SIGKILL.
+// ===========================================================================
+
+mod a43 {
+    use super::*;
+    use gilde_code_lib::contract::common::Vendor;
+    use gilde_code_lib::contract::ids::ProcessKey;
+    use gilde_code_lib::contract::process::LeftoverReason;
+    use gilde_code_lib::contract::services::{ProcInfo, ProcSnapshot, TeammateLabels};
+    use gilde_code_lib::supervise::health::{HealthState, LeftoverTracker, RegistryFact, RegistryView};
+
+    fn proc_info(pid: i32, start: i64, exec: &str, labels: TeammateLabels, vendor: Option<Vendor>) -> ProcInfo {
+        ProcInfo {
+            key: ProcessKey::new(pid as u32, start as u64),
+            pid,
+            ppid: 1,
+            uid: 501,
+            start_sec: start,
+            exec_path: Some(exec.into()),
+            argv_redacted: vec![exec.into()],
+            labels,
+            cwd: None,
+            rss_bytes: 1 << 20,
+            cpu_ns: 0,
+            cco_team_member: None,
+            gilde_app_instance: None,
+            vendor,
+        }
+    }
+
+    /// G7c-07a, the reviewer's test: the first scan after boot names a crash
+    /// leftover the boot sweep proved.
+    #[test]
+    fn g7c_07a_the_first_scan_after_boot_names_a_crash_leftover() {
+        let mut view = RegistryView::new();
+        view.insert(
+            (901, 9),
+            RegistryFact { spawn_id: "s".into(), crash_leftover: true, ..RegistryFact::default() },
+        );
+        let mut t = LeftoverTracker::default();
+        let first = t.observe(
+            &ProcSnapshot { taken_at: 1, procs: vec![proc_info(901, 9, "/x/claude", TeammateLabels::default(), Some(Vendor::Claude))] },
+            &view,
+        );
+        let l = first[0].leftover.as_ref().expect("a crash leftover from the first scan");
+        assert_eq!((l.reason, l.held_scans), (LeftoverReason::GildeCrashLeftover, 1));
+    }
+
+    /// The 2-scan hold still applies to a leftover inferred from scans.
+    #[test]
+    fn a43_an_inferred_leftover_still_needs_two_scans() {
+        let labels = TeammateLabels {
+            agent_id: Some("a@t".into()),
+            agent_name: Some("a".into()),
+            team_name: Some("t".into()),
+            ..TeammateLabels::default()
+        };
+        let snap = |n| ProcSnapshot { taken_at: n, procs: vec![proc_info(902, 9, "/x/claude", labels.clone(), Some(Vendor::Claude))] };
+        let mut t = LeftoverTracker::default();
+        let view = RegistryView::new();
+        assert!(t.observe(&snap(1), &view)[0].leftover.is_none(), "inferred: held for a second scan");
+        let second = t.observe(&snap(2), &view);
+        assert_eq!(second[0].leftover.as_ref().map(|l| l.reason), Some(LeftoverReason::TeammateOfGoneLead));
+    }
+
+    rusty_fork_test! {
+        /// A42.1: Clean-up of a non-Gilde leftover (no registry row: a
+        /// teammate of a gone lead) after the undo window is a SIGTERM to that
+        /// process only — one that ignores it survives, never SIGKILLed.
+        #[test]
+        fn a42_cleanup_of_a_non_gilde_leftover_never_sigkills() {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("runtime")
+                .block_on(async {
+                    let dir = tempfile::tempdir().expect("tempdir");
+                    let db = Db::open_in_memory().expect("db");
+                    let config = Arc::new(ConfigStore::open_at(&dir.path().join("config.json")).expect("config"));
+                    let sup = Arc::new(Supervisor::open_instance(&db, config, "0.0.0-test").await.expect("sup"));
+                    let mut child = Command::new(fixtures::fake_agent_path())
+                        .arg("ignore-term")
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .process_group(0)
+                        .spawn()
+                        .expect("spawn");
+                    std::thread::sleep(Duration::from_millis(400));
+                    let pid = child.id() as i32;
+                    let start = start_time_of(pid).expect("start");
+                    let labels = TeammateLabels {
+                        agent_id: Some("a@t".into()),
+                        agent_name: Some("a".into()),
+                        team_name: Some("t".into()),
+                        ..TeammateLabels::default()
+                    };
+                    let p = proc_info(pid, start, &fixtures::fake_agent_path().to_string_lossy(), labels, Some(Vendor::Claude));
+                    let key = p.key.clone();
+                    let health = HealthState::new();
+                    let reg = RegistryView::new();
+                    let s = Arc::new(ProcSnapshot { taken_at: 1, procs: vec![p] });
+                    health.observe(s.clone(), &reg);
+                    let left = health.observe(s, &reg);
+                    assert!(left[0].leftover.is_some() && !left[0].gilde_owned, "a non-Gilde leftover: {left:?}");
+                    let preview = health.stop_preview(std::slice::from_ref(&key));
+                    assert_eq!(preview.targets.len(), 1, "{preview:?}");
+                    let res = health.stop(&preview.confirm_token, sup.clone(), Duration::from_millis(100)).expect("stop");
+                    assert_eq!(res.stopped, 1);
+                    // The window, the TERM (ignored) and its 2 s grace, then the
+                    // kill-verify budget: still alive, nothing escalated.
+                    tokio::time::sleep(Duration::from_millis(4_800)).await;
+                    let alive = is_alive(pid) && !is_gone(pid);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    assert!(alive, "Clean-up SIGKILLed a non-Gilde leftover");
+                });
+        }
     }
 }

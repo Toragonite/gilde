@@ -1,1195 +1,1036 @@
 /**
- * The showcase's demo world — neutral, plausible data in the app's real shapes.
+ * The showcase world: a deterministic `StoreSnapshot` plus the content the
+ * screens fetch on demand (conversation blocks, message bodies, task titles,
+ * History rows), built from neutral sample data (ux-merge-decisions
+ * "Additional requirements": projects like checkout-service, infra-live,
+ * mobile-app, docs-site; teams like auth-split).
  *
- * One small engineering organisation (`acme`) on one Mac: three repositories
- * under `~/code`, four teams, five worker accounts across the agent CLIs, and the
- * agent processes the health surface sees. Every value is built from the real
- * types (`CcoTeamView`, `CcoWorkersAnswer`, `HealthSnapshot`, …), so `tsc`
- * checks the fixtures against the same contract real data meets, and every
- * time is relative to `now` (the moment the showcase starts).
+ * `buildWorld(options, now)` is pure: the same options and `now` give the same
+ * world, so screenshots and the browser gates (contract §14.3) are repeatable.
+ * The sizes the Floor geometry gate needs (1, 8, 20, 31 agents, with
+ * native-inferred and orchestrator teams) are `WorldOptions.agents`.
  *
- * Nothing here may name a real person, account, e-mail address or machine
- * path: accounts are `main`, `work`, `ci-bot`, `codex`, `cursor`; repositories
- * are `acme/*`; paths are `~/code/*`. The showcase test scans the rendered
- * markup for anything else.
+ * Every value follows the contract's rules where the UI can see them: the
+ * attention queue is computed from the sessions with Q1–Q8 (§8.1), so its
+ * counts always equal what the sidebar shows; hosted-team approvals carry
+ * `onBehalfOf`/`answerIn` (Q3); ids have the §3.2 shapes.
  */
 
-import type {
-  CcoBoardTask,
-  CcoMemberActivity,
-  CcoMemberState,
-  CcoTeamListResult,
-  CcoTeamMessage,
-  CcoTeamState,
-  CcoTeamSummary,
-  CcoTeamView,
-  CcoUsageWindow,
-  CcoWorkerAccount,
-  CcoWorkersAnswer,
-  HealthAgent,
-  HealthAlert,
-  HealthHost,
-  HealthSnapshot,
-  HealthTeam,
-  Project,
-  RepoIdentity,
-} from '../lib/ipc';
-import { CCO_WORKERS_SCHEMA } from '../lib/ipc';
-import { RUN_LOGIN_FAILURE_DETAIL } from '../workers/model';
+import type { AbsPath } from '../lib/gen/AbsPath';
+import type { Account } from '../lib/gen/Account';
+import type { ActivityState } from '../lib/gen/ActivityState';
+import type { AttentionItem } from '../lib/gen/AttentionItem';
+import type { AttentionQueue } from '../lib/gen/AttentionQueue';
+import type { AttentionReason } from '../lib/gen/AttentionReason';
+import type { Block } from '../lib/gen/Block';
+import type { BlockKind } from '../lib/gen/BlockKind';
+import type { ClaudeCompat } from '../lib/gen/ClaudeCompat';
+import type { Control } from '../lib/gen/Control';
+import type { HistoryRow } from '../lib/gen/HistoryRow';
+import type { UndoToken } from '../lib/gen/UndoToken';
+import type { IdentityColour } from '../lib/gen/IdentityColour';
+import type { Location } from '../lib/gen/Location';
+import type { Member } from '../lib/gen/Member';
+import type { PaneTile } from '../lib/gen/PaneTile';
+import type { MemberKey } from '../lib/gen/MemberKey';
+import type { MessageKey } from '../lib/gen/MessageKey';
+import type { MessageKind } from '../lib/gen/MessageKind';
+import type { PendingInteraction } from '../lib/gen/PendingInteraction';
+import type { PrimaryAction } from '../lib/gen/PrimaryAction';
+import type { ProcessRecord } from '../lib/gen/ProcessRecord';
+import type { Project } from '../lib/gen/Project';
+import type { Session } from '../lib/gen/Session';
+import type { SessionCaps } from '../lib/gen/SessionCaps';
+import type { SessionUid } from '../lib/gen/SessionUid';
+import type { SourceStatus } from '../lib/gen/SourceStatus';
+import type { StoreSnapshot } from '../lib/gen/StoreSnapshot';
+import type { Task } from '../lib/gen/Task';
+import type { TaskKey } from '../lib/gen/TaskKey';
+import type { Team } from '../lib/gen/Team';
+import type { TeamCapabilities } from '../lib/gen/TeamCapabilities';
+import type { TeamKey } from '../lib/gen/TeamKey';
+import type { TeamMessage } from '../lib/gen/TeamMessage';
+import type { Vendor } from '../lib/gen/Vendor';
+import {
+  accountId,
+  blockId,
+  episodeId,
+  locationId,
+  memberKey,
+  messageKey,
+  paneId,
+  processKey,
+  projectId,
+  ptyId,
+  requestId,
+  sessionUid,
+  taskKey,
+  teamKey,
+} from './ids';
 
-/** Which teams (and which health facts) a scene shows. */
+// ---------------------------------------------------------------------------
+// Options and result
+// ---------------------------------------------------------------------------
+
+/** The three team shapes the screens must render (§7.2, §7.3.1, §7.2.5). */
+export type TeamKind = 'native' | 'nativeInferred' | 'orchestrator';
+
 export interface WorldOptions {
-  /** The four teams (Repository grouping) instead of the checkout repository's two. */
-  allTeams: boolean;
-  /** The ended team's agent is still running: one actionable health alert. */
-  leftover: boolean;
+  /** Agents on the Floor: solo sessions plus every team member (leads included). 0 = empty world. */
+  agents: number;
+  /** Teams to form out of the agents, in this order. */
+  teams: readonly TeamKind[];
+  /** Approval and question cards are waiting. */
+  pending: boolean;
+  /** Leftover processes held for 2 scans (band 6). */
+  leftovers: number;
+  /** Ended sessions in History. */
+  history: number;
+  /** The default claude account is at 95 % of its 5-hour window (Home's warning line, A26.6). */
+  quotaHot?: boolean;
+  /** The boot sweep's undo window is open: the Recovered dialog (A29.3, T18b). */
+  recovery?: boolean;
+  /**
+   * The hosted team also shows panes without a member session (A30.1): one
+   * starting, one whose spawn failed, one running unknown pane.
+   */
+  paneTiles?: boolean;
 }
+
+/** The Recovered-dialog fixture's group token and window (A29.3). */
+export const RECOVERY_UNDO = 'u_showcase-recovery' as UndoToken;
+export const RECOVERY_WINDOW_MS = 10_000;
 
 export interface ShowcaseWorld {
   now: number;
-  views: CcoTeamView[];
-  list: CcoTeamListResult;
-  identities: RepoIdentity[];
-  projects: Project[];
-  workers: CcoWorkersAnswer;
-  health: HealthSnapshot;
+  snapshot: StoreSnapshot;
+  /** Conversation blocks per session (what `convo_subscribe` resets to). */
+  convo: ReadonlyMap<SessionUid, readonly Block[]>;
+  /** On-demand texts (never in the store, §3.4.7–§3.4.8). */
+  messageBodies: ReadonlyMap<MessageKey, string>;
+  taskTitles: ReadonlyMap<TaskKey, string>;
+  history: readonly HistoryRow[];
+  /** Sessions a scene may open, by role. */
+  roles: WorldRoles;
 }
 
-/** The team the Team view opens on. */
-export const MAIN_TEAM_ID = 'tmc7k2p9x4qa';
-/** The member whose details the Team scene opens. */
-export const MAIN_MEMBER = 'api';
-
-const ENDED_TEAM_ID = 'tmb3e8w1v6nd';
-const SEARCH_TEAM_ID = 'tms5r9m2h7kc';
-const DOCS_TEAM_ID = 'tmd4q1z8f3ye';
-
-const SEC = 1_000;
-const MIN = 60 * SEC;
-const HOUR = 60 * MIN;
-const DAY = 24 * HOUR;
-const GIB = 1024 * 1024 * 1024;
-const RAM = 32 * GIB;
-
-/** A git object name for the eye: 40 hex digits from a short seed. */
-function sha(seed: string): string {
-  return seed.repeat(Math.ceil(40 / seed.length)).slice(0, 40);
+export interface WorldRoles {
+  /** A Conversation session with an approval card (the Session scene). */
+  approval: SessionUid | null;
+  /** A session another app owns (the Watching ownership bar). */
+  watching: SessionUid | null;
+  /** A Terminal-mode session. */
+  terminal: SessionUid | null;
+  /** Up to 6 live sessions for Split. */
+  split: SessionUid[];
+  /** The first team, if any. */
+  team: TeamKey | null;
 }
 
 // ---------------------------------------------------------------------------
-// repositories, folders, worktrees
+// Sample data
 // ---------------------------------------------------------------------------
 
-const CHECKOUT = '~/code/checkout';
-const CHECKOUT_BILLING = '~/code/checkout-billing';
-const WEB = '~/code/web';
-const DOCS = '~/code/docs';
-const WORKTREES = '~/code/.team-worktrees';
+export const HOME_DIR = '/Users/demo';
 
-interface Repo {
-  slug: string;
-  root: string;
-  branch: string;
+export const PROJECT_NAMES = ['checkout-service', 'infra-live', 'mobile-app', 'docs-site'] as const;
+
+const TITLES = [
+  'Fix the retry loop in the payment client',
+  'Add rate limiting to the public API',
+  'Migrate the deploy pipeline to the new runner',
+  'Investigate flaky checkout integration tests',
+  'Update the onboarding screens for tablets',
+  'Write the release notes for 4.2',
+  'Refactor the session cache eviction',
+  'Rotate the staging certificates',
+  'Profile the cold start of the mobile build',
+  'Document the webhook signing scheme',
+  'Split the auth module into separate token and session services with a shared key store',
+  '결제 재시도 로직 정리',
+  'Clean up unused feature flags',
+  'Add tracing to the order worker',
+  '배포 스크립트 점검',
+  'Speed up the docs search index',
+] as const;
+
+const MEMBER_NAMES = [
+  'token-agent', 'session-agent', 'db-agent', 'docs-agent', 'api-agent', 'test-agent',
+  'perf-agent', 'infra-agent', 'ui-agent', 'review-agent', 'build-agent', 'data-agent',
+] as const;
+
+const TASK_TITLES = [
+  'Extract the token signer',
+  'Move session storage behind an interface',
+  'Add key rotation tests',
+  'Update the auth docs',
+  'Wire the new service into the gateway',
+] as const;
+
+const COLOURS: readonly IdentityColour[] = ['blue', 'green', 'yellow', 'purple', 'orange', 'pink', 'cyan', 'red'];
+const TEAM_NAMES: Readonly<Record<TeamKind, string>> = { native: 'auth-split', nativeInferred: 'cache-rework', orchestrator: 'docs-refresh' };
+
+const MIN = 60_000;
+
+// ---------------------------------------------------------------------------
+// Building blocks
+// ---------------------------------------------------------------------------
+
+function abs(path: string): AbsPath {
+  return path as AbsPath;
 }
 
-const REPOS: Record<'checkout' | 'web' | 'docs', Repo> = {
-  checkout: { slug: 'acme/checkout', root: CHECKOUT, branch: 'main' },
-  web: { slug: 'acme/web', root: WEB, branch: 'main' },
-  docs: { slug: 'acme/docs', root: DOCS, branch: 'main' },
+function projectRoot(name: string): string {
+  return `${HOME_DIR}/code/${name}`;
+}
+
+const WORKTREE = `${HOME_DIR}/.gilde/worktrees/checkout-service/retry-fix`;
+
+export function buildProjects(now: number, live: ReadonlyMap<string, number>): Project[] {
+  return PROJECT_NAMES.map((name, order) => ({
+    id: projectId(name),
+    name,
+    root: abs(projectRoot(name)),
+    kind: name === 'docs-site' ? 'folder' : 'git',
+    order,
+    folded: false,
+    earlier: (live.get(name) ?? 0) === 0 && name === 'docs-site',
+    lastActivityAt: now - (order + 1) * 7 * MIN,
+    liveSessions: live.get(name) ?? 0,
+    isTemp: false,
+  }));
+}
+
+export function buildLocations(): Location[] {
+  const out: Location[] = PROJECT_NAMES.map((name) => ({
+    id: locationId(projectRoot(name)),
+    projectId: projectId(name),
+    path: abs(projectRoot(name)),
+    kind: name === 'docs-site' ? 'folder' : 'main',
+    branch: name === 'docs-site' ? null : 'main',
+    worktreeName: null,
+    gildeCreated: false,
+    exists: true,
+  }));
+  out.push({
+    id: locationId(WORKTREE),
+    projectId: projectId('checkout-service'),
+    path: abs(WORKTREE),
+    kind: 'worktree',
+    branch: 'gilde/retry-fix',
+    worktreeName: 'retry-fix',
+    gildeCreated: true,
+    exists: true,
+  });
+  return out;
+}
+
+const CAPS_CONVERSATION: SessionCaps = {
+  send: 'conversation', interrupt: true, forceStop: true, approve: 'structured', setModel: true,
+  setPermissionMode: ['default', 'acceptEdits', 'plan'], continueOptions: [], stopSession: 'claudeStop',
+  terminalView: true, logView: false, changes: 'full', ownerFocus: false,
+};
+const CAPS_TERMINAL: SessionCaps = {
+  ...CAPS_CONVERSATION, send: 'ptyPaste', approve: 'screenKeys', setModel: false, setPermissionMode: [], stopSession: 'fenced',
+};
+const CAPS_TURNS: SessionCaps = {
+  ...CAPS_CONVERSATION, send: 'turn', approve: 'none', setPermissionMode: [], stopSession: 'fenced', terminalView: false, logView: true,
+};
+const CAPS_WATCHING: SessionCaps = {
+  send: 'none', interrupt: false, forceStop: false, approve: 'goToOwner', setModel: false, setPermissionMode: [],
+  continueOptions: ['fork'], stopSession: 'termAfterIdentity', terminalView: false, logView: false, changes: 'readOnly', ownerFocus: true,
+};
+const CAPS_ENDED: SessionCaps = {
+  send: 'none', interrupt: false, forceStop: false, approve: 'none', setModel: false, setPermissionMode: [],
+  continueOptions: ['resume', 'fork'], stopSession: 'none', terminalView: false, logView: false, changes: 'readOnly', ownerFocus: false,
 };
 
-/** The worktree-aware identity of a path in one repository (what `repo_identity` answers). */
-function identity(path: string, repo: Repo, worktree: { branch: string } | null): RepoIdentity {
+export interface SessionSpec {
+  n: number;
+  vendor: Vendor;
+  title: string;
+  project: string;
+  worktree?: boolean;
+  control: Control;
+  state: ActivityState;
+  sinceMin: number;
+  startedMin: number;
+  pending?: PendingInteraction[];
+  team?: Session['team'];
+}
+
+export function capsFor(control: Control): SessionCaps {
+  if (control.kind === 'watching') return CAPS_WATCHING;
+  if (control.kind === 'notRunning') return CAPS_ENDED;
+  if (control.mode === 'terminal') return CAPS_TERMINAL;
+  if (control.mode === 'turnBased') return CAPS_TURNS;
+  return CAPS_CONVERSATION;
+}
+
+const MODELS: Readonly<Record<Vendor, string>> = { claude: 'sonnet', codex: 'gpt-codex', cursor: 'auto', agy: 'default' };
+
+export function buildSession(spec: SessionSpec, now: number): Session {
+  const uid = sessionUid(spec.n);
+  const cwd = spec.worktree ? WORKTREE : projectRoot(spec.project);
+  const live = spec.control.kind !== 'notRunning';
+  const startedAt = now - spec.startedMin * MIN;
+  const claude = spec.vendor === 'claude';
+  const transport = spec.control.kind === 'inGilde' ? spec.control.transport : null;
   return {
-    path,
-    kind: 'repo',
-    key: `origin:git.example.com/${repo.slug}`,
-    commonDir: `${repo.root}/.git`,
-    root: repo.root,
-    toplevel: path,
-    linkedWorktree: worktree !== null,
-    branch: worktree ? worktree.branch : repo.branch,
-    origin: `https://git.example.com/${repo.slug}.git`,
+    uid,
+    vendor: spec.vendor,
+    accountId: accountId(spec.vendor, 'default'),
+    vendorSessionId: `0192f0aa-0000-4000-8000-${spec.n.toString(16).padStart(12, '0')}`,
+    projectId: projectId(spec.project),
+    locationId: locationId(cwd),
+    cwd: abs(cwd),
+    control: spec.control,
+    activity: {
+      state: spec.state,
+      since: now - spec.sinceMin * MIN,
+      confidence: spec.control.kind === 'watching' ? 'likely' : 'high',
+      evidence: null,
+      episode: episodeId(uid, 1),
+    },
+    title: spec.title,
+    team: spec.team ?? null,
+    startedAt,
+    endedAt: live ? null : now - spec.sinceMin * MIN,
+    lastActivityAt: now - spec.sinceMin * MIN,
+    pending: spec.pending ?? [],
+    queued: [],
+    model: MODELS[spec.vendor],
+    permissionMode: claude ? 'default' : null,
+    binary: null,
+    claudeVersion: claude ? '2.1.307' : null,
+    memoryBytes: live ? 200 * 1024 * 1024 : null,
+    usageToday: null,
+    caps: capsFor(spec.control),
+    details: {
+      vendorSessionId: null,
+      accountLabel: 'Default',
+      configDir: claude ? '~/.claude' : null,
+      cwd: cwd.replace(HOME_DIR, '~'),
+      location: spec.worktree ? 'wt/retry-fix' : 'main',
+      model: MODELS[spec.vendor],
+      controlMode: spec.control.kind === 'inGilde' ? spec.control.mode : null,
+      connection: transport,
+      claudeVersion: claude ? '2.1.307' : null,
+      compatState: claude ? 'verified' : null,
+      binaryRealpath: null,
+      versionNote: null,
+      startedAt,
+      memoryBytes: live ? 200 * 1024 * 1024 : null,
+      transcriptPath: null,
+      teamRawId: null,
+      orchestratorTaskTitle: null,
+      usageToday: null,
+      approvalChannelUnconfirmed: null,
+      followLastRowAt: null,
+      teammateVersionDiffers: false,
+      teamFormatUnverified: false,
+    },
+    mergedInto: null,
   };
 }
 
-function memberWorktree(team: string, suffix: string, member: string) {
+/** An approval card for a shell command (contract §3.4.5). */
+export function approvalCard(uid: SessionUid, n: number, receivedAt: number, extra: Partial<PendingInteraction> = {}): PendingInteraction {
   return {
-    path: `${WORKTREES}/${team}/${member}`,
-    branch: `cco/${team}-${suffix}/${member}`,
-  };
-}
-
-// ---------------------------------------------------------------------------
-// teams
-// ---------------------------------------------------------------------------
-
-interface MemberInput {
-  name: string;
-  index: number;
-  role: string;
-  state: CcoMemberState['state'];
-  provider: string;
-  worker: string;
-  model: string;
-  mailbox: string;
-  team: string;
-  suffix: string;
-  baseCommit: string;
-  turns: number;
-  tokens: { in: number; out: number };
-  costUsd: number | null;
-  tasks: string[];
-  rssMb: number;
-  extra?: Partial<CcoMemberState>;
-}
-
-function member(m: MemberInput): CcoMemberState {
-  const wt = memberWorktree(m.team, m.suffix, m.name);
-  return {
-    name: m.name,
-    index: m.index,
-    role: m.role,
-    state: m.state,
-    provider: m.provider,
-    worker: m.worker,
-    accountLabel: m.worker,
-    machineLogin: false,
-    sharesLeadPlan: false,
-    billableOverage: false,
-    runsCommands: true,
-    model: m.model,
-    incarnation: 1,
-    mailbox: m.mailbox,
-    portBase: 41000 + m.index * 10,
-    worktree: { path: wt.path, branch: wt.branch, baseCommit: m.baseCommit, ready: true },
-    turns: m.turns,
-    tokens: m.tokens,
-    costUsd: m.costUsd,
-    pending: 0,
-    tasks: m.tasks,
-    peerWakes: 0,
-    rssMb: m.rssMb,
-    ...m.extra,
-  };
-}
-
-function task(
-  t: Pick<CcoBoardTask, 'id' | 'title' | 'state' | 'paths'> & Partial<CcoBoardTask>,
-  createdAt: number,
-  updatedAt: number,
-): CcoBoardTask {
-  return {
-    allowOverlap: false,
-    createdBy: 'lead',
-    createdAt,
-    reports: [],
-    commits: [],
-    turns: [],
-    updatedAt,
-    updatedBy: t.assignee ?? 'lead',
-    ...t,
-  };
-}
-
-function message(
-  seq: number,
-  ts: number,
-  from: string,
-  to: string,
-  kind: string,
-  body: string,
-  taskId?: string,
-): CcoTeamMessage {
-  return {
-    seq,
-    id: `m${seq}`,
-    ts,
-    from,
-    to,
-    kind,
-    urgent: false,
-    ...(taskId === undefined ? {} : { task: taskId }),
-    body,
-    cut: false,
-    bytes: body.length,
-  };
-}
-
-function view(state: CcoTeamState, extra: Omit<CcoTeamView, 'teamId' | 'state' | 'generation' | 'truncated'>): CcoTeamView {
-  return { teamId: state.id, state, generation: 1, truncated: false, ...extra };
-}
-
-/** checkout-revamp: the live team the Team view shows — lead and three members on three CLIs. */
-function checkoutRevamp(now: number): CcoTeamView {
-  const team = 'checkout-revamp';
-  const suffix = 'c7k2';
-  const base = sha('4e1c9a7b2d');
-  const createdAt = now - 3 * HOUR - 12 * MIN;
-  const api = member({
-    name: 'api',
-    index: 1,
-    role: 'Backend: checkout sessions API',
-    state: 'running',
-    provider: 'claude',
-    worker: 'work',
-    model: 'opus',
-    mailbox: 'tools',
-    team,
-    suffix,
-    baseCommit: base,
-    turns: 14,
-    tokens: { in: 1_020_544, out: 66_310 },
-    costUsd: 9.87,
-    tasks: ['b3'],
-    rssMb: 1_410,
-    extra: {
-      conversationShort: '8c2f1a',
-      turn: { id: 't37', n: 14, startedAt: now - 2 * MIN - 5 * SEC, pid: 52210, lastOutputAt: now - 8 * SEC },
-      lastTurn: {
-        id: 't31',
-        n: 13,
-        outcome: 'ok',
-        endedAt: now - 9 * MIN,
-        head: 'Request validation for POST /v1/checkout/sessions is in; 12 tests pass.',
-      },
-      lastInputTokens: 61_204,
-      peerWakes: 2,
-      lastActivity: { ts: now - 8 * SEC, text: 'Edit · src/api/checkout/sessions.ts' },
-      worktree: {
-        ...memberWorktree(team, suffix, 'api'),
-        baseCommit: base,
-        ready: true,
-        headSha: sha('9b0e5d13'),
-        ahead: 4,
-        filesChanged: 9,
-        dirty: true,
-      },
-    },
-  });
-  const web = member({
-    name: 'web',
-    index: 2,
-    role: 'Frontend: card form and checkout page',
-    state: 'idle',
-    provider: 'codex',
-    worker: 'codex',
-    model: '',
-    mailbox: 'turns-only',
-    team,
-    suffix,
-    baseCommit: base,
-    turns: 11,
-    tokens: { in: 742_118, out: 48_906 },
-    costUsd: null,
-    tasks: ['b4'],
-    rssMb: 640,
-    extra: {
-      lastTurn: {
-        id: 't35',
-        n: 11,
-        outcome: 'ok',
-        endedAt: now - 6 * MIN,
-        head: 'Card form validates number, expiry and CVC as you type; b4 is in review.',
-      },
-      lastActivity: { ts: now - 6 * MIN, text: 'Moved b4 "Card form with inline validation" to review' },
-      worktree: {
-        ...memberWorktree(team, suffix, 'web'),
-        baseCommit: base,
-        ready: true,
-        headSha: sha('51ac7e02'),
-        ahead: 6,
-        filesChanged: 7,
-        dirty: false,
-      },
-    },
-  });
-  const tests = member({
-    name: 'tests',
-    index: 3,
-    role: 'QA: end-to-end tests',
-    state: 'idle',
-    provider: 'cursor',
-    worker: 'cursor',
-    model: '',
-    mailbox: 'turns-only',
-    team,
-    suffix,
-    baseCommit: base,
-    turns: 8,
-    tokens: { in: 401_655, out: 26_740 },
-    costUsd: null,
-    tasks: ['b5'],
-    rssMb: 490,
-    extra: {
-      lastTurn: {
-        id: 't36',
-        n: 8,
-        outcome: 'ok',
-        endedAt: now - 3 * MIN,
-        head: 'Happy-path test passes against staging; the declined-card test waits for the lead.',
-      },
-      lastActivity: { ts: now - 3 * MIN, text: 'Waiting for the lead: should an expired card return 402 or 422?' },
-      worktree: {
-        ...memberWorktree(team, suffix, 'tests'),
-        baseCommit: base,
-        ready: true,
-        headSha: sha('e47b2c90'),
-        ahead: 2,
-        filesChanged: 3,
-        dirty: false,
-      },
-    },
-  });
-
-  const board: CcoBoardTask[] = [
-    task(
-      {
-        id: 'b1',
-        title: 'Checkout sessions table and migration',
-        state: 'done',
-        assignee: 'api',
-        paths: ['db/migrations/0042_checkout_sessions.sql', 'src/api/checkout/schema.ts'],
-        commits: ['3f9a1c2'],
-      },
-      createdAt + 4 * MIN,
-      now - 2 * HOUR - 20 * MIN,
-    ),
-    task(
-      {
-        id: 'b2',
-        title: 'API contract for POST /v1/checkout/sessions',
-        state: 'done',
-        assignee: 'api',
-        paths: ['docs/api/checkout.md'],
-        commits: ['a81d0f4'],
-      },
-      createdAt + 5 * MIN,
-      now - 1 * HOUR - 45 * MIN,
-    ),
-    task(
-      {
-        id: 'b3',
-        title: 'POST /v1/checkout/sessions endpoint',
-        state: 'claimed',
-        assignee: 'api',
-        paths: ['src/api/checkout/sessions.ts', 'src/api/checkout/sessions.test.ts', 'src/api/checkout/errors.ts'],
-        note: 'Idempotency-Key required; 409 when a key is reused with a different body.',
-      },
-      createdAt + 6 * MIN,
-      now - 14 * MIN,
-    ),
-    task(
-      {
-        id: 'b4',
-        title: 'Card form with inline validation',
-        state: 'review',
-        assignee: 'web',
-        paths: ['web/src/checkout/CardForm.tsx', 'web/src/checkout/validate.ts'],
-        commits: ['c03e9b7', '77d1a2e'],
-      },
-      createdAt + 6 * MIN,
-      now - 6 * MIN,
-    ),
-    task(
-      {
-        id: 'b5',
-        title: 'E2E: happy path and declined card',
-        state: 'blocked',
-        assignee: 'tests',
-        paths: ['e2e/checkout.spec.ts'],
-        note: 'Waiting for the lead: 402 or 422 for an expired card?',
-      },
-      createdAt + 7 * MIN,
-      now - 3 * MIN,
-    ),
-    task({ id: 'b6', title: 'Saved cards: list and remove', state: 'open', paths: ['web/src/checkout/SavedCards.tsx'] }, now - 40 * MIN, now - 40 * MIN),
-    task({ id: 'b7', title: 'Retire the three-step checkout flow', state: 'open', paths: [] }, now - 38 * MIN, now - 38 * MIN),
-  ];
-
-  const messages: CcoTeamMessage[] = [
-    message(
-      42,
-      now - 3 * MIN,
-      'tests',
-      'lead',
-      'question',
-      'Should an expired card return 402 or 422 from POST /v1/checkout/sessions/{id}/confirm? The contract only says 4xx, and the declined-card test needs the exact code.',
-      'b5',
-    ),
-    message(
-      41,
-      now - 6 * MIN,
-      'engine',
-      'lead',
-      'notice',
-      'web moved b4 "Card form with inline validation" to review: CardForm validates number, expiry and CVC as you type and shows the decline reason under the field. 18 unit tests pass.',
-      'b4',
-    ),
-    message(
-      40,
-      now - 9 * MIN,
-      'api',
-      'lead',
-      'report',
-      'Validation for POST /v1/checkout/sessions is in: amount, currency and an Idempotency-Key header are required. 12 tests pass. Starting on the confirm step.',
-      'b3',
-    ),
-    message(
-      39,
-      now - 14 * MIN,
-      'lead',
-      'api',
-      'assignment',
-      'Take b3 next: the endpoint as specified in docs/api/checkout.md. Return 409 when an Idempotency-Key is reused with a different body.',
-      'b3',
-    ),
-    message(
-      38,
-      now - 22 * MIN,
-      'lead',
-      'tests',
-      'assignment',
-      'Write b5 against the staging API: the happy path, a declined card and an expired card.',
-      'b5',
-    ),
-    message(
-      37,
-      now - 31 * MIN,
-      'lead',
-      'web',
-      'answer',
-      'Use the existing Field component and show errors under the input, not as a toast.',
-      'b4',
-    ),
-    message(
-      36,
-      now - 33 * MIN,
-      'web',
-      'lead',
-      'question',
-      'Card errors: inline under each field, or one summary above the Pay button?',
-      'b4',
-    ),
-  ];
-
-  const activity: CcoMemberActivity[] = [
-    {
-      member: 'api',
-      lines: [
-        { ts: now - 125 * SEC, turn: 't37', k: 'turn', text: 'Turn 14: the confirm step' },
-        { ts: now - 118 * SEC, turn: 't37', k: 'tool', text: 'Read · docs/api/checkout.md' },
-        { ts: now - 112 * SEC, turn: 't37', k: 'tool', text: 'Read · src/api/checkout/sessions.ts' },
-        {
-          ts: now - 100 * SEC,
-          turn: 't37',
-          k: 'text',
-          text: 'The confirm step needs the card state from the processor; adding a typed error for expired cards.',
-        },
-        { ts: now - 80 * SEC, turn: 't37', k: 'tool', text: 'Grep · ProcessorError in src/api' },
-        { ts: now - 61 * SEC, turn: 't37', k: 'tool', text: 'Edit · src/api/checkout/errors.ts' },
-        { ts: now - 40 * SEC, turn: 't37', k: 'tool', text: 'Bash · npm test -- checkout/sessions' },
-        { ts: now - 27 * SEC, turn: 't37', k: 'text', text: '12 passed, 1 failed: confirm returns 500 for an expired card instead of a 4xx.' },
-        { ts: now - 8 * SEC, turn: 't37', k: 'tool', text: 'Edit · src/api/checkout/sessions.ts' },
-      ],
-    },
-    {
-      member: 'web',
-      lines: [
-        { ts: now - 9 * MIN, turn: 't35', k: 'tool', text: 'Edit · web/src/checkout/validate.ts' },
-        { ts: now - 8 * MIN, turn: 't35', k: 'tool', text: 'Bash · npm run test -- CardForm' },
-        { ts: now - 7 * MIN, turn: 't35', k: 'text', text: '18 tests pass.' },
-        { ts: now - 6 * MIN, turn: 't35', k: 'done', text: 'Turn 11 finished' },
-      ],
-    },
-    {
-      member: 'tests',
-      lines: [
-        { ts: now - 5 * MIN, turn: 't36', k: 'tool', text: 'Bash · npm run e2e -- checkout.spec.ts' },
-        { ts: now - 4 * MIN, turn: 't36', k: 'text', text: 'Happy path passes. The expired-card case needs the expected status code.' },
-        { ts: now - 3 * MIN, turn: 't36', k: 'done', text: 'Turn 8 finished' },
-      ],
-    },
-  ];
-
-  const state: CcoTeamState = {
-    v: 1,
-    id: MAIN_TEAM_ID,
-    name: team,
-    title: 'One-page checkout with saved cards',
-    status: 'active',
-    goal: 'Replace the three-step checkout with one page: a sessions endpoint, a card form that validates as you type, and end-to-end tests for the happy path and declined cards.',
-    workspace: CHECKOUT,
-    repoRoot: CHECKOUT,
-    leadRel: '',
-    baseCommit: base,
-    createdAt,
-    seq: 42,
-    owner: { hostPid: 51834, hostStartedAt: createdAt - 3 * MIN, session: { pid: 51790, startedAt: createdAt - 8 * MIN } },
-    lead: { unread: 1, readSeq: 41, waiter: false, lastCallAt: now - 4 * MIN, wakesToday: 6 },
-    user: { unread: 0, readSeq: 42 },
-    members: [api, web, tests],
-    board,
-    budgets: { turnsToday: 33, turnsPerDay: 300, running: 1, maxRunning: 3, pingPongTripped: false },
-    totals: { turns: 33, inputTokens: 2_164_317, outputTokens: 141_956, costUsd: 18.42 },
-    warnings: [],
-  };
-
-  return view(state, {
-    rev: 42,
-    source: 'host',
-    live: true,
-    hostKey: 's51790',
-    messages,
-    activity,
-    composedAt: now - 2 * SEC,
-    believed: true,
-  });
-}
-
-/** billing-export: ended an hour ago; its lead ran in a linked worktree of the checkout repository. */
-function billingExport(now: number): CcoTeamView {
-  const team = 'billing-export';
-  const suffix = 'b3e8';
-  const base = sha('7a3f0c5e');
-  const createdAt = now - 5 * HOUR;
-  const endedAt = now - 52 * MIN;
-  const exporter = member({
-    name: 'exporter',
-    index: 1,
-    role: 'Nightly CSV export of settled payments',
-    state: 'ended',
-    provider: 'claude',
-    worker: 'work',
-    model: 'sonnet',
-    mailbox: 'tools',
-    team,
-    suffix,
-    baseCommit: base,
-    turns: 9,
-    tokens: { in: 512_330, out: 31_118 },
-    costUsd: 3.61,
-    tasks: [],
-    rssMb: 0,
-    extra: {
-      lastTurn: { id: 't18', n: 9, outcome: 'ok', endedAt: endedAt - 4 * MIN, head: 'Export job and its retry policy are merged.' },
-    },
-  });
-  const reviewer = member({
-    name: 'reviewer',
-    index: 2,
-    role: 'Code review and test gaps',
-    state: 'ended',
-    provider: 'codex',
-    worker: 'codex',
-    model: '',
-    mailbox: 'turns-only',
-    team,
-    suffix,
-    baseCommit: base,
-    turns: 5,
-    tokens: { in: 220_904, out: 12_402 },
-    costUsd: null,
-    tasks: [],
-    rssMb: 0,
-  });
-  const state: CcoTeamState = {
-    v: 1,
-    id: ENDED_TEAM_ID,
-    name: team,
-    title: 'Nightly billing export',
-    status: 'ended',
-    goal: 'A nightly CSV export of settled payments for finance, with retries and an alert when a run fails.',
-    workspace: CHECKOUT_BILLING,
-    repoRoot: CHECKOUT_BILLING,
-    leadRel: '',
-    baseCommit: base,
-    createdAt,
-    endedAt,
-    seq: 27,
-    owner: null,
-    lead: { unread: 0, readSeq: 27, waiter: false, lastCallAt: endedAt - 2 * MIN, wakesToday: 3 },
-    user: { unread: 0, readSeq: 27 },
-    members: [exporter, reviewer],
-    board: [
-      task({ id: 'b1', title: 'Export job for settled payments', state: 'done', assignee: 'exporter', paths: ['jobs/billing_export.ts'] }, createdAt, endedAt - 30 * MIN),
-      task({ id: 'b2', title: 'Retry policy and failure alert', state: 'done', assignee: 'exporter', paths: ['jobs/retry.ts'] }, createdAt, endedAt - 10 * MIN),
-      task({ id: 'b3', title: 'Review the export job', state: 'done', assignee: 'reviewer', paths: [] }, createdAt, endedAt - 6 * MIN),
+    requestId: requestId(uid, n),
+    kind: 'toolApproval',
+    receivedAt,
+    onBehalfOf: null,
+    answerIn: null,
+    title: 'Run the test suite',
+    tool: { tool: 'Bash', verb: 'run', object: 'npm test -- --watch=false' },
+    detailLines: [{ key: 'card.detailText', params: { text: 'npm test -- --watch=false' } }],
+    // As the producer sends them (convo/approvals.rs, A25.4): `alwaysLabel` is
+    // the rule content (a prefix rule), never a sentence; button 2 carries it.
+    options: [
+      { key: '1', label: 'Allow once', role: 'allowOnce' },
+      { key: '2', label: 'npm test:*', role: 'allowSession' },
+      { key: '3', label: 'Deny', role: 'deny' },
     ],
-    budgets: { turnsToday: 14, turnsPerDay: 300, running: 0, maxRunning: 2, pingPongTripped: false },
-    totals: { turns: 14, inputTokens: 733_234, outputTokens: 43_520, costUsd: 3.61 },
-    warnings: [],
+    alwaysLabel: 'npm test:*',
+    defaultToNo: false,
+    degraded: false,
+    promptRev: null,
+    confidence: 'high',
+    multiSelect: false,
+    questions: [],
+    ...extra,
   };
-  return view(state, {
-    rev: 27,
-    source: 'disk',
-    live: false,
-    messages: [
-      message(27, endedAt - 2 * MIN, 'lead', 'exporter', 'text', 'Merged. Thanks, ending the team now.'),
-      message(26, endedAt - 4 * MIN, 'exporter', 'lead', 'report', 'Export job and retry policy are merged; the failure alert posts to #billing-ops.', 'b2'),
-    ],
-    activity: [],
-    composedAt: endedAt,
-    believed: false,
-  });
 }
 
-/** search-ui: a live team in the web repository (shown by the grouping scene). */
-function searchUi(now: number): CcoTeamView {
-  const team = 'search-ui';
-  const suffix = 's5r9';
-  const base = sha('2d6b8f41');
-  const createdAt = now - 1 * HOUR - 25 * MIN;
-  const indexer = member({
-    name: 'indexer',
-    index: 1,
-    role: 'Search index and query API',
-    state: 'running',
-    provider: 'claude',
-    worker: 'work',
-    model: 'sonnet',
-    mailbox: 'tools',
-    team,
-    suffix,
-    baseCommit: base,
-    turns: 6,
-    tokens: { in: 388_420, out: 22_118 },
-    costUsd: 2.14,
-    tasks: ['b2'],
-    rssMb: 1_120,
-    extra: {
-      turn: { id: 't9', n: 6, startedAt: now - 4 * MIN, pid: 53102, lastOutputAt: now - 15 * SEC },
-      lastActivity: { ts: now - 15 * SEC, text: 'Bash · npm test -- search/query' },
-    },
-  });
-  const ui = member({
-    name: 'ui',
-    index: 2,
-    role: 'Search results page',
-    state: 'idle',
-    provider: 'codex',
-    worker: 'codex',
-    model: '',
-    mailbox: 'turns-only',
-    team,
-    suffix,
-    baseCommit: base,
-    turns: 4,
-    tokens: { in: 160_210, out: 9_804 },
-    costUsd: null,
-    tasks: [],
-    rssMb: 380,
-    extra: { lastActivity: { ts: now - 11 * MIN, text: 'Results list renders highlights; waiting for the query API.' } },
-  });
-  const state: CcoTeamState = {
-    v: 1,
-    id: SEARCH_TEAM_ID,
-    name: team,
-    title: 'Instant search on the storefront',
-    status: 'active',
-    goal: 'Search as you type on the storefront, with highlighted matches.',
-    workspace: WEB,
-    repoRoot: WEB,
-    leadRel: '',
-    baseCommit: base,
-    createdAt,
-    seq: 18,
-    owner: { hostPid: 53001, hostStartedAt: createdAt - 2 * MIN, session: { pid: 52990, startedAt: createdAt - 6 * MIN } },
-    lead: { unread: 0, readSeq: 18, waiter: true, lastCallAt: now - 12 * MIN, wakesToday: 2 },
-    user: { unread: 0, readSeq: 18 },
-    members: [indexer, ui],
-    board: [
-      task({ id: 'b1', title: 'Results page with highlights', state: 'review', assignee: 'ui', paths: ['src/search/Results.tsx'] }, createdAt, now - 11 * MIN),
-      task({ id: 'b2', title: 'Query API with prefix matching', state: 'claimed', assignee: 'indexer', paths: ['src/search/query.ts'] }, createdAt, now - 4 * MIN),
-    ],
-    budgets: { turnsToday: 10, turnsPerDay: 300, running: 1, maxRunning: 2, pingPongTripped: false },
-    totals: { turns: 10, inputTokens: 548_630, outputTokens: 31_922, costUsd: 2.14 },
-    warnings: [],
-  };
-  return view(state, {
-    rev: 18,
-    source: 'host',
-    live: true,
-    hostKey: 's52990',
-    messages: [message(18, now - 11 * MIN, 'ui', 'lead', 'report', 'Results list renders highlighted matches; b1 is ready for review.', 'b1')],
-    activity: [],
-    composedAt: now - 3 * SEC,
-    believed: true,
-  });
-}
-
-/** docs-refresh: suspended yesterday (its lead session was closed). */
-function docsRefresh(now: number): CcoTeamView {
-  const team = 'docs-refresh';
-  const suffix = 'd4q1';
-  const base = sha('5c90e2aa');
-  const createdAt = now - 1 * DAY - 2 * HOUR;
-  const writer = member({
-    name: 'writer',
-    index: 1,
-    role: 'API reference pages',
-    state: 'idle',
-    provider: 'claude',
-    worker: 'work',
-    model: 'sonnet',
-    mailbox: 'tools',
-    team,
-    suffix,
-    baseCommit: base,
-    turns: 7,
-    tokens: { in: 301_772, out: 40_210 },
-    costUsd: 1.92,
-    tasks: ['b2'],
-    rssMb: 0,
-  });
-  const state: CcoTeamState = {
-    v: 1,
-    id: DOCS_TEAM_ID,
-    name: team,
-    title: 'Refresh the API reference',
-    status: 'suspended',
-    goal: 'Regenerate the API reference from the OpenAPI spec and fix the broken examples.',
-    workspace: DOCS,
-    repoRoot: DOCS,
-    leadRel: '',
-    baseCommit: base,
-    createdAt,
-    seq: 15,
-    owner: null,
-    lead: { unread: 0, readSeq: 15, waiter: false, lastCallAt: now - 20 * HOUR, wakesToday: 0 },
-    user: { unread: 0, readSeq: 15 },
-    members: [writer],
-    board: [
-      task({ id: 'b1', title: 'Generate reference pages from the spec', state: 'done', assignee: 'writer', paths: [] }, createdAt, now - 21 * HOUR),
-      task({ id: 'b2', title: 'Fix the broken request examples', state: 'claimed', assignee: 'writer', paths: ['reference/examples'] }, createdAt, now - 20 * HOUR),
-    ],
-    budgets: { turnsToday: 0, turnsPerDay: 300, running: 0, maxRunning: 2, pingPongTripped: false },
-    totals: { turns: 7, inputTokens: 301_772, outputTokens: 40_210, costUsd: 1.92 },
-    warnings: [],
-  };
-  return view(state, {
-    rev: 15,
-    source: 'disk',
-    live: false,
-    messages: [],
-    activity: [],
-    composedAt: now - 20 * HOUR,
-    believed: false,
-  });
-}
-
-function summaryOf(v: CcoTeamView): CcoTeamSummary {
-  const members = v.state.members;
+/** A question card (AskUserQuestion, §6.1.4). */
+export function questionCard(uid: SessionUid, n: number, receivedAt: number): PendingInteraction {
   return {
-    teamId: v.teamId,
-    name: v.state.name,
-    title: v.state.title,
-    status: v.state.status,
-    source: v.source,
-    live: v.live,
-    members: members.length,
-    running: members.filter((m) => m.state === 'running').length,
-    blocked: members.filter((m) => m.state === 'blocked').length,
-    userUnread: v.state.user.unread,
-    leadUnread: v.state.lead.unread,
-    createdAt: v.state.createdAt,
-    ...(v.state.endedAt === undefined ? {} : { endedAt: v.state.endedAt }),
-    ...(v.hostKey === undefined ? {} : { hostKey: v.hostKey }),
-    owner: v.state.owner,
-    rev: v.rev,
-    believed: v.believed,
+    requestId: requestId(uid, n),
+    kind: 'question',
+    receivedAt,
+    onBehalfOf: null,
+    answerIn: null,
+    title: 'Which database should the cache use?',
+    tool: { tool: 'AskUserQuestion', verb: 'ask', object: null },
+    detailLines: [],
+    options: [],
+    alwaysLabel: null,
+    defaultToNo: false,
+    degraded: false,
+    promptRev: null,
+    confidence: 'high',
+    multiSelect: false,
+    questions: [{ text: 'Which database should the cache use?', options: ['Redis', 'Postgres', 'In-memory only'], multiSelect: false }],
   };
 }
 
 // ---------------------------------------------------------------------------
-// worker accounts
+// Attention queue (§8.1 Q1–Q8, computed the way the core does)
 // ---------------------------------------------------------------------------
 
-const NO_STATS = { tasks: 0, inputTokens: 0, outputTokens: 0, costUsd: 0 };
-
-function usage(
-  kind: CcoUsageWindow['kind'],
-  label: string,
-  percent: number,
-  severity: CcoUsageWindow['severity'],
-  resetsAt: number,
-): CcoUsageWindow {
-  return { kind, label, percent, severity, resetsAt };
-}
-
-function account(a: Pick<CcoWorkerAccount, 'key' | 'name' | 'provider' | 'providerLabel' | 'login'> & Partial<CcoWorkerAccount>): CcoWorkerAccount {
-  return {
-    isMain: false,
-    isWorker: true,
-    preferred: false,
-    defaultModel: null,
-    sessionWorkers: a.provider === 'claude',
-    permissionMode: null,
-    modelRanAs: null,
-    loginDetail: null,
-    loginCheck: null,
-    plan: null,
-    planLabel: null,
-    sameAccountAs: [],
-    windows: [],
-    windowsStaleSince: null,
-    lastGoodWindowsAt: null,
-    usageFetchedAt: null,
-    overage: null,
-    cooldownUntil: null,
-    session5h: NO_STATS,
-    week: NO_STATS,
-    allTime: { ...NO_STATS, errors: 0 },
-    lastError: null,
-    running: 0,
-    ...a,
-  };
-}
-
-function workersAnswer(now: number): CcoWorkersAnswer {
-  const generatedAt = now - 20 * SEC;
-  // `main` and `work` are two config folders signed in to one claude.ai login:
-  // one plan, so the engine reports the same windows for both and names each other.
-  const sharedWindows = [
-    usage('session', 'Session (5hr)', 23, 'normal', now + 2 * HOUR + 41 * MIN),
-    usage('weekly_all', 'Weekly (all models)', 61, 'normal', now + 3 * DAY + 5 * HOUR),
-  ];
-  const accounts: CcoWorkerAccount[] = [
-    account({
-      key: 'acct-main',
-      name: 'main',
-      isMain: true,
-      isWorker: false,
-      provider: 'claude',
-      providerLabel: 'Claude Code',
-      login: 'ok',
-      loginCheck: { state: 'ok', since: now - 2 * DAY, checkedAt: now - 4 * MIN, reason: '' },
-      plan: 'max',
-      planLabel: 'Claude Max',
-      sameAccountAs: ['work'],
-      windows: sharedWindows,
-      lastGoodWindowsAt: generatedAt,
-      usageFetchedAt: generatedAt,
-      session5h: { tasks: 0, inputTokens: 0, outputTokens: 0, costUsd: 0 },
-      week: { tasks: 0, inputTokens: 0, outputTokens: 0, costUsd: 0 },
-    }),
-    account({
-      key: 'acct-work',
-      name: 'work',
-      preferred: true,
-      defaultModel: 'opus',
-      provider: 'claude',
-      providerLabel: 'Claude Code',
-      permissionMode: 'acceptEdits',
-      login: 'ok',
-      loginCheck: { state: 'ok', since: now - 2 * DAY, checkedAt: now - 4 * MIN, reason: '' },
-      plan: 'max',
-      planLabel: 'Claude Max',
-      sameAccountAs: ['main'],
-      windows: sharedWindows,
-      lastGoodWindowsAt: generatedAt,
-      usageFetchedAt: generatedAt,
-      session5h: { tasks: 6, inputTokens: 1_284_300, outputTokens: 81_420, costUsd: 11.9 },
-      week: { tasks: 46, inputTokens: 8_412_006, outputTokens: 512_340, costUsd: 74.31 },
-      allTime: { tasks: 318, inputTokens: 52_904_118, outputTokens: 3_180_442, costUsd: 466.2, errors: 4 },
-      running: 1,
-    }),
-    account({
-      key: 'acct-ci-bot',
-      name: 'ci-bot',
-      defaultModel: 'sonnet',
-      provider: 'claude',
-      providerLabel: 'Claude Code',
-      login: 'expired',
-      loginDetail: RUN_LOGIN_FAILURE_DETAIL,
-      loginCheck: { state: 'loggedOut', since: now - 1 * HOUR, checkedAt: now - 55 * MIN, reason: 'not logged in' },
-      plan: 'pro',
-      planLabel: 'Claude Pro',
-      lastGoodWindowsAt: now - 26 * HOUR,
-      week: { tasks: 12, inputTokens: 1_906_220, outputTokens: 102_884, costUsd: 9.4 },
-      allTime: { tasks: 87, inputTokens: 12_410_552, outputTokens: 690_118, costUsd: 61.8, errors: 2 },
-    }),
-    account({
-      key: 'acct-codex',
-      name: 'codex',
-      provider: 'codex',
-      providerLabel: 'Codex',
-      permissionMode: 'workspace-write',
-      login: 'ok',
-      windows: [
-        usage('session', '5h limit', 94, 'critical', now + 38 * MIN),
-        usage('weekly_all', 'Weekly limit', 58, 'normal', now + 4 * DAY + 2 * HOUR),
-      ],
-      lastGoodWindowsAt: generatedAt,
-      usageFetchedAt: generatedAt,
-      session5h: { tasks: 5, inputTokens: 742_118, outputTokens: 48_906, costUsd: 0 },
-      week: { tasks: 23, inputTokens: 3_120_904, outputTokens: 204_118, costUsd: 0 },
-      allTime: { tasks: 141, inputTokens: 19_884_301, outputTokens: 1_204_552, costUsd: 0, errors: 1 },
-    }),
-    account({
-      key: 'acct-cursor',
-      name: 'cursor',
-      provider: 'cursor',
-      providerLabel: 'Cursor',
-      login: 'no-plan-limits',
-      week: { tasks: 9, inputTokens: 1_002_440, outputTokens: 61_207, costUsd: 0 },
-      allTime: { tasks: 40, inputTokens: 4_410_090, outputTokens: 262_004, costUsd: 0, errors: 0 },
-    }),
-  ];
-  return {
-    available: true,
-    supported: true,
-    snapshot: {
-      schema: CCO_WORKERS_SCHEMA,
-      generatedAt,
-      accounts,
-      unsupportedAccounts: [],
-      servedFromCache: false,
-      guards: { overageWorkerDispatch: 'block', frontierWorkerDispatch: 'allow' },
-    },
-    hostKey: 's51790',
-    receivedAt: generatedAt,
-    stale: false,
-    fromCache: false,
-    unavailable: null,
-    nextPollAt: generatedAt + 60 * SEC,
-    minPollMs: 60 * SEC,
-    generation: 1,
-  };
-}
-
-// ---------------------------------------------------------------------------
-// health
-// ---------------------------------------------------------------------------
-
-interface AgentInput {
-  pid: number;
-  agent: HealthAgent['agent'];
-  name: string;
-  argv: string;
-  rssGb: number;
-  cpuPct: number;
-  ageSecs: number;
-  teamId: string;
-  team: string;
-  member: string;
-  worktree: string;
-  orphan: boolean;
-}
-
-function healthAgent(now: number, a: AgentInput): HealthAgent {
-  const rssBytes = Math.round(a.rssGb * GIB);
-  const startTime = now - a.ageSecs * SEC;
-  return {
-    pid: a.pid,
-    pgid: a.pid,
-    ppid: a.orphan ? 1 : a.pid - 40,
-    agent: a.agent,
-    rssBytes,
-    cpuPct: a.cpuPct,
-    elapsedSecs: a.ageSecs,
-    startTime,
-    attribution: { kind: 'teamMember', teamId: a.teamId, team: a.team, member: a.member, worktree: a.worktree },
-    orphan: a.orphan,
-    pids: [a.pid],
-    row: {
-      pid: a.pid,
-      ppid: a.orphan ? 1 : a.pid - 40,
-      pgid: a.pid,
-      name: a.name,
-      argvDisplay: a.argv,
-      rssBytes,
-      cpuPct: a.cpuPct,
-      elapsedSecs: a.ageSecs,
-      startTime,
-      cwd: a.worktree,
-      userOwned: true,
-      group: a.orphan ? 'externalResidue' : 'agentUnmanaged',
-      tags: a.orphan ? ['orphan', 'inWorktree', 'external'] : ['inWorktree', 'external'],
-      owner: null,
-      spawnId: null,
-    },
-  };
-}
-
-function healthSnapshot(now: number, options: WorldOptions): HealthSnapshot {
-  const wt = (team: string, suffix: string, name: string) => memberWorktree(team, suffix, name).path;
-  const live: AgentInput[] = [
-    { pid: 52210, agent: 'claude', name: 'claude', argv: 'claude -p --output-format stream-json', rssGb: 1.38, cpuPct: 31.5, ageSecs: 125, teamId: MAIN_TEAM_ID, team: 'checkout-revamp', member: 'api', worktree: wt('checkout-revamp', 'c7k2', 'api'), orphan: false },
-    { pid: 52480, agent: 'codex', name: 'codex', argv: 'codex exec --json', rssGb: 0.62, cpuPct: 0.4, ageSecs: 40 * 60, teamId: MAIN_TEAM_ID, team: 'checkout-revamp', member: 'web', worktree: wt('checkout-revamp', 'c7k2', 'web'), orphan: false },
-    { pid: 52633, agent: 'cursor-agent', name: 'cursor-agent', argv: 'cursor-agent --print --output-format stream-json', rssGb: 0.48, cpuPct: 0.2, ageSecs: 35 * 60, teamId: MAIN_TEAM_ID, team: 'checkout-revamp', member: 'tests', worktree: wt('checkout-revamp', 'c7k2', 'tests'), orphan: false },
-  ];
-  if (options.allTeams) {
-    live.push(
-      { pid: 53102, agent: 'claude', name: 'claude', argv: 'claude -p --output-format stream-json', rssGb: 1.09, cpuPct: 24.8, ageSecs: 240, teamId: SEARCH_TEAM_ID, team: 'search-ui', member: 'indexer', worktree: wt('search-ui', 's5r9', 'indexer'), orphan: false },
-      { pid: 53240, agent: 'codex', name: 'codex', argv: 'codex exec --json', rssGb: 0.37, cpuPct: 0.1, ageSecs: 20 * 60, teamId: SEARCH_TEAM_ID, team: 'search-ui', member: 'ui', worktree: wt('search-ui', 's5r9', 'ui'), orphan: false },
-    );
+/** The band of a session's state (§3.5.7), or null when it does not queue. */
+export function bandOf(session: Session): number | null {
+  switch (session.activity.state.kind) {
+    case 'needsApproval':
+      return 1;
+    case 'needsAnswer':
+      return 2;
+    case 'error':
+    case 'crashed':
+      return 3;
+    case 'noProgress':
+      return 4;
+    case 'newReply':
+      return 5;
+    default:
+      return null;
   }
-  // The ended team's two agents outlived it (its host is gone): the one actionable alert.
-  const leftovers: AgentInput[] = options.leftover
-    ? [
-        { pid: 49310, agent: 'claude', name: 'claude', argv: 'claude -p --output-format stream-json', rssGb: 0.86, cpuPct: 0.0, ageSecs: 2 * 3600 + 14 * 60, teamId: ENDED_TEAM_ID, team: 'billing-export', member: 'exporter', worktree: wt('billing-export', 'b3e8', 'exporter'), orphan: true },
-        { pid: 49388, agent: 'codex', name: 'codex', argv: 'codex exec --json', rssGb: 0.41, cpuPct: 0.0, ageSecs: 2 * 3600 + 9 * 60, teamId: ENDED_TEAM_ID, team: 'billing-export', member: 'reviewer', worktree: wt('billing-export', 'b3e8', 'reviewer'), orphan: true },
-      ]
-    : [];
+}
 
-  const agents = [...live, ...leftovers].map((a) => healthAgent(now, a));
-  const byPid = new Map(agents.map((a) => [a.pid, a]));
-  const rssOf = (pid: number) => byPid.get(pid)?.rssBytes ?? 0;
-
-  const teamBlock = (teamId: string, team: string, status: string, hostAlive: boolean, members: [string, 'running' | 'idle' | 'leftover', number][]): HealthTeam => ({
-    teamId,
-    team,
-    status,
-    hostAlive,
-    rssBytes: members.reduce((sum, [, , pid]) => sum + rssOf(pid), 0),
-    members: members.map(([name, state, pid]) => ({ name, state, rssBytes: rssOf(pid), pids: [pid] })),
-  });
-
-  const teams: HealthTeam[] = [
-    teamBlock(MAIN_TEAM_ID, 'checkout-revamp', 'active', true, [
-      ['api', 'running', 52210],
-      ['web', 'idle', 52480],
-      ['tests', 'idle', 52633],
-    ]),
-  ];
-  const hosts: HealthHost[] = [
-    { pid: 51834, rssBytes: Math.round(0.09 * GIB), elapsedSecs: 3 * 3600 + 15 * 60, sessionPid: 51790, leadAlive: true, teamIds: [MAIN_TEAM_ID] },
-  ];
-  if (options.allTeams) {
-    teams.push(
-      teamBlock(SEARCH_TEAM_ID, 'search-ui', 'active', true, [
-        ['indexer', 'running', 53102],
-        ['ui', 'idle', 53240],
-      ]),
-    );
-    hosts.push({ pid: 53001, rssBytes: Math.round(0.08 * GIB), elapsedSecs: 87 * 60, sessionPid: 52990, leadAlive: true, teamIds: [SEARCH_TEAM_ID] });
+function reasonOf(session: Session): AttentionReason {
+  const s = session.activity.state;
+  switch (s.kind) {
+    case 'needsApproval':
+      return { kind: 'needsApproval' };
+    case 'needsAnswer':
+      return { kind: 'needsAnswer' };
+    case 'error':
+      return { kind: 'error', sub: s.sub };
+    case 'crashed':
+      return { kind: 'crashed' };
+    case 'noProgress':
+      return { kind: 'noProgress', forSecs: s.forSecs };
+    default:
+      return { kind: 'newReply' };
   }
+}
 
-  const alerts: HealthAlert[] = [];
-  if (leftovers.length > 0) {
-    const pids = leftovers.map((a) => a.pid);
-    teams.push(
-      teamBlock(ENDED_TEAM_ID, 'billing-export', 'ended', false, leftovers.map((a) => [a.member, 'leftover', a.pid] as [string, 'leftover', number])),
-    );
-    alerts.push({
-      id: `orphans:${ENDED_TEAM_ID}`,
-      kind: 'orphans',
-      severity: 'action',
-      titleKey: 'health.alert.orphans.title',
-      bodyKey: 'health.alert.orphans.body',
-      params: {
-        count: pids.length,
-        team: 'billing-export',
-        members: leftovers.map((a) => a.member),
-        rssBytes: pids.reduce((sum, pid) => sum + rssOf(pid), 0),
-      },
-      actions: [{ kind: 'cleanUp', pids }, { kind: 'details' }],
-      since: now - 12 * MIN,
-      raisedAt: now - 12 * MIN,
-      teamId: ENDED_TEAM_ID,
-      dismissed: false,
-      dismissedUntil: null,
+function primaryOf(session: Session): PrimaryAction {
+  const s = session.activity.state;
+  const watching = session.control.kind === 'watching';
+  switch (s.kind) {
+    case 'needsApproval':
+    case 'needsAnswer':
+      return watching ? 'goToOwner' : 'answer';
+    case 'error':
+      if (s.sub.kind === 'usageLimit') return 'continueOnOtherAccount';
+      if (s.sub.kind === 'signInNeeded') return 'signIn';
+      return 'retry';
+    case 'crashed':
+      return 'continueInGilde';
+    case 'noProgress':
+      return 'open';
+    default:
+      return 'review';
+  }
+}
+
+/**
+ * Q1–Q8: one item per session in its band, ranked; one aggregated leftover
+ * item. `later` maps uids to their Later deadline (Q5, memory only).
+ */
+export function computeQueue(
+  sessions: readonly Session[],
+  leftovers: readonly ProcessRecord[],
+  rev: number,
+  now: number,
+  later: ReadonlyMap<SessionUid, number> = new Map(),
+): AttentionQueue {
+  const items: AttentionItem[] = [];
+  for (const s of sessions) {
+    if (s.mergedInto !== null) continue;
+    const band = bandOf(s);
+    if (band === null) continue;
+    const card = s.pending[0] ?? null;
+    const until = later.get(s.uid) ?? null;
+    items.push({
+      key: `q_${s.uid}`,
+      band,
+      subject: { kind: 'session', uid: s.uid, onBehalfOf: card?.onBehalfOf ?? null, answerIn: card?.answerIn ?? null },
+      reason: reasonOf(s),
+      since: s.activity.since,
+      waitedMs: Math.max(0, now - s.activity.since),
+      episode: s.activity.episode,
+      laterUntil: until !== null && until > now ? until : null,
+      primary: primaryOf(s),
+      watched: s.control.kind === 'watching',
+    });
+  }
+  const held = leftovers.filter((p) => p.leftover !== null && p.leftover.heldScans >= 2);
+  if (held.length > 0) {
+    items.push({
+      key: 'q_leftovers',
+      band: 6,
+      subject: { kind: 'leftovers', count: held.length, bytes: held.reduce((n, p) => n + p.rssBytes, 0) },
+      reason: { kind: 'leftovers' },
+      since: Math.min(...held.map((p) => p.leftover?.since ?? now)),
+      waitedMs: 0,
+      episode: 'e_leftovers' as AttentionItem['episode'],
+      laterUntil: null,
+      primary: 'cleanUp',
+      watched: false,
+    });
+  }
+  items.sort((a, b) => {
+    if (a.band !== b.band) return a.band - b.band;
+    const newestFirst = a.band === 3 || a.band === 5;
+    if (a.since !== b.since) return newestFirst ? b.since - a.since : a.since - b.since;
+    return a.key < b.key ? -1 : a.key > b.key ? 1 : 0;
+  });
+  const visible = items.filter((i) => i.laterUntil === null);
+  return {
+    rev,
+    items,
+    needYou: visible.filter((i) => i.band <= 2).length,
+    also: visible.filter((i) => i.band >= 3).length,
+    pausedUntil: null,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Teams
+// ---------------------------------------------------------------------------
+
+function teamCaps(kind: TeamKind): TeamCapabilities {
+  if (kind === 'orchestrator') {
+    return {
+      observeMembers: 'yes', observeMemberState: 'yes', observeMessages: 'no', observeInFlight: 'no', observeTasks: 'yes',
+      observeApprovals: 'no', observeQuestions: 'no', actSend: [], actBroadcast: [], actSpawn: [], actStop: [],
+      actAnswerApproval: 'none', actTaskWrite: 'none', correlationReport: 'perRequest', durabilityTaskBoard: 'durable',
+      durabilityMessageLog: 'transient', fidelityNote: null,
+    };
+  }
+  const hosted = kind === 'native';
+  return {
+    observeMembers: 'yes', observeMemberState: hosted ? 'yes' : 'partial', observeMessages: 'yes', observeInFlight: 'partial',
+    observeTasks: kind === 'nativeInferred' ? 'inferred' : 'yes', observeApprovals: 'yes', observeQuestions: 'partial',
+    actSend: hosted ? ['viaLead', 'viaMemberPane'] : ['viaLead'], actBroadcast: ['viaLead'], actSpawn: ['viaLead'],
+    actStop: hosted ? ['viaLead', 'closePane'] : ['viaLead'], actAnswerApproval: 'inLeadUi', actTaskWrite: 'none',
+    correlationReport: 'perTurn', durabilityTaskBoard: kind === 'nativeInferred' ? 'derived' : 'durable',
+    durabilityMessageLog: 'durable', fidelityNote: null,
+  };
+}
+
+interface TeamBuild {
+  team: Team;
+  members: Member[];
+  sessions: Session[];
+  tasks: Task[];
+  messages: TeamMessage[];
+  bodies: [MessageKey, string][];
+  titles: [TaskKey, string][];
+}
+
+/** A team of `size` agents (lead + members), session numbers from `firstN`. */
+function buildTeam(kind: TeamKind, size: number, firstN: number, now: number, pending: boolean, withPanes = false): TeamBuild {
+  const name = TEAM_NAMES[kind];
+  const key = teamKey(name);
+  const project = kind === 'orchestrator' ? 'docs-site' : kind === 'native' ? 'checkout-service' : 'infra-live';
+  const members: Member[] = [];
+  const sessions: Session[] = [];
+  const leadName = kind === 'orchestrator' ? 'coordinator' : 'team-lead';
+  const leadKey = memberKey(name, leadName);
+  const leadUid = sessionUid(firstN);
+
+  for (let i = 0; i < size; i++) {
+    const lead = i === 0;
+    const base = MEMBER_NAMES[(i - 1 + MEMBER_NAMES.length) % MEMBER_NAMES.length] ?? 'agent';
+    const mname = lead ? leadName : i > MEMBER_NAMES.length ? `${base}-${i}` : base;
+    const mkey = lead ? leadKey : memberKey(name, mname);
+    const n = firstN + i;
+    const uid = sessionUid(n);
+    const colour = lead ? null : (COLOURS[(i - 1) % COLOURS.length] ?? null);
+    let control: Control;
+    if (kind === 'native') control = { kind: 'inGilde', mode: 'terminal', pty: ptyId(uid), hostedTeam: true, transport: 'pty' };
+    else if (kind === 'nativeInferred') control = { kind: 'watching', origin: 'itermTeam', owner: { appPid: 4100, appName: 'iTerm2', kind: 'terminal', bundleId: 'com.googlecode.iterm2' } };
+    else control = { kind: 'watching', origin: 'orchestrator', owner: null };
+    const vendor: Vendor = kind === 'orchestrator' ? (i % 2 === 0 ? 'claude' : 'codex') : 'claude';
+    let state: ActivityState = i % 3 === 2 ? { kind: 'ready' } : { kind: 'working' };
+    let cards: PendingInteraction[] = [];
+    if (pending && kind === 'native' && i === 2) {
+      // Q3: the lead prompts for its teammate; the member's item answers in the lead.
+      state = { kind: 'needsApproval' };
+      cards = [approvalCard(uid, 1, now - 3 * MIN, {
+        onBehalfOf: mkey,
+        answerIn: leadUid,
+        title: 'Edit src/auth/token.ts',
+        tool: { tool: 'Edit', verb: 'edit', object: 'src/auth/token.ts' },
+        detailLines: [{ key: 'card.detailText', params: { text: 'src/auth/token.ts' } }],
+        // Keys 1 and 3 — numbers never shift when button 2 is hidden (§3.4.5).
+        options: [
+          { key: '1', label: 'Allow once', role: 'allowOnce' },
+          { key: '3', label: 'Deny', role: 'deny' },
+        ],
+        alwaysLabel: null,
+      })];
+    }
+    if (kind === 'nativeInferred' && i === 3) state = { kind: 'noProgress', forSecs: 720 };
+    sessions.push(buildSession({
+      n, vendor, project, control, state,
+      title: lead ? `Coordinate ${name}` : (TITLES[(n + 3) % TITLES.length] ?? 'Task'),
+      sinceMin: 2 + (i % 5), startedMin: 40 + i, pending: cards,
+      team: { teamKey: key, memberKey: mkey, role: lead ? 'lead' : 'member', colour },
+    }, now));
+    members.push({
+      key: mkey,
+      teamKey: key,
+      sessionUid: uid,
+      name: mname,
+      agentId: `${mname}@${name}`,
+      role: lead ? 'lead' : 'member',
+      colour,
+      vendor,
+      backend: kind === 'native' ? (lead ? 'inProcess' : 'pane') : kind === 'orchestrator' ? 'orchestrator' : 'inProcess',
+      joinedAt: now - (40 - i) * MIN,
+      presence: { kind: 'present' },
+      pane: kind === 'native' && !lead ? paneId(i) : null,
+      planModeRequired: false,
+      currentTask: null,
     });
   }
 
-  const agentsRssBytes = agents.reduce((sum, a) => sum + a.rssBytes, 0) + hosts.reduce((sum, h) => sum + h.rssBytes, 0);
-  return {
-    at: now,
-    overall: alerts.length > 0 ? 'action' : 'ok',
-    agents,
-    hosts,
-    orphans: agents.filter((a) => a.orphan).map((a) => a.pid),
-    teams,
-    memory: { pressure: 'normal', agentsRssBytes, physicalRamBytes: RAM },
-    alerts,
-    teamsKnown: true,
+  const tasks: Task[] = [];
+  const titles: [TaskKey, string][] = [];
+  const inferred = kind === 'nativeInferred';
+  const nTasks = Math.max(2, size + 1);
+  for (let t = 0; t < nTasks; t++) {
+    const tkey = taskKey(name, t + 1);
+    const owner = members[1 + (t % Math.max(1, members.length - 1))]?.key ?? null;
+    const status = t < 2 ? 'done' : t % 3 === 0 ? 'open' : 'inProgress';
+    tasks.push({
+      key: tkey,
+      teamKey: key,
+      nativeId: inferred ? null : String(t + 1),
+      title: inferred ? null : (TASK_TITLES[t % TASK_TITLES.length] ?? null),
+      inferredK: inferred ? t + 1 : null,
+      status,
+      station: status === 'done' ? (inferred ? 'reported' : 'done') : status === 'open' ? (inferred ? 'assigned' : 'toDo') : 'inProgress',
+      owner,
+      blockedBy: [],
+      blocks: [],
+      createdAt: now - (60 - t) * MIN,
+      startedAt: status === 'open' ? null : now - (50 - t) * MIN,
+      completedAt: status === 'done' ? now - (20 - t) * MIN : null,
+      firstSeenInProgressAt: null,
+      source: inferred ? 'inferred' : kind === 'orchestrator' ? 'orchestrator' : 'file',
+      inferred,
+    });
+    if (!inferred) titles.push([tkey, TASK_TITLES[t % TASK_TITLES.length] ?? 'Task']);
+  }
+  // A declared dependency (never on inferred items, §3.4.8): task 4 waits for task 3.
+  const t3 = tasks[2];
+  const t4 = tasks[3];
+  if (!inferred && t3 && t4) {
+    t3.blocks = [t4.key];
+    t4.blockedBy = [t3.key];
+    if (t4.status === 'open') t4.station = 'blocked';
+  }
+  for (const m of members) {
+    const own = tasks.find((t) => t.owner === m.key && t.status === 'inProgress');
+    if (own) m.currentTask = own.key;
+  }
+
+  const messages: TeamMessage[] = [];
+  const bodies: [MessageKey, string][] = [];
+  if (kind !== 'orchestrator') {
+    const kinds: MessageKind[] = ['taskAssignment', 'plain', 'idleNotification', 'plain'];
+    members.slice(1).forEach((m, i) => {
+      const k = kinds[i % kinds.length] ?? 'plain';
+      const toLead = i % 2 === 1;
+      const mk = messageKey(name, i + 1);
+      messages.push({
+        key: mk,
+        teamKey: key,
+        from: toLead ? { kind: 'member', member: m.key } : { kind: 'member', member: leadKey },
+        to: toLead ? { kind: 'member', member: leadKey } : { kind: 'member', member: m.key },
+        at: now - (30 - i) * MIN,
+        kind: k,
+        status: 'delivered',
+        inReplyTo: null,
+        derived: kind === 'nativeInferred',
+        idleReason: k === 'idleNotification' ? 'available' : null,
+        hasSummary: k === 'plain',
+      });
+      bodies.push([mk, toLead ? 'Done with the first pass. Two tests still fail on the refresh path.' : 'Please take the next task on the board when you are free.']);
+    });
+  }
+
+  const done = tasks.filter((t) => t.status === 'done').length;
+  const team: Team = {
+    key,
+    source: kind === 'orchestrator' ? 'orchestrator' : 'claudeNative',
+    name,
+    rawId: `session-${key.slice(2, 10)}`,
+    projectId: projectId(project),
+    lead: leadKey,
+    leadBinding: kind === 'native' ? 'hosted' : kind === 'orchestrator' ? 'none' : 'exact',
+    hosted: kind === 'native',
+    externalHost: kind === 'nativeInferred' ? 'iTerm2' : null,
+    caps: teamCaps(kind),
+    glyphState: sessions.some((s) => s.activity.state.kind === 'needsApproval') ? { kind: 'needsApproval' } : { kind: 'working' },
+    progress: { done, total: tasks.length, inferred, approx: inferred, inFlight: kind === 'native' ? null : 1, bottlenecks: [] },
+    startedAt: now - 45 * MIN,
+    endedAt: null,
+    paneHosting: kind === 'native' ? 'hosted' : kind === 'nativeInferred' ? 'outsideGilde' : 'notApplicable',
+    rosterStale: false,
+    paneTiles: kind === 'native' && withPanes ? paneTileFixtures(size, firstN, now) : [],
   };
+  return { team, members, sessions, tasks, messages, bodies, titles };
 }
 
-// ---------------------------------------------------------------------------
-// the world
-// ---------------------------------------------------------------------------
-
-function projects(now: number): Project[] {
-  const project = (id: string, path: string, name: string, slug: string, color: string, addedAt: number): Project => ({
-    id,
-    path,
-    canonicalPath: path,
-    repoSlug: slug,
-    name,
-    color,
-    defaultBaseRef: 'main',
-    addedAt,
-    lastOpenedAt: now - 10 * MIN,
-    pathExists: true,
-  });
-  // The colours are the backend's project palette (src-tauri/src/commands/project.rs), as data.
+/** A30.1 pane tiles of a hosted team: starting, spawn failed, a running unknown pane (its terminal read-only). */
+function paneTileFixtures(size: number, firstN: number, now: number): PaneTile[] {
   return [
-    project('0192f3a0-6c1e-7a54-9c2d-5f1e8b7a4c01', CHECKOUT, 'checkout', 'acme/checkout', '#59b39b', now - 9 * DAY), // lint-ui: allow
-    project('0192f3a0-6c1e-7a54-9c2d-5f1e8b7a4c02', CHECKOUT_BILLING, 'checkout-billing', 'acme/checkout', '#7c8cf8', now - 6 * DAY), // lint-ui: allow
-    project('0192f3a0-6c1e-7a54-9c2d-5f1e8b7a4c03', WEB, 'web', 'acme/web', '#d08b5b', now - 4 * DAY), // lint-ui: allow
+    { paneId: paneId(size + 1), state: { kind: 'starting', since: now, spawnFailed: false }, title: null, pty: null, createdAt: now - 4_000 },
+    { paneId: paneId(size + 2), state: { kind: 'starting', since: now - 6_000, spawnFailed: true }, title: null, pty: null, createdAt: now - 3_000 },
+    {
+      paneId: paneId(size + 3),
+      state: { kind: 'unknown', running: true, exitCode: null },
+      title: 'dev-server',
+      pty: ptyId(sessionUid(firstN + 90)),
+      createdAt: now - 2_000,
+    },
   ];
 }
 
-function identities(views: readonly CcoTeamView[], folders: readonly Project[]): RepoIdentity[] {
-  const repoOfWorkspace: Record<string, Repo> = {
-    [CHECKOUT]: REPOS.checkout,
-    [CHECKOUT_BILLING]: REPOS.checkout,
-    [WEB]: REPOS.web,
-    [DOCS]: REPOS.docs,
-  };
-  const out = new Map<string, RepoIdentity>();
-  const add = (path: string, repo: Repo, worktree: { branch: string } | null) => out.set(path, identity(path, repo, worktree));
-  add(CHECKOUT, REPOS.checkout, null);
-  add(CHECKOUT_BILLING, REPOS.checkout, { branch: 'billing-export' });
-  add(WEB, REPOS.web, null);
-  add(DOCS, REPOS.docs, null);
-  for (const v of views) {
-    const repo = repoOfWorkspace[v.state.workspace];
-    if (!repo) continue;
-    for (const m of v.state.members) add(m.worktree.path, repo, { branch: m.worktree.branch });
+// ---------------------------------------------------------------------------
+// Solo sessions, accounts, leftovers, content
+// ---------------------------------------------------------------------------
+
+type SoloShape = { vendor: Vendor; control: 'conversation' | 'terminal' | 'turns' | 'vsCode' | 'terminalApp'; state: ActivityState };
+
+/**
+ * The first solo sessions of every world, each with a job: 0 waits for an
+ * approval (the Session scene), 1 is the session that asks at 5 s, 2 is owned
+ * by another app (Watching), 3 is a Terminal-mode PTY, 4 waits for an answer,
+ * 5 gets a reply at 27 s, 6 ends at 30 s; the rest spread the other states.
+ * Larger worlds cycle the table.
+ */
+const SOLO: readonly SoloShape[] = [
+  { vendor: 'claude', control: 'conversation', state: { kind: 'needsApproval' } },
+  { vendor: 'claude', control: 'conversation', state: { kind: 'working' } },
+  { vendor: 'claude', control: 'vsCode', state: { kind: 'working' } },
+  { vendor: 'cursor', control: 'terminal', state: { kind: 'working' } },
+  { vendor: 'claude', control: 'conversation', state: { kind: 'needsAnswer' } },
+  { vendor: 'codex', control: 'turns', state: { kind: 'ready' } },
+  { vendor: 'claude', control: 'conversation', state: { kind: 'working' } },
+  { vendor: 'claude', control: 'conversation', state: { kind: 'error', sub: { kind: 'usageLimit', accountId: null, resetsAt: null } } },
+  { vendor: 'agy', control: 'turns', state: { kind: 'newReply' } },
+  { vendor: 'claude', control: 'terminal', state: { kind: 'ready' } },
+  { vendor: 'codex', control: 'turns', state: { kind: 'starting' } },
+  { vendor: 'claude', control: 'terminalApp', state: { kind: 'noProgress', forSecs: 900 } },
+];
+
+/** Solo session `i` of a world. */
+function soloSpec(i: number, n: number, pending: boolean): SessionSpec {
+  const shape = SOLO[i % SOLO.length] ?? { vendor: 'claude', control: 'conversation', state: { kind: 'ready' } };
+  const vendor = shape.vendor;
+  const project = PROJECT_NAMES[i % 3] ?? 'checkout-service';
+  const title = TITLES[i % TITLES.length] ?? 'Task';
+  const uid = sessionUid(n);
+  let control: Control;
+  switch (shape.control) {
+    case 'turns':
+      control = { kind: 'inGilde', mode: 'turnBased', pty: null, hostedTeam: false, transport: 'turns' };
+      break;
+    case 'terminal':
+      control = { kind: 'inGilde', mode: 'terminal', pty: ptyId(uid), hostedTeam: false, transport: 'pty' };
+      break;
+    case 'vsCode':
+      control = { kind: 'watching', origin: 'vsCode', owner: { appPid: 3200, appName: 'Visual Studio Code', kind: 'vsCode', bundleId: 'com.microsoft.VSCode' } };
+      break;
+    case 'terminalApp':
+      control = { kind: 'watching', origin: 'terminal', owner: { appPid: 3300, appName: 'Terminal', kind: 'terminal', bundleId: 'com.apple.Terminal' } };
+      break;
+    default:
+      control = { kind: 'inGilde', mode: 'conversation', pty: null, hostedTeam: false, transport: 'l1' };
   }
-  for (const folder of folders) {
-    const repo = repoOfWorkspace[folder.path];
-    if (repo && !out.has(folder.path)) add(folder.path, repo, null);
+  let state: ActivityState = shape.state;
+  let cards: PendingInteraction[] = [];
+  if (state.kind === 'needsApproval') {
+    if (pending) cards = [approvalCard(uid, 1, 0)];
+    else state = { kind: 'working' };
+  } else if (state.kind === 'needsAnswer') {
+    if (pending) cards = [questionCard(uid, 1, 0)];
+    else state = { kind: 'ready' };
+  } else if (state.kind === 'error' && state.sub.kind === 'usageLimit') {
+    state = { kind: 'error', sub: { kind: 'usageLimit', accountId: accountId(vendor, 'default'), resetsAt: null } };
   }
-  return [...out.values()];
+  return { n, vendor, title, project, worktree: i === 0, control, state, sinceMin: 1 + (i % 9), startedMin: 15 + i * 3, pending: cards };
 }
 
-/** Build the whole world for one scene, every time relative to `now`. */
-export function buildWorld(now: number, options: WorldOptions): ShowcaseWorld {
-  const views = options.allTeams
-    ? [checkoutRevamp(now), billingExport(now), searchUi(now), docsRefresh(now)]
-    : [checkoutRevamp(now), billingExport(now)];
-  const folders = projects(now);
-  const list: CcoTeamListResult = {
-    available: true,
-    supported: true,
-    dataRoot: '~/code/.team-data',
-    teamMode: 'on',
-    hosts: views
-      .filter((v) => v.live && v.state.owner !== null)
-      .map((v) => ({
-        key: v.hostKey ?? `s${v.state.owner?.session.pid ?? 0}`,
-        sessionPid: v.state.owner?.session.pid ?? 0,
-        sessionStartedAt: v.state.owner?.session.startedAt ?? now,
-        hostPid: v.state.owner?.hostPid ?? 0,
-        workspace: v.state.workspace,
-        pane: false,
-        state: 'connected',
-        teamId: v.teamId,
-      })),
-    teams: views.map(summaryOf),
-    generation: 1,
+function accounts(now: number, quotaHot = false): Account[] {
+  const quota = (five: number, week: number) => ({
+    windows: [
+      { kind: 'fiveHour' as const, label: null, usedPct: five, resetsAt: now + 95 * MIN },
+      { kind: 'week' as const, label: null, usedPct: week, resetsAt: now + 3 * 24 * 60 * MIN },
+    ],
+    fetchedAt: now - 2 * MIN,
+    stale: false,
+    unavailable: null,
+  });
+  return [
+    { id: accountId('claude', 'default'), vendor: 'claude', configDir: abs(`${HOME_DIR}/.claude`), label: 'Default', isDefault: true, source: 'ambient', usableForNew: true, signIn: 'signedIn', quota: quota(quotaHot ? 95 : 42, 63), liveSessions: 0 },
+    { id: accountId('claude', 'work'), vendor: 'claude', configDir: abs(`${HOME_DIR}/.claude-work`), label: 'Work', isDefault: false, source: 'user', usableForNew: true, signIn: 'signedIn', quota: quota(8, 21), liveSessions: 0 },
+    { id: accountId('codex', 'default'), vendor: 'codex', configDir: abs(`${HOME_DIR}/.codex`), label: 'Default', isDefault: true, source: 'ambient', usableForNew: true, signIn: 'signedIn', quota: null, liveSessions: 0 },
+    { id: accountId('cursor', 'default'), vendor: 'cursor', configDir: null, label: 'Default', isDefault: true, source: 'ambient', usableForNew: true, signIn: 'signedIn', quota: null, liveSessions: 0 },
+    { id: accountId('agy', 'default'), vendor: 'agy', configDir: null, label: 'Default', isDefault: true, source: 'ambient', usableForNew: true, signIn: 'unknown', quota: null, liveSessions: 0 },
+  ];
+}
+
+function leftoverRecords(count: number, now: number): ProcessRecord[] {
+  const start = Math.floor(now / 1000) - 7200;
+  return Array.from({ length: count }, (_, i): ProcessRecord => ({
+    key: processKey(52000 + i, start - i),
+    pid: 52000 + i,
+    startSec: start - i,
+    vendor: 'claude',
+    role: i === 0 ? 'teammate' : 'toolServer',
+    sessionUid: null,
+    gildeOwned: false,
+    rssBytes: (i === 0 ? 300 : 100) * 1024 * 1024,
+    leftover: { reason: i === 0 ? 'teammateOfGoneLead' : 'toolServerOfEndedSession', since: now - 25 * MIN, heldScans: 2 },
+  }));
+}
+
+function sources(): SourceStatus[] {
+  const row = (vendor: Vendor, source: SourceStatus['source']): SourceStatus => ({
+    vendor, source, state: { kind: 'ok' }, lastReconcileAt: null, hiddenStale: 0, indexed: 0, truncated: false,
+  });
+  return [
+    row('claude', 'registry'), row('claude', 'processes'), row('claude', 'teams'), row('claude', 'transcripts'),
+    row('codex', 'rollouts'), row('cursor', 'chats'), row('agy', 'summaries'),
+  ];
+}
+
+export const COMPAT: ClaudeCompat = {
+  version: '2.1.307',
+  conversation: 'verified',
+  paneHosting: 'verified',
+  source: 'shipped',
+  staticCanary: { kind: 'pass' },
+  handshakeOk: true,
+  belowMinimum: false,
+  note: null,
+  features: { handshakeShape: true, allowSession: true, denyAndStop: true, nowPriority: true, interruptReceipt: true, sessionStateEvents: true },
+};
+
+/** The conversation of one session: a short, plausible exchange in blocks (§3.7.1). */
+export function conversationOf(session: Session, now: number): Block[] {
+  const uid = session.uid;
+  let seq = 0;
+  const block = (kind: BlockKind, minAgo: number): Block => {
+    seq += 1;
+    return { id: blockId(uid, seq), seq, at: now - minAgo * MIN, kind, truncated: false };
   };
-  return {
-    now,
-    views,
-    list,
-    identities: identities(views, folders),
-    projects: folders,
-    workers: workersAnswer(now),
-    health: healthSnapshot(now, options),
+  const tool = (n: number) => `toolu_${uid.slice(-8)}_${n}`;
+  const out: Block[] = [
+    block({ kind: 'userText', text: session.title ?? 'Continue', origin: 'human', delivery: 'delivered', clientMsgId: null }, 12),
+    block({ kind: 'thinking', seconds: 4, text: null }, 11),
+    block({ kind: 'toolCall', toolUseId: tool(1), summary: { tool: 'Read', verb: 'read', object: 'src/client/retry.ts' }, inputPreview: 'src/client/retry.ts', status: 'ok', resultPreview: '128 lines', fileChange: null, incomplete: false }, 11),
+    block({
+      kind: 'assistantText',
+      markdown:
+        'The retry loop never resets its backoff after a success, so one slow response keeps every later call waiting.\n\n' +
+        'Plan:\n\n1. Reset the attempt counter on success.\n2. Cap the delay at 8 seconds.\n3. Add a test for the reset.\n\n' +
+        '```ts\nif (ok) attempt = 0;\n```',
+      streaming: false,
+      agent: null,
+    }, 10),
+    block({ kind: 'toolCall', toolUseId: tool(2), summary: { tool: 'Edit', verb: 'edit', object: 'src/client/retry.ts' }, inputPreview: 'src/client/retry.ts', status: 'ok', resultPreview: null, fileChange: { pathRel: 'src/client/retry.ts', added: 6, removed: 2, change: 'modified' }, incomplete: false }, 8),
+  ];
+  const card = session.pending[0];
+  if (card) {
+    out.push(block({ kind: 'interaction', requestId: card.requestId, interactionKind: card.kind, outcome: 'pending' }, 3));
+  } else if (session.activity.state.kind === 'working') {
+    out.push(block({ kind: 'toolCall', toolUseId: tool(3), summary: { tool: 'Bash', verb: 'run', object: 'npm test -- retry' }, inputPreview: 'npm test -- retry', status: 'running', resultPreview: null, fileChange: null, incomplete: false }, 1));
+  } else {
+    out.push(block({ kind: 'assistantText', markdown: 'Done. The backoff now resets after a success and the new test passes.', streaming: false, agent: null }, 2));
+  }
+  return out;
+}
+
+/**
+ * A History row's conversation, as the core's history fallback of
+ * `convo_subscribe` delivers it for a session World does not hold (A29.2).
+ */
+export function historyConversationOf(row: HistoryRow, now: number): Block[] {
+  const at = row.startedAt ?? now;
+  const block = (seq: number, kind: BlockKind, offsetMin: number): Block => ({ id: blockId(row.uid, seq), seq, at: at + offsetMin * MIN, kind, truncated: false });
+  return [
+    block(1, { kind: 'userText', text: row.title ?? 'Continue', origin: 'human', delivery: 'delivered', clientMsgId: null }, 0),
+    block(2, { kind: 'assistantText', markdown: 'I looked at the failing path first and kept the change small.', streaming: false, agent: null }, 1),
+    block(3, { kind: 'assistantText', markdown: 'Done. The change is merged and the tests pass.', streaming: false, agent: null }, 38),
+  ];
+}
+
+function historyRows(count: number, now: number): HistoryRow[] {
+  const vendors: readonly Vendor[] = ['claude', 'codex', 'claude', 'cursor', 'agy'];
+  return Array.from({ length: count }, (_, i): HistoryRow => {
+    const vendor = vendors[i % vendors.length] ?? 'claude';
+    const titleOnly = vendor === 'cursor' || vendor === 'agy';
+    const startedAt = now - (i + 1) * 3 * 60 * MIN;
+    return {
+      uid: sessionUid(5000 + i),
+      vendor,
+      projectId: projectId(PROJECT_NAMES[i % PROJECT_NAMES.length] ?? 'checkout-service'),
+      accountId: accountId(vendor, 'default'),
+      origin: i % 3 === 0 ? 'terminal' : i % 3 === 1 ? 'vsCode' : 'headless',
+      startedAt,
+      endedAt: startedAt + 40 * MIN,
+      running: false,
+      titleOnly,
+      label: titleOnly ? 'vendorDate' : 'title',
+      title: titleOnly ? null : (TITLES[(i + 5) % TITLES.length] ?? null),
+      continueOptions: titleOnly ? [] : ['resume', 'fork'],
+      continuedIn: null,
+    };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// The world
+// ---------------------------------------------------------------------------
+
+/** Agents per team: half of all agents shared among the teams, 2–12 each. */
+export function teamSizes(agents: number, teams: readonly TeamKind[]): number[] {
+  if (agents < 3 || teams.length === 0) return [];
+  const each = Math.max(2, Math.min(12, Math.round((agents * 0.5) / teams.length)));
+  const sizes: number[] = [];
+  let left = agents;
+  for (let i = 0; i < teams.length && left >= 2; i++) {
+    const size = Math.min(each, left);
+    sizes.push(size);
+    left -= size;
+  }
+  return sizes;
+}
+
+/** Live sessions per project; a team counts once [ux-ia §2.5 Counts]. */
+export function liveCounts(sessions: readonly Session[]): Map<string, number> {
+  const live = new Map<string, number>();
+  const counted = new Set<string>();
+  for (const s of sessions) {
+    if (s.control.kind === 'notRunning' || s.mergedInto !== null) continue;
+    const project = PROJECT_NAMES.find((p) => projectId(p) === s.projectId);
+    if (!project) continue;
+    if (s.team) {
+      const key = `${project}\0${s.team.teamKey}`;
+      if (counted.has(key)) continue;
+      counted.add(key);
+    }
+    live.set(project, (live.get(project) ?? 0) + 1);
+  }
+  return live;
+}
+
+export function buildWorld(options: WorldOptions, now: number): ShowcaseWorld {
+  const sessions: Session[] = [];
+  const teams: Team[] = [];
+  const members: Member[] = [];
+  const tasks: Task[] = [];
+  const messages: TeamMessage[] = [];
+  const bodies = new Map<MessageKey, string>();
+  const titles = new Map<TaskKey, string>();
+
+  const sizes = teamSizes(options.agents, options.teams);
+  sizes.forEach((size, i) => {
+    const kind = options.teams[i] ?? 'native';
+    const t = buildTeam(kind, size, 100 * (i + 1), now, options.pending, options.paneTiles === true);
+    teams.push(t.team);
+    members.push(...t.members);
+    sessions.push(...t.sessions);
+    tasks.push(...t.tasks);
+    messages.push(...t.messages);
+    for (const [k, v] of t.bodies) bodies.set(k, v);
+    for (const [k, v] of t.titles) titles.set(k, v);
+  });
+  const solo = Math.max(0, options.agents - sizes.reduce((a, b) => a + b, 0));
+  for (let i = 0; i < solo; i++) {
+    const s = buildSession(soloSpec(i, i + 1, options.pending), now);
+    // Cards arrived a few minutes ago, the earlier sessions first (Q4 ranks by wait).
+    s.pending = s.pending.map((c, k) => ({ ...c, receivedAt: now - (4 + i + k) * MIN }));
+    sessions.push(s);
+  }
+
+  const accountList = accounts(now, options.quotaHot ?? false);
+  for (const a of accountList) a.liveSessions = sessions.filter((s) => s.accountId === a.id && s.control.kind !== 'notRunning').length;
+  const leftovers = leftoverRecords(options.leftovers, now);
+  const rev = 1;
+  const snapshot: StoreSnapshot = {
+    rev,
+    projects: buildProjects(now, liveCounts(sessions)),
+    locations: buildLocations(),
+    sessions,
+    teams,
+    members,
+    tasks,
+    messages,
+    queue: computeQueue(sessions, leftovers, rev, now),
+    accounts: accountList,
+    leftovers,
+    compat: [COMPAT],
+    notices: [],
+    boot: {
+      spawnGateOpen: true,
+      firstDiscoveryDone: true,
+      agentsDetected: true,
+      memoryOnly: null,
+      agents: [
+        { vendor: 'claude', installed: true, version: '2.1.307' },
+        { vendor: 'codex', installed: true, version: '0.47.0' },
+        { vendor: 'cursor', installed: false, version: null },
+        { vendor: 'agy', installed: false, version: null },
+      ],
+      agentsScannedAt: now - 2 * MIN,
+      recovery: options.recovery ? { stopping: 3, undoToken: RECOVERY_UNDO, until: now + RECOVERY_WINDOW_MS } : null,
+    },
+    sources: sources(),
+    integrations: { orchestrator: teams.some((t) => t.source === 'orchestrator') ? 'present' : 'absent' },
   };
+
+  const convo = new Map<SessionUid, readonly Block[]>();
+  for (const s of sessions) convo.set(s.uid, conversationOf(s, now));
+
+  const liveSolo = sessions.filter((s) => !s.team && s.control.kind !== 'notRunning');
+  const roles: WorldRoles = {
+    approval: sessions.find((s) => s.pending.some((c) => c.kind === 'toolApproval') && s.control.kind === 'inGilde' && s.control.mode === 'conversation')?.uid ?? null,
+    watching: sessions.find((s) => s.control.kind === 'watching' && !s.team)?.uid ?? null,
+    terminal: sessions.find((s) => s.control.kind === 'inGilde' && s.control.mode === 'terminal' && !s.team)?.uid ?? null,
+    split: liveSolo.slice(0, 6).map((s) => s.uid),
+    team: teams[0]?.key ?? null,
+  };
+
+  return { now, snapshot, convo, messageBodies: bodies, taskTitles: titles, history: historyRows(options.history, now), roles };
+}
+
+/** Members of a team in roster order (lead first). */
+export function teamMembers(world: ShowcaseWorld, key: TeamKey): Member[] {
+  return world.snapshot.members.filter((m) => m.teamKey === key);
+}
+
+/** The member key of a session, if it is a team member. */
+export function memberOf(world: ShowcaseWorld, uid: SessionUid): MemberKey | null {
+  return world.snapshot.members.find((m) => m.sessionUid === uid)?.key ?? null;
 }

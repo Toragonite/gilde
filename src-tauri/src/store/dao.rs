@@ -96,6 +96,27 @@ pub mod app_instance {
     ///
     /// Read through `sysctlbyname(3)`; no subprocess, so this needs no
     /// `SpawnGuard`.
+    /// B5 (contract §2.4): when the window became visible. T-boot-2 asserts no
+    /// `proc_registry` row of this instance was planned before it.
+    pub fn set_window_visible(conn: &Connection, id: &str, at: i64) -> Result<bool> {
+        let n = conn.execute(
+            "UPDATE app_instance SET window_visible_at = ?2 WHERE id = ?1 AND window_visible_at IS NULL",
+            params![id, at],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn window_visible_at(conn: &Connection, id: &str) -> Result<Option<i64>> {
+        let v: Option<Option<i64>> = conn
+            .query_row(
+                "SELECT window_visible_at FROM app_instance WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(v.flatten())
+    }
+
     #[cfg(target_os = "macos")]
     pub fn current_boot_id() -> Result<String> {
         // 36 chars + NUL; a generous buffer costs nothing.
@@ -371,6 +392,55 @@ pub mod proc {
             params![pid],
         )
     }
+
+    /// The owning session of a row (contract §3.8), written in the same
+    /// transaction as the planned row.
+    pub fn set_parent_uid(conn: &Connection, spawn_id: &str, uid: &str) -> Result<bool> {
+        let n = conn.execute(
+            "UPDATE proc_registry SET parent_uid = ?2 WHERE spawn_id = ?1",
+            params![spawn_id, uid],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn parent_uid(conn: &Connection, spawn_id: &str) -> Result<Option<String>> {
+        let v: Option<Option<String>> = conn
+            .query_row(
+                "SELECT parent_uid FROM proc_registry WHERE spawn_id = ?1",
+                [spawn_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(v.flatten())
+    }
+
+    /// `spawn_id → parent_uid` for every row of `app_instance` that has one.
+    pub fn parents_of_instance(
+        conn: &Connection,
+        app_instance: &str,
+    ) -> Result<Vec<(String, String)>> {
+        let mut stmt = conn.prepare(
+            "SELECT spawn_id, parent_uid FROM proc_registry
+              WHERE app_instance = ?1 AND parent_uid IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([app_instance], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Every row whose `planned_at` is earlier than `at` for `app_instance`
+    /// (T-boot-2's assertion, also logged by the boot timer).
+    pub fn planned_before(conn: &Connection, app_instance: &str, at: i64) -> Result<Vec<ProcRow>> {
+        query_rows(
+            conn,
+            "SELECT * FROM proc_registry WHERE app_instance = ?1 AND planned_at < ?2
+              ORDER BY planned_at",
+            params![app_instance, at],
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -642,11 +712,12 @@ pub mod pty_session {
 
     pub fn insert(conn: &Connection, row: &PtySessionRow) -> Result<()> {
         conn.execute(
+            // No title: the column is gone since v2 (A12.4).
             "INSERT INTO pty_session
-               (id, spawn_id, project_id, worktree_id, agent_kind, account_id, title, cwd,
+               (id, spawn_id, project_id, worktree_id, agent_kind, account_id, cwd,
                 cols, rows, argv, opened_at, closed_at, exit_code, exit_signal,
                 last_io_at, last_status, detached)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 row.id,
                 row.spawn_id,
@@ -654,7 +725,6 @@ pub mod pty_session {
                 row.worktree_id,
                 row.agent_kind,
                 row.account_id,
-                row.title,
                 row.cwd,
                 row.cols,
                 row.rows,
@@ -1267,6 +1337,176 @@ pub mod settings_kv {
 }
 
 // ---------------------------------------------------------------------------
+// quit_record / quit_record_item (contract §3.9, §10.2–§10.3)
+// ---------------------------------------------------------------------------
+
+pub mod quit_record {
+    use super::*;
+
+    /// Unresolved records expire after 7 days.
+    pub const EXPIRY_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
+    /// The record and every item in **one** transaction. Callers run it through
+    /// `Db::write_durable` (`synchronous=FULL`, §3.9 *Durability*).
+    pub fn insert(conn: &Connection, record: &QuitRecordRow, items: &[QuitItemRow]) -> Result<()> {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO quit_record (id, cause, created_at, resolved_at) VALUES (?1, ?2, ?3, ?4)",
+            params![record.id, record.cause, record.created_at, record.resolved_at],
+        )?;
+        for item in items {
+            tx.execute(
+                "INSERT OR REPLACE INTO quit_record_item
+                   (record_id, uid, control_mode, permission_mode, model, was_waiting, team_lead, survivor)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    record.id,
+                    item.uid,
+                    item.control_mode,
+                    item.permission_mode,
+                    item.model,
+                    item.was_waiting,
+                    b(item.team_lead),
+                    b(item.survivor),
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get(conn: &Connection, id: &str) -> Result<Option<QuitRecordRow>> {
+        query_opt(conn, "SELECT * FROM quit_record WHERE id = ?1", [id])
+    }
+
+    /// Unresolved, unexpired records, newest first.
+    pub fn list_open(conn: &Connection, now: i64) -> Result<Vec<QuitRecordRow>> {
+        query_rows(
+            conn,
+            "SELECT * FROM quit_record WHERE resolved_at IS NULL AND created_at >= ?1
+              ORDER BY created_at DESC",
+            [now - EXPIRY_MS],
+        )
+    }
+
+    /// Items in quit order (insertion order).
+    pub fn items(conn: &Connection, record_id: &str) -> Result<Vec<QuitItemRow>> {
+        query_rows(
+            conn,
+            "SELECT * FROM quit_record_item WHERE record_id = ?1 ORDER BY rowid",
+            [record_id],
+        )
+    }
+
+    pub fn mark_survivor(conn: &Connection, record_id: &str, uid: &str) -> Result<bool> {
+        let n = conn.execute(
+            "UPDATE quit_record_item SET survivor = 1 WHERE record_id = ?1 AND uid = ?2",
+            params![record_id, uid],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Continued or dismissed: the record is deleted (its items cascade).
+    pub fn delete(conn: &Connection, id: &str) -> Result<bool> {
+        conn.execute("DELETE FROM quit_record_item WHERE record_id = ?1", [id])?;
+        let n = conn.execute("DELETE FROM quit_record WHERE id = ?1", [id])?;
+        Ok(n > 0)
+    }
+
+    /// Remove one item (it was continued); deletes the record when it empties.
+    pub fn remove_item(conn: &Connection, record_id: &str, uid: &str) -> Result<bool> {
+        let n = conn.execute(
+            "DELETE FROM quit_record_item WHERE record_id = ?1 AND uid = ?2",
+            params![record_id, uid],
+        )?;
+        let left: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM quit_record_item WHERE record_id = ?1",
+            [record_id],
+            |r| r.get(0),
+        )?;
+        if left == 0 {
+            conn.execute("DELETE FROM quit_record WHERE id = ?1", [record_id])?;
+        }
+        Ok(n > 0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// claude_compat_observed (contract §3.9, §3.10) — the table; T21 owns the rules
+// ---------------------------------------------------------------------------
+
+pub mod compat_observed {
+    use super::*;
+
+    /// Upsert one observation keyed `(version, binary_fingerprint)` [F-22].
+    pub fn upsert(conn: &Connection, row: &CompatObservedRow) -> Result<()> {
+        conn.execute(
+            "INSERT INTO claude_compat_observed
+               (version, conversation, pane_hosting, source, binary_fingerprint, static_result,
+                handshake_ok, features_json, note, observed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT (version, binary_fingerprint) DO UPDATE SET
+               conversation = excluded.conversation, pane_hosting = excluded.pane_hosting,
+               source = excluded.source, static_result = excluded.static_result,
+               handshake_ok = excluded.handshake_ok, features_json = excluded.features_json,
+               note = excluded.note, observed_at = excluded.observed_at",
+            params![
+                row.version,
+                row.conversation,
+                row.pane_hosting,
+                row.source,
+                row.binary_fingerprint,
+                row.static_result,
+                row.handshake_ok.map(b),
+                row.features_json,
+                row.note,
+                row.observed_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list(conn: &Connection) -> Result<Vec<CompatObservedRow>> {
+        query_rows(
+            conn,
+            "SELECT * FROM claude_compat_observed ORDER BY version, binary_fingerprint",
+            [],
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UI state (`settings_kv` under `ui.*`, contract §3.9, §4.2.1 `ui_state_set`)
+// ---------------------------------------------------------------------------
+
+pub mod ui_state {
+    use super::*;
+
+    /// The `settings_kv` key prefix for UI state.
+    pub const PREFIX: &str = "ui.";
+
+    pub fn set(conn: &Connection, key: &str, value: &serde_json::Value) -> Result<()> {
+        settings_kv::set(conn, &format!("{PREFIX}{key}"), value)
+    }
+
+    /// Every `ui.*` entry, keyed without the prefix.
+    pub fn all(conn: &Connection) -> Result<Vec<(String, serde_json::Value)>> {
+        let mut stmt = conn.prepare(
+            "SELECT key, value_json FROM settings_kv WHERE key LIKE 'ui.%' ORDER BY key",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (key, json) = row?;
+            if let Ok(value) = serde_json::from_str(&json) {
+                out.push((key[PREFIX.len()..].to_string(), value));
+            }
+        }
+        Ok(out)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // retention (DESIGN §10-4, run once at boot)
 // ---------------------------------------------------------------------------
 
@@ -1288,18 +1528,20 @@ pub const EVENT_LOG_MAX_ROWS: i64 = 50_000;
 pub fn run_retention(conn: &Connection, now: i64) -> Result<RetentionReport> {
     let tx = conn.unchecked_transaction()?;
 
-    let mut run_events_deleted = tx.execute(
-        "DELETE FROM run_event WHERE at < ?1",
-        [now - RUN_EVENT_MAX_AGE_MS],
-    )? as u64;
-    run_events_deleted += tx.execute(
-        "DELETE FROM run_event
-          WHERE run_id NOT IN (
-            SELECT id FROM dispatch_run
-             ORDER BY COALESCE(finished_at, started_at, 0) DESC, id DESC
-             LIMIT ?1)",
-        [RUN_EVENT_MAX_RUNS],
-    )? as u64;
+    // `run_event` is legacy since Gilde 2 (contract §3.9): never read or
+    // written, so retention leaves it alone too.
+    let run_events_deleted = 0u64;
+
+    // Unresolved quit records expire after 7 days (contract §3.9, §10.2).
+    tx.execute(
+        "DELETE FROM quit_record_item WHERE record_id IN
+           (SELECT id FROM quit_record WHERE resolved_at IS NULL AND created_at < ?1)",
+        [now - quit_record::EXPIRY_MS],
+    )?;
+    tx.execute(
+        "DELETE FROM quit_record WHERE resolved_at IS NULL AND created_at < ?1",
+        [now - quit_record::EXPIRY_MS],
+    )?;
 
     let proc_samples_deleted = tx.execute(
         "DELETE FROM proc_sample WHERE at < ?1",

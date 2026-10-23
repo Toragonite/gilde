@@ -9,11 +9,12 @@
 #   ui/no-hardcoded-color   hex/rgb/hsl/oklch outside tokens    §1, §2-1  · §3-1
 #   ui/no-emoji             emoji as icon/bullet/status         §1, §2-3  · §3-2
 #   ui/no-marketing-copy    marketing phrases, "!" in copy      §1, §2-4  · §3-3
-#   ui/no-new-deps          deps beyond the T00-frozen set      §1        · §3-4
+#   ui/no-new-deps          deps beyond the pinned set (H4)     §1        · §3-4
 #   ui/tokens-shape         neutral 1 + accent 1 + semantic 4   §2-1      · §3-5
 #   ui/no-tailwind          Tailwind / UI kit adoption          §1        · §3-4
 #   ui/no-sample-data       lorem ipsum, demo sessions          §1        · §3-6
 #   ui/a11y-input-label     an input with no accessible name    §2-7      · §3-9
+#   ui/no-raw-html          raw HTML insertion anywhere in src  contract §9.1 (PM-03)
 #
 # Usage: scripts/lint-ui.sh [ROOT] [-q] [--fix-hints]
 #   ROOT          tree to check (default: the repository root)
@@ -24,7 +25,12 @@
 # a skipped rule must never be reported as clean).
 # Exempt a line with the marker `lint-ui: allow` (colors, marketing copy,
 # i18n emoji, and a11y input labels) — use it sparingly and only where the
-# rule cannot apply.
+# rule cannot apply. ui/no-raw-html has no exemption marker.
+#
+# Generated contract types (src/lib/gen/**, written by scripts/gen-ipc.mjs from
+# the Rust contract) are skipped by ui/no-hardcoded-color and
+# ui/no-marketing-copy: their doc comments cite issue numbers ("#105") and Rust
+# syntax, not UI. Every other rule covers them.
 
 set -uo pipefail
 
@@ -48,15 +54,22 @@ TOKENS="$SRC/styles/tokens.css"
 # no-op while the summary still claimed all 9 rules ran clean. Fail loudly (2 =
 # lint could not run, distinct from 1 = violations found) instead.
 command -v python3 >/dev/null 2>&1 || {
-  echo "lint-ui: python3 is required for ui/no-new-deps and ui/a11y-input-label" >&2
+  echo "lint-ui: python3 is required for ui/no-new-deps, ui/a11y-input-label and ui/no-raw-html" >&2
   exit 2
 }
 
-ALLOW_DEPS="react react-dom @tauri-apps/api @tauri-apps/plugin-opener
-@tauri-apps/plugin-dialog @tauri-apps/plugin-notification @xterm/xterm @xterm/addon-fit @xterm/addon-web-links
-@xterm/addon-webgl zustand @xyflow/react @dagrejs/dagre @types/react
-@types/react-dom @vitejs/plugin-react typescript vite @tauri-apps/cli esbuild
-@types/node"
+# The pinned dependency set (contract §15.1 H4, T01's package.json). Gilde 2
+# revised it deliberately [R1 §7.4, §7.5]: + micromark, micromark-extension-gfm,
+# mdast-util-from-markdown, mdast-util-gfm (the AST markdown renderer, §9.1),
+# + happy-dom, @testing-library/react, @testing-library/dom, axe-core (the DOM
+# test environment, §14.2 T-ui-*); − @xyflow/react, @dagrejs/dagre and the
+# three @tauri-apps/plugin-* packages (the WebView has no plugin permissions,
+# §9.2). Any other package is a contract request, not an edit here.
+ALLOW_DEPS="react react-dom zustand @tauri-apps/api @tauri-apps/cli
+@xterm/xterm @xterm/addon-fit @xterm/addon-web-links @xterm/addon-webgl
+micromark micromark-extension-gfm mdast-util-from-markdown mdast-util-gfm
+@types/react @types/react-dom @vitejs/plugin-react typescript vite
+happy-dom @testing-library/react @testing-library/dom axe-core"
 
 hint() { # hint <rule-id>
   case "$1" in
@@ -64,16 +77,17 @@ hint() { # hint <rule-id>
     ui/no-hardcoded-color) echo "  ui/no-hardcoded-color: replace the literal with a var(--token) from src/styles/tokens.css (§2-1)." ;;
     ui/no-emoji)           echo "  ui/no-emoji: use an inline Lucide path from components/icons.tsx, or a text badge (§2-3)." ;;
     ui/no-marketing-copy)  echo "  ui/no-marketing-copy: plain declarative Korean/English, no exclamation marks, verb-only buttons (§2-4)." ;;
-    ui/no-new-deps)        echo "  ui/no-new-deps: remove the package — only the T00-frozen dependency set is allowed (§1)." ;;
+    ui/no-new-deps)        echo "  ui/no-new-deps: remove the package — only the pinned dependency set is allowed; a new one is a contract request (H4)." ;;
     ui/tokens-shape)       echo "  ui/tokens-shape: define the missing token/theme block in src/styles/tokens.css (§2-1)." ;;
     ui/no-tailwind)        echo "  ui/no-tailwind: delete the Tailwind config/import and write plain CSS against the tokens (§1)." ;;
     ui/no-sample-data)     echo "  ui/no-sample-data: render real store data and an empty state instead of a fixture (§2-2)." ;;
     ui/a11y-input-label)   echo "  ui/a11y-input-label: give the field aria-label={t('…')}, aria-labelledby, or wrap it in the <label> that already names it (M1.5 BACKLOG 11)." ;;
+    ui/no-raw-html)        echo "  ui/no-raw-html: render through React elements (agent markdown goes through src/markdown's AST renderer); never insert an HTML string (contract §9.1)." ;;
   esac
 }
 ALL_RULES="ui/no-gradient ui/no-hardcoded-color ui/no-emoji ui/no-marketing-copy
 ui/no-new-deps ui/tokens-shape ui/no-tailwind ui/no-sample-data
-ui/a11y-input-label"
+ui/a11y-input-label ui/no-raw-html"
 
 if [ ! -d "$SRC" ]; then
   [ "$QUIET" -eq 1 ] || echo "lint-ui: no src/ yet"
@@ -91,8 +105,9 @@ my ($rule, $re, $allow, $root, $skip) = @ARGV;
 my $qr = qr/$re/;
 my @files;
 { local $/ = "\0"; while (<STDIN>) { chomp; push @files, $_ if length; } }
+my @skips = grep { length } split /\|/, $skip;
 for my $f (@files) {
-  next if length($skip) && index($f, $skip) >= 0;
+  next if grep { index($f, $_) >= 0 } @skips;
   open my $fh, "<", $f or next;
   my $ln = 0;
   my $p = $f; $p =~ s/^\Q$root\E\///;
@@ -136,7 +151,7 @@ scan ui/no-gradient \
 # longer hex run (session ids) and not a url(#id) reference; #root is not hex.
 scan ui/no-hardcoded-color \
   '(?<![^\s:\x27"(,=\[{;])(?<!url\()#[0-9a-fA-F]{3,8}(?![0-9a-fA-F])|\b(?:rgba?|hsla?|oklch)\s*\(' \
-  any "$TOKENS" tsx ts css
+  any "$TOKENS|$SRC/lib/gen/" tsx ts css
 
 # --- 3. emoji ----------------------------------------------------------------
 scan ui/no-emoji \
@@ -146,7 +161,7 @@ scan ui/no-emoji \
 # --- 4. marketing copy and exclamation marks in user-facing strings -----------
 scan ui/no-marketing-copy \
   '(?i)(?:welcome|supercharge|get started|getting started|powered by|at a glance|let[\x27\x{2019}]s go|awesome|magic)|!(?=["\x27\x60]|<\/)' \
-  any '' tsx ts
+  any "$SRC/lib/gen/" tsx ts
 
 # --- 5. dependency allowlist -------------------------------------------------
 if [ -f "$ROOT/package.json" ]; then
@@ -406,6 +421,51 @@ a11y_status=$?
   exit 2
 }
 
+# --- 10. raw HTML insertion (contract §9.1, PM-03) ---------------------------
+# Agent output is attacker-controlled; the WebView renders it only through
+# React elements and src/markdown's AST renderer. None of these APIs may appear
+# anywhere under src/ — code, tests or comments alike — so a mention can never
+# turn into a use. No exemption marker. The only files skipped are the legacy
+# tests pinned by src/test/quarantine.mjs while their content is unchanged
+# (they are deleted or rewritten in wave 2; a rewrite is checked like any file).
+RAW_PY="$(mktemp -t lintuiraw)"
+cat >"$RAW_PY" <<'PY'
+import hashlib, os, re, sys
+root = sys.argv[1]
+src = os.path.join(root, "src")
+pins = {}
+q = os.path.join(src, "test", "quarantine.mjs")
+if os.path.exists(q):
+    text = open(q, encoding="utf-8").read()
+    for m in re.finditer(r"path:\s*'([^']+)'[^}]*?sha256:\s*'([0-9a-f]{64})'", text):
+        pins[m.group(1)] = m.group(2)
+pattern = re.compile(
+    r"dangerouslySetInnerHTML|innerHTML|outerHTML|insertAdjacentHTML|"
+    r"document\s*\.\s*write(?:ln)?\b|createContextualFragment|setHTMLUnsafe|parseHTMLUnsafe"
+)
+exts = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".html")
+for dirpath, dirnames, filenames in os.walk(src):
+    dirnames[:] = [d for d in dirnames if d not in ("node_modules", "dist", ".git")]
+    for name in sorted(filenames):
+        if not name.endswith(exts):
+            continue
+        path = os.path.join(dirpath, name)
+        rel = os.path.relpath(path, root).replace(os.sep, "/")
+        data = open(path, "rb").read()
+        if rel in pins and hashlib.sha256(data).hexdigest() == pins[rel]:
+            continue
+        for n, line in enumerate(data.decode("utf-8", "replace").splitlines(), 1):
+            for m in pattern.finditer(line):
+                print("%s:%d: ui/no-raw-html: %s" % (rel, n, m.group(0)))
+PY
+python3 "$RAW_PY" "$ROOT" >>"$OUT"
+raw_status=$?
+rm -f "$RAW_PY"
+[ "$raw_status" -eq 0 ] || {
+  echo "lint-ui: ui/no-raw-html scanner failed (python3 exit $raw_status)" >&2
+  exit 2
+}
+
 # --- report ------------------------------------------------------------------
 n=$(grep -c . "$OUT" 2>/dev/null || true)
 if [ "$n" -gt 0 ]; then
@@ -425,5 +485,5 @@ if [ "$HINTS" -eq 1 ]; then
   for r in $ALL_RULES; do hint "$r"; done
 fi
 files=$(find_files tsx ts css html json md svg | tr '\0' '\n' | grep -c . || true)
-[ "$QUIET" -eq 1 ] || echo "lint-ui: clean — 9 rules, ${files} file(s) under ${SRC#"$ROOT"/}"
+[ "$QUIET" -eq 1 ] || echo "lint-ui: clean — 10 rules, ${files} file(s) under ${SRC#"$ROOT"/}"
 exit 0

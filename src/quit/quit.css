@@ -1,0 +1,80 @@
+/* The quit sheet (ux-ia §3.16). Tokens only. */
+
+.qt-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-8);
+}
+
+.qt-line {
+  margin: 0;
+  color: var(--n11);
+}
+
+.qt-muted {
+  color: var(--n8);
+  font-size: var(--fs-sub);
+}
+
+.qt-warn {
+  color: var(--warn);
+  font-size: var(--fs-sub);
+}
+
+.qt-error {
+  color: var(--error);
+  font-size: var(--fs-sub);
+}
+
+.qt-detail {
+  display: block;
+  color: var(--n8);
+  font-size: var(--fs-label);
+  white-space: pre-wrap;
+}
+
+.qt-rows {
+  list-style: none;
+  margin: 0;
+  padding: var(--sp-4) 0;
+  max-height: 280px;
+  overflow-y: auto;
+}
+
+.qt-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-8);
+  min-height: var(--row-h);
+  padding: 0 var(--sp-8);
+  font-size: var(--fs-sub);
+  min-width: 0;
+}
+
+.qt-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--n11);
+}
+
+.qt-sub {
+  color: var(--n8);
+  white-space: nowrap;
+}
+
+.qt-wait {
+  color: var(--warn);
+  white-space: nowrap;
+}
+
+.qt-project {
+  margin-left: auto;
+  padding-left: var(--sp-12);
+  color: var(--n8);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 40%;
+}

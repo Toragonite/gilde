@@ -1,45 +1,50 @@
-//! The Node sidecar: runtime resolution, lifecycle, health, and the supervision
-//! seam that keeps its grandchildren visible (DESIGN §1, §5, §8-3).
+//! The Node sidecar: runtime resolution, lifecycle, health, protocol 2 and the
+//! supervision seam that keeps its grandchildren visible (contract §2.1, §2.4
+//! B12, §4.5, §4.7, §10.4).
 //!
-//! The sidecar is the headless lane. It embeds `@toragonite/agent-mesh` and the
-//! four vendor adapters behind an NDJSON JSON-RPC channel ([`protocol`],
-//! [`client`]) and mirrors agent-mesh's data contract field for field
-//! ([`types`]). What lives *here* is everything that owns a **process**:
+//! The sidecar is the turn-based lane: `@toragonite/agent-mesh` and its four
+//! vendor adapters behind an NDJSON JSON-RPC channel ([`protocol`], [`client`]).
+//! What lives *here* is everything that owns a **process** or a **turn**:
 //!
-//!   * **Runtime resolution** ([`SidecarRuntime`]) — the vendored `gilde-node` next
-//!     to the executable in production, `CARGO_MANIFEST_DIR/sidecar/sidecar.cjs`
-//!     plus a login-shell-resolved `node` under `GILDE_SIDECAR_DEV=1`, and a
-//!     system-node fallback that is reported rather than hidden.
-//!   * **A self-test before the real spawn** — `<runtime> --version` under a 5 s
-//!     cap, so a broken runtime is [`GildeError::SidecarRuntimeUnusable`] with the
-//!     path and the stderr instead of a mysterious hang.
-//!   * **Write-before-spawn** — every process this module starts, the sidecar
-//!     itself and the `--version` probe included, goes through
-//!     [`Supervisor::plan_spawn`] and a [`SpawnGuard`] (DESIGN §8-3), and
-//!     `host.registerSpawn` extends the same guarantee to the children the
-//!     sidecar spawns: the durable row lands **before** the response that
-//!     unblocks the spawn, so a headless `claude` shows up in the Process
-//!     Monitor within one scan.
-//!   * **Health and restart** — `mesh.ping` every 10 s with a 5 s deadline,
-//!     three consecutive misses ⇒ hang-kill, restart backoff
-//!     `[1, 2, 5, 15, 60]s`, and a circuit breaker at five crashes under 5 s of
-//!     uptime that stops restarting and surfaces the last 200 stderr lines.
-//!   * **Crash semantics** — in-flight requests reject as
-//!     [`SidecarCallError::Gone`], the affected runs settle as `interrupted`
-//!     rather than `error`, and [`GenerationSweeper::sweep`] runs **before** the
-//!     replacement sidecar can accept work, so a crash loop cannot pile up
-//!     orphaned `claude -p` children.
+//!   * **Runtime resolution** ([`SidecarRuntime`]) — the vendored `gilde-node`
+//!     next to the executable in production, `CARGO_MANIFEST_DIR/sidecar/sidecar.cjs`
+//!     plus a `node` off the resolved `PATH` under `GILDE_SIDECAR_DEV=1`.
+//!   * **Lazy start** (B12) — nothing is spawned at boot. The first command that
+//!     needs the sidecar calls [`SidecarApi::ensure_started`]; until the handshake
+//!     answers it gets `NOT_READY{sidecarStarting}` (retryable). An orchestrator
+//!     detected by discovery is the other trigger ([`SidecarManager::set_orchestrator_present`]).
+//!   * **Protocol 2** — `mesh.hello {protocol: 2, buildId, appInstanceId,
+//!     providers}` and `mesh.configure {binaries, accounts, providers}`. The build
+//!     id is [`HOST_BUILD_ID`] (contract §4.7 / A8.1). A sidecar from another build
+//!     exits with code 78 (or answers with another id): the manager latches
+//!     `VERSION_MISMATCH`, never restarts it, and every command says "Restart Gilde
+//!     to finish updating." A protocol-1 peer is stopped.
+//!   * **Write-before-spawn** — the sidecar process, its `--version` self-test and
+//!     every child the sidecar registers through `host.registerSpawn` get a durable
+//!     registry row before they exist. `host.registerSpawn` is also an
+//!     **allowlist** (§4.5, §9.3): its `cmd` must be a configured vendor binary or
+//!     the bundled node, else `REFUSED{notAllowlisted}` and nothing spawns.
+//!   * **Turns** — `turn.start` / `turn.cancel` and the `turn.event` stream, routed
+//!     per turn through a bounded queue (≤ 1,024 undelivered events: `Text` merged
+//!     on overflow, `Done` / `Error` never dropped). A generation that dies
+//!     mid-turn ends each of its turns with one `Error` carrying
+//!     [`HELPER_RESTARTED`] (§10.4: Error·Agent error "The helper restarted; the
+//!     turn was stopped.").
+//!   * **Health and restart** (§10.4) — `mesh.ping` every interval with a 5 s
+//!     deadline, three consecutive misses ⇒ hang-kill; restart backoff
+//!     1, 2, 4 … 60 s; three deaths within five minutes ⇒ it stays down and its
+//!     commands return `SIDECAR_DOWN`.
 //!
-//! **The PTY lane never depends on any of this.** A sidecar that is down, hung
-//! or refusing to start leaves the interactive lane fully usable — that
-//! isolation is deliberate (DESIGN §5-3) and nothing in this module may weaken it.
+//! **Nothing else depends on this.** A sidecar that is down, hung, mismatched or
+//! disabled costs turn-based turns and probes only: Conversation (L1), Terminal,
+//! discovery and teams keep working (contract §2.3, D3, PM-31).
 
 pub mod client;
 pub mod protocol;
 pub mod team_cache;
 pub mod types;
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -48,63 +53,118 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, Notify};
 
+use crate::contract::account::Quota;
+use crate::contract::common::{AbsPath, Vendor};
+use crate::contract::error::{ErrorCode, IpcError, VendorErrorClass};
+use crate::contract::services::{SidecarApi, TurnEventSink};
+use crate::contract::sidecar as wire;
 use crate::error::{GildeError, Result};
-use crate::events::{SidecarStateEvent, TeamSnapshotEvent, SIDECAR_STATE, TEAM_SNAPSHOT};
-use crate::events::bus::EventBus;
-use crate::model::graph::SidecarState;
-use crate::store::models::ProcKind;
-use crate::supervise::registry::{EnvBase, SpawnGuard, SpawnPlan, Supervisor};
+use crate::supervise::registry::{EnvBase, Supervisor};
+use crate::contract::activity::ExitInfo;
+use crate::contract::process::ProcKind as SpawnKind;
+use crate::contract::services::{SpawnRequest, SpawnTicket, SupervisorApi};
 use crate::supervise::spawn::{is_alive, tokio_command_grouped};
 
 pub use client::{ClientFault, HostFuture, HostHandler, SidecarCallError, SidecarClient};
 pub use protocol::{code, host_method, method, RpcErrorObject, MAX_LINE_BYTES, PROTOCOL_VERSION};
-pub use types::*;
 pub use team_cache::TeamCache;
+pub use types::*;
 
-/// Wall clock for the `--version` self-test (DESIGN §5-11).
+// ---------------------------------------------------------------------------
+// the build id (contract §4.7, A8.1)
+// ---------------------------------------------------------------------------
+
+/// The build id this core sends in `mesh.hello`: the core's `BUILD_ID` (A8.1:
+/// the compile-time `GILDE_BUILD_ID` when set and non-empty, else the app
+/// version) — the same rule as the WebView's (`src/lib/buildId.ts`) and the
+/// sidecar's (`esbuild.mjs`), so a dev or test build carries the version on
+/// every side.
+pub const HOST_BUILD_ID: &str = crate::BUILD_ID;
+
+const _: () = assert!(
+    is_valid_build_id(HOST_BUILD_ID),
+    "GILDE_BUILD_ID must match ^[0-9A-Za-z][0-9A-Za-z._+-]{{0,63}}$ (contract §4.7, A8.1); it is never trimmed or replaced"
+);
+
+/// A8.1: an empty value is unset; it is never trimmed or replaced.
+pub const fn build_id_from<'a>(env: Option<&'a str>, version: &'a str) -> &'a str {
+    match env {
+        Some(id) if !id.is_empty() => id,
+        _ => version,
+    }
+}
+
+/// A8.1: `^[0-9A-Za-z][0-9A-Za-z._+-]{0,63}$`.
+pub const fn is_valid_build_id(id: &str) -> bool {
+    let b = id.as_bytes();
+    if b.is_empty() || b.len() > 64 || !b[0].is_ascii_alphanumeric() {
+        return false;
+    }
+    let mut i = 1;
+    while i < b.len() {
+        let c = b[i];
+        if !(c.is_ascii_alphanumeric() || c == b'.' || c == b'_' || c == b'+' || c == b'-') {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+// ---------------------------------------------------------------------------
+// budgets
+// ---------------------------------------------------------------------------
+
+/// Wall clock for the `--version` self-test.
 pub const SELF_TEST_TIMEOUT: Duration = Duration::from_secs(5);
-/// Deadline for one `mesh.ping` (DESIGN §5-3).
+/// The hard deadline of the handshake (§2.4 B12: ≤ 3 s budget, 30 s hard).
+pub const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(30);
+/// How long [`SidecarApi::ensure_started`] waits before answering
+/// `NOT_READY{sidecarStarting}` (the B12 handshake budget).
+pub const ENSURE_WAIT: Duration = Duration::from_secs(3);
+/// Deadline for one `mesh.ping`.
 pub const PING_DEADLINE: Duration = Duration::from_secs(5);
 /// Consecutive missed pings before the sidecar is declared *hung* (not dead).
 pub const PING_MISSES_BEFORE_HANG: u32 = 3;
-/// Restart backoff ladder, in seconds (DESIGN §5-3).
-pub const RESTART_BACKOFF_SECS: [u64; 5] = [1, 2, 5, 15, 60];
-/// A start that dies sooner than this counts against the circuit breaker.
-pub const CRASH_WINDOW: Duration = Duration::from_secs(5);
-/// Crashes inside [`CRASH_WINDOW`] before restarts stop (DESIGN §5-3).
-pub const CRASH_LIMIT: u32 = 5;
-/// stderr lines kept for the "Sidecar log" drawer and the down banner.
+/// Restart backoff ladder, in seconds (§10.4: 1, 2, 4 … 60 s).
+pub const RESTART_BACKOFF_SECS: [u64; 7] = [1, 2, 4, 8, 16, 32, 60];
+/// Deaths within [`DEATH_WINDOW`] after which the sidecar stays down (§10.4).
+pub const DEATHS_BEFORE_STAYING_DOWN: usize = 3;
+/// The window of [`DEATHS_BEFORE_STAYING_DOWN`].
+pub const DEATH_WINDOW: Duration = Duration::from_secs(5 * 60);
+/// stderr lines kept for diagnostics and the down reason.
 pub const STDERR_TAIL_LINES: usize = 200;
-/// Grace between the shutdown/hang `SIGTERM` and its `SIGKILL`.
+/// Grace between the shutdown/hang `SIGTERM` and its `SIGKILL`. The sidecar's
+/// node is a Gilde helper, not a vendor CLI, so it may be escalated (§9.8).
 pub const TERMINATE_GRACE: Duration = Duration::from_secs(3);
 /// Grace handed to `mesh.shutdown` before the signal path takes over.
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+/// Deadline of a probe call (agent-mesh's own probe clocks are ≤ 90 s).
+pub const PROBE_DEADLINE: Duration = Duration::from_secs(120);
+/// Deadline of `turn.start` / `turn.cancel` answers (the turn itself streams).
+pub const TURN_CALL_DEADLINE: Duration = Duration::from_secs(30);
 /// The host pid, handed to the sidecar's parent-death watchdog (INT-C).
-///
-/// The sidecar polls it every 2 s with signal 0 and exits when it is gone. This
-/// is the third of its three exit paths and the only one that survives *this*
-/// process being `SIGKILL`ed: no stream closes in that case on macOS — the child
-/// is simply reparented to `launchd` and keeps holding whatever it spawned.
-///
-/// The budgets on the two sides are deliberately ordered: the sidecar's signal
-/// path exits within 2 s, inside [`TERMINATE_GRACE`], so a healthy stop is
-/// recorded as `SIGTERM` and never reaches the escalation.
 pub const ENV_HOST_PID: &str = "GILDE_HOST_PID";
+
+/// The `message` of the `Error` that ends every turn of a generation that died
+/// (§6.3, §10.4). The turn driver shows it as `turn.helperRestarted`.
+pub const HELPER_RESTARTED: &str = "turn.helperRestarted";
 
 // ---------------------------------------------------------------------------
 // runtime resolution
 // ---------------------------------------------------------------------------
 
 /// Where the Node runtime came from. Surfaced in diagnostics because
-/// "it works in dev, not from Finder" is almost always this field (DESIGN §5-11).
+/// "it works in dev, not from Finder" is almost always this field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum NodeSource {
@@ -134,17 +194,14 @@ pub struct SidecarRuntime {
     pub node: PathBuf,
     pub script: PathBuf,
     pub node_source: NodeSource,
-    /// Non-fatal problems worth showing in `app_diagnostics()`.
+    /// Non-fatal problems worth showing in diagnostics.
     #[serde(default)]
     pub warnings: Vec<String>,
 }
 
 impl SidecarRuntime {
-    /// Resolve the runtime for this build.
-    ///
-    /// `search_path` is the login-shell-resolved `PATH` (T09's `PathReport`),
-    /// not the app's own: a bundle launched from Finder cannot see nvm, which is
-    /// exactly where this machine's `node` lives.
+    /// Resolve the runtime for this build. `search_path` is the resolved
+    /// `PATH`, not the app's own: a bundle launched from Finder cannot see nvm.
     pub fn resolve(
         resource_script: Option<PathBuf>,
         configured_node: Option<&str>,
@@ -229,12 +286,8 @@ impl SidecarRuntime {
         }
     }
 
-    /// The production entry point: resolve against a live Tauri app.
-    ///
-    /// The bundled script is `sidecar/sidecar.cjs` under
-    /// [`tauri::path::BaseDirectory::Resource`] — the path `tauri.conf.json`
-    /// declares in `bundle.resources`. Everything else is
-    /// [`SidecarRuntime::resolve`]'s ladder.
+    /// The production entry point: resolve against a live Tauri app. The bundled
+    /// script is `sidecar/sidecar.cjs` under `BaseDirectory::Resource`.
     pub fn resolve_for_app(
         app: &tauri::AppHandle,
         configured_node: Option<&str>,
@@ -283,20 +336,52 @@ fn which_on(search_path: &[PathBuf], name: &str) -> Option<PathBuf> {
 // status
 // ---------------------------------------------------------------------------
 
-/// What `sidecar_status` returns — mirrored by `ipc.ts::SidecarStatus`.
+/// Lifecycle of the sidecar (contract §10.4). The turn-based lane only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SidecarState {
+    Starting,
+    Ready,
+    Degraded,
+    #[default]
+    Down,
+    Restarting,
+}
+
+impl SidecarState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            SidecarState::Starting => "starting",
+            SidecarState::Ready => "ready",
+            SidecarState::Degraded => "degraded",
+            SidecarState::Down => "down",
+            SidecarState::Restarting => "restarting",
+        }
+    }
+}
+
+/// A status snapshot. `S` is the state's type: [`SidecarState`] by default.
+/// [`SidecarManager::status`] can render the state into any type that decodes
+/// from its camelCase name (the legacy graph projection reads it that way until
+/// it is deleted, A7.9).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SidecarStatus {
-    pub state: SidecarState,
+pub struct SidecarStatus<S = SidecarState> {
+    pub state: S,
     pub generation: i64,
     pub restarts: u32,
     pub last_error: Option<String>,
     pub node_path: Option<String>,
     pub script_path: Option<String>,
+    /// A sidecar from another build answered: "Restart Gilde to finish updating."
+    #[serde(default)]
+    pub version_mismatch: bool,
+    /// Three deaths within five minutes: it stays down until an explicit restart.
+    #[serde(default)]
+    pub stays_down: bool,
 }
 
-/// Broadcast when a generation dies, so the dispatch engine can settle the runs
-/// it interrupted as `interrupted` — never as `error` (DESIGN §5-10 rule 2).
+/// Broadcast when a generation dies.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidecarDeath {
     pub generation: i64,
@@ -305,13 +390,268 @@ pub struct SidecarDeath {
     pub deliberate: bool,
 }
 
-/// The reaper hook. T11 installs `reaper::sweep_generation`; until then a
-/// caller may install its own, and the manager simply has nothing to call.
-///
-/// It is awaited **before the replacement sidecar can accept work**, which is
-/// the property that keeps a crash loop from accumulating orphans.
+/// The reaper hook, awaited **before the replacement sidecar can accept
+/// work** — the property that keeps a crash loop from accumulating orphans.
 pub trait GenerationSweeper: Send + Sync + 'static {
     fn sweep(&self, dead_generation: i64) -> Pin<Box<dyn Future<Output = ()> + Send>>;
+}
+
+/// One relayed `orch.snapshot`, after Rust stamped its own fields: the team
+/// views T02's orchestrator mapping consumes ([`SidecarManager::subscribe_orchestrator`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrchTeamSnapshot {
+    /// `(host generation, observer generation)` folded into one ordered key.
+    pub generation: i64,
+    pub rev: u64,
+    pub team_id: String,
+    /// `None` = the team left the observer's sight.
+    pub view: Option<CcoTeamView>,
+}
+
+/// The ordered key of a view: the host's sidecar generation in the high bits,
+/// the sidecar's observer generation in the low 24 (a new observer restarts `rev`).
+pub fn orch_generation_key(host_generation: i64, observer_generation: u64) -> i64 {
+    (host_generation.max(0) << 24) | (observer_generation.min(0x00FF_FFFF) as i64)
+}
+
+// ---------------------------------------------------------------------------
+// turn routing (§4.5 backpressure)
+// ---------------------------------------------------------------------------
+
+/// What one turn's queue holds and how it merges on overflow: at most
+/// [`wire::MAX_PENDING_TURN_EVENTS`] undelivered events; past that a `Text`
+/// event is merged into a `Text` already queued (order kept), a `Usage` replaces
+/// a trailing `Usage`, and `Done` / `Error` are always admitted. `seq` must be
+/// strictly increasing; anything after the terminal event is dropped.
+#[derive(Debug, Default)]
+pub struct TurnQueue {
+    events: VecDeque<(u64, wire::TurnEvent)>,
+    last_seq: u64,
+    terminal: bool,
+    /// Events merged into another on overflow (diagnostics).
+    pub merged: u64,
+    /// Events dropped as out of order or after the terminal event.
+    pub rejected: u64,
+}
+
+/// Why [`TurnQueue::admit`] did not queue an event as its own entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admit {
+    Queued,
+    Merged,
+    Rejected,
+}
+
+impl TurnQueue {
+    pub fn is_terminal(event: &wire::TurnEvent) -> bool {
+        matches!(event, wire::TurnEvent::Done { .. } | wire::TurnEvent::Error { .. })
+    }
+
+    pub fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
+    pub fn admit(&mut self, seq: u64, event: wire::TurnEvent) -> Admit {
+        if self.terminal || seq <= self.last_seq {
+            self.rejected += 1;
+            return Admit::Rejected;
+        }
+        self.last_seq = seq;
+        if Self::is_terminal(&event) {
+            self.terminal = true;
+            self.events.push_back((seq, event));
+            return Admit::Queued;
+        }
+        if self.events.len() >= wire::MAX_PENDING_TURN_EVENTS {
+            match event {
+                wire::TurnEvent::Text { delta } => {
+                    if let Some((_, wire::TurnEvent::Text { delta: tail })) = self.events.back_mut() {
+                        tail.push_str(&delta);
+                        self.merged += 1;
+                        return Admit::Merged;
+                    }
+                    // Make room by joining the first adjacent pair of texts.
+                    if let Some(i) = (0..self.events.len().saturating_sub(1)).find(|&i| {
+                        matches!(self.events[i].1, wire::TurnEvent::Text { .. })
+                            && matches!(self.events[i + 1].1, wire::TurnEvent::Text { .. })
+                    }) {
+                        if let Some((_, wire::TurnEvent::Text { delta: second })) = self.events.remove(i + 1) {
+                            if let (_, wire::TurnEvent::Text { delta: first }) = &mut self.events[i] {
+                                first.push_str(&second);
+                            }
+                        }
+                        self.merged += 1;
+                    }
+                    self.events.push_back((seq, wire::TurnEvent::Text { delta }));
+                    Admit::Queued
+                }
+                wire::TurnEvent::Usage { usage } => {
+                    if let Some((tail_seq, wire::TurnEvent::Usage { usage: tail })) = self.events.back_mut() {
+                        *tail = usage;
+                        *tail_seq = seq;
+                        self.merged += 1;
+                        return Admit::Merged;
+                    }
+                    self.events.push_back((seq, wire::TurnEvent::Usage { usage }));
+                    Admit::Queued
+                }
+                other => {
+                    self.events.push_back((seq, other));
+                    Admit::Queued
+                }
+            }
+        } else {
+            self.events.push_back((seq, event));
+            Admit::Queued
+        }
+    }
+
+    pub fn pop(&mut self) -> Option<(u64, wire::TurnEvent)> {
+        self.events.pop_front()
+    }
+}
+
+/// One live turn: its sink, its queue and the generation it runs in.
+struct TurnRoute {
+    generation: i64,
+    sink: Arc<dyn TurnEventSink>,
+    queue: Mutex<TurnQueue>,
+    wake: Notify,
+    done: AtomicBool,
+}
+
+impl TurnRoute {
+    fn push(&self, seq: u64, event: wire::TurnEvent) -> Admit {
+        let admitted = self.queue.lock().admit(seq, event);
+        if admitted != Admit::Rejected {
+            self.wake.notify_one();
+        }
+        admitted
+    }
+
+    /// The synthesized terminal of a turn whose generation died.
+    fn fail_helper_restarted(&self) {
+        let seq = self.queue.lock().last_seq + 1;
+        self.push(
+            seq,
+            wire::TurnEvent::Error {
+                class: VendorErrorClass::Unknown,
+                message: HELPER_RESTARTED.to_string(),
+            },
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// configuration (legacy shape kept for the boot wiring)
+// ---------------------------------------------------------------------------
+
+/// The fleet configuration in its pre-protocol-2 shape (`lib.rs`, the boot
+/// tests). [`SidecarManager::configure`] converts it into protocol 2's
+/// `mesh.configure`: resolved binaries by contract vendor and [`wire::AccountEnv`]s.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MeshConfig {
+    pub binaries: BinaryPaths,
+    pub accounts: Vec<Account>,
+    pub defaults: MeshDefaults,
+}
+
+/// A vendor binary resolver, asked on EVERY sidecar start (A12.6; boot no
+/// longer starts the sidecar): the app binds `agents::resolve_binary`
+/// (realpath + the A1 fingerprint cache, §6.0), whose answer is also what the
+/// spawn allowlist admits. `None` = not installed. It never runs the binary
+/// for the sidecar.
+pub type BinaryResolver = Arc<dyn Fn(Vendor) -> ResolveFuture + Send + Sync>;
+
+/// The answer of a [`BinaryResolver`].
+pub type ResolveFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Option<AbsPath>> + Send>>;
+
+/// A resolver over a synchronous lookup (fixed paths, tests).
+pub fn resolver_from<F>(lookup: F) -> BinaryResolver
+where
+    F: Fn(Vendor) -> Option<AbsPath> + Send + Sync + 'static,
+{
+    Arc::new(move |vendor| {
+        let found = lookup(vendor);
+        Box::pin(async move { found })
+    })
+}
+
+/// The account variable rule (contract §6.0, C8): claude → `CLAUDE_CONFIG_DIR`,
+/// codex → `CODEX_HOME`; cursor and agy have none.
+pub const fn account_env_key(vendor: Vendor) -> Option<&'static str> {
+    match vendor {
+        Vendor::Claude => Some("CLAUDE_CONFIG_DIR"),
+        Vendor::Codex => Some("CODEX_HOME"),
+        Vendor::Cursor | Vendor::Agy => None,
+    }
+}
+
+/// The realpath of `p` when it exists, else `p` itself if it already has the
+/// canonical form.
+pub fn canonical_abs(p: &Path) -> Option<AbsPath> {
+    let resolved = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    AbsPath::parse(resolved.to_str()?.to_string()).ok()
+}
+
+/// The legacy account list as protocol-2 `AccountEnv`s. A claude/codex account
+/// whose directory is the vendor's default (`~/.claude`, `~/.codex`) or absent is
+/// the default login: `envKey: null` (C8). cursor/agy never carry a variable.
+pub fn account_envs_of(accounts: &[Account], home: &Path) -> Vec<wire::AccountEnv> {
+    let mut out: Vec<wire::AccountEnv> = Vec::new();
+    for account in accounts {
+        let vendor = match account.vendor.as_str() {
+            "gemini" => Vendor::Agy,
+            other => match Vendor::parse(other) {
+                Some(v) => v,
+                None => continue,
+            },
+        };
+        let default_dir = match vendor {
+            Vendor::Claude => Some(home.join(".claude")),
+            Vendor::Codex => Some(home.join(".codex")),
+            _ => None,
+        };
+        let dir = account
+            .config_dir
+            .as_deref()
+            .filter(|d| !d.is_empty())
+            .and_then(|d| canonical_abs(Path::new(d)));
+        let is_default = match (&dir, &default_dir) {
+            (None, _) => true,
+            (Some(d), Some(def)) => canonical_abs(def).is_some_and(|def| &def == d),
+            _ => false,
+        };
+        let env = match (account_env_key(vendor), is_default, dir) {
+            (Some(key), false, Some(dir)) => wire::AccountEnv {
+                account_id: crate::contract::ids::AccountId::derive(vendor, dir.as_str()),
+                vendor,
+                env_key: Some(key.to_string()),
+                config_dir: Some(dir),
+            },
+            _ => {
+                let default = default_dir.as_deref().and_then(canonical_abs);
+                wire::AccountEnv {
+                    account_id: match &default {
+                        Some(d) => crate::contract::ids::AccountId::derive(vendor, d.as_str()),
+                        None => crate::contract::ids::AccountId::derive_default_login(vendor),
+                    },
+                    vendor,
+                    env_key: None,
+                    config_dir: None,
+                }
+            }
+        };
+        if !out.iter().any(|e| e.account_id == env.account_id) {
+            out.push(env);
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -322,13 +662,28 @@ struct LiveState {
     state: SidecarState,
     generation: i64,
     restarts: u32,
-    crash_streak: u32,
     last_error: Option<String>,
     client: Option<SidecarClient>,
     child_pid: Option<i32>,
-    guard: Option<Arc<SpawnGuard>>,
+    /// The live generation's registry ticket.
+    guard: Option<SpawnTicket>,
     started_at: Option<Instant>,
-    hello: Option<HelloResult>,
+    roster: Vec<wire::AdapterInfo>,
+    /// The binaries the live generation was configured with: the allowlist.
+    configured: BTreeMap<Vendor, AbsPath>,
+    /// Non-deliberate deaths, for the "three in five minutes" rule.
+    deaths: VecDeque<Instant>,
+    /// The latch of a build mismatch: never restarted, every command says so.
+    version_mismatch: bool,
+    /// Three deaths in five minutes: stays down until an explicit restart.
+    stays_down: bool,
+    /// A lazy start is in flight.
+    starting: bool,
+    /// The generation stopped on purpose for a presence change (A11.6): its
+    /// exit is not a death and is not restarted.
+    retired: Option<i64>,
+    /// `providers.orchestrator` as the live generation's `mesh.hello` sent it.
+    hello_orchestrator: Option<bool>,
 }
 
 impl LiveState {
@@ -337,55 +692,64 @@ impl LiveState {
             state: SidecarState::Down,
             generation: 0,
             restarts: 0,
-            crash_streak: 0,
             last_error: None,
             client: None,
             child_pid: None,
             guard: None,
             started_at: None,
-            hello: None,
+            roster: Vec::new(),
+            configured: BTreeMap::new(),
+            deaths: VecDeque::new(),
+            version_mismatch: false,
+            stays_down: false,
+            starting: false,
+            retired: None,
+            hello_orchestrator: None,
         }
     }
 }
 
-/// Everything `mesh.hello` / `mesh.configure` need to build the fleet.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct MeshConfig {
-    pub binaries: BinaryPaths,
-    pub accounts: Vec<Account>,
-    pub defaults: MeshDefaults,
-}
-
-/// Owns the sidecar process across restarts.
-///
-/// Held in Tauri managed state as `Arc<SidecarManager>`; every lifecycle method
-/// takes `&Arc<Self>` because the supervision tasks outlive the call that
-/// started them and hold a [`Weak`] back.
+/// Owns the sidecar process across restarts. Held in Tauri managed state as
+/// `Arc<SidecarManager>`; it is also the [`SidecarApi`] the turn driver and the
+/// accounts service use (`Arc<SidecarManager>` coerces to `Arc<dyn SidecarApi>`).
 pub struct SidecarManager {
+    me: Weak<SidecarManager>,
+    /// Env composition and the app instance id (A13.4).
     supervisor: Arc<Supervisor>,
+    /// Every spawn goes through this: the §9.3 allowlist, the durable row
+    /// before the process exists (A12.8).
+    spawns: Arc<dyn SupervisorApi>,
     runtime: SidecarRuntime,
     env_base: EnvBase,
-    mesh: Mutex<MeshConfig>,
+    /// Explicit binaries (the legacy `configure`), by contract vendor.
+    binaries: Mutex<BTreeMap<Vendor, AbsPath>>,
+    binary_resolver: Mutex<Option<BinaryResolver>>,
+    accounts: Mutex<Vec<wire::AccountEnv>>,
+    orchestrator: AtomicBool,
     state: Mutex<LiveState>,
-    events: Mutex<Option<EventBus>>,
     sweeper: Mutex<Option<Arc<dyn GenerationSweeper>>>,
-    /// The sidecar's own spawn id → our registry guard. Keyed by *its* id
-    /// because that is what `host.spawned` / `host.exited` carry; the row's own
-    /// id is ours and is never sent back.
-    guards: DashMap<String, Arc<SpawnGuard>>,
+    /// The sidecar's own spawn id → our registry ticket.
+    guards: DashMap<String, SpawnTicket>,
+    turns: DashMap<String, Arc<TurnRoute>>,
     stderr_tail: Mutex<VecDeque<String>>,
     /// Why the current generation is about to die, when we know better than the
-    /// exit status does. A `SIGKILL` we sent ourselves says "signal 9"; this
-    /// says "it sent a 9 MiB line", which is the sentence the user needs.
+    /// exit status does.
     fault_reason: Mutex<Option<String>>,
     run_events: broadcast::Sender<RunEventEnvelope>,
     statuses: broadcast::Sender<SidecarStatus>,
     deaths: broadcast::Sender<SidecarDeath>,
+    orch_snapshots: broadcast::Sender<OrchTeamSnapshot>,
     ping_interval: Duration,
     ping_nonce: AtomicU64,
     /// Serialises start / restart / shutdown against each other.
     lifecycle: tokio::sync::Mutex<()>,
     shutting_down: AtomicBool,
+    /// Held (shared) while a turn claims its route, (exclusive) while a presence
+    /// stop checks for turns and detaches the generation: a turn never starts on
+    /// a generation that is being stopped (A11.6).
+    turn_gate: parking_lot::RwLock<()>,
+    /// A presence stop is waiting for the sidecar to go idle.
+    presence_stop_pending: AtomicBool,
     /// The team views relayed so far — the health tick's team facts.
     team_cache: Arc<TeamCache>,
 }
@@ -403,7 +767,8 @@ impl std::fmt::Debug for SidecarManager {
 }
 
 impl SidecarManager {
-    /// Build a manager. Nothing is spawned until [`SidecarManager::start`].
+    /// Build a manager. Nothing is spawned until the first [`SidecarApi::ensure_started`]
+    /// (B12) or an explicit [`SidecarManager::start`].
     pub fn new(
         supervisor: Arc<Supervisor>,
         runtime: SidecarRuntime,
@@ -411,76 +776,228 @@ impl SidecarManager {
         mesh: MeshConfig,
         ping_interval: Duration,
     ) -> Arc<SidecarManager> {
-        let (run_events, _) = broadcast::channel(1024);
+        SidecarManager::with_presence(supervisor, runtime, env_base, mesh, ping_interval, false)
+    }
+
+    /// [`SidecarManager::new`] with the orchestrator's presence at boot
+    /// (`app_bootstrap.features.orchestrator`, A11.6): the first `mesh.hello`
+    /// carries it.
+    pub fn with_presence(
+        supervisor: Arc<Supervisor>,
+        runtime: SidecarRuntime,
+        env_base: EnvBase,
+        mesh: MeshConfig,
+        ping_interval: Duration,
+        orchestrator_present: bool,
+    ) -> Arc<SidecarManager> {
+        let (run_events, _) = broadcast::channel(16);
         let (statuses, _) = broadcast::channel(64);
         let (deaths, _) = broadcast::channel(64);
-        Arc::new(SidecarManager {
+        let (orch_snapshots, _) = broadcast::channel(256);
+        let home = env_base.home.clone();
+        let accounts = account_envs_of(&mesh.accounts, &home);
+        let binaries = binaries_of(&mesh.binaries);
+        let spawns: Arc<dyn SupervisorApi> = supervisor.clone();
+        Arc::new_cyclic(|me| SidecarManager {
+            me: me.clone(),
             supervisor,
+            spawns,
             runtime,
             env_base,
-            mesh: Mutex::new(mesh),
+            binaries: Mutex::new(binaries),
+            binary_resolver: Mutex::new(None),
+            accounts: Mutex::new(accounts),
+            orchestrator: AtomicBool::new(orchestrator_present),
             state: Mutex::new(LiveState::new()),
-            events: Mutex::new(None),
             sweeper: Mutex::new(None),
             guards: DashMap::new(),
+            turns: DashMap::new(),
             stderr_tail: Mutex::new(VecDeque::with_capacity(STDERR_TAIL_LINES)),
             fault_reason: Mutex::new(None),
             run_events,
             statuses,
             deaths,
+            orch_snapshots,
             ping_interval,
             ping_nonce: AtomicU64::new(1),
             lifecycle: tokio::sync::Mutex::new(()),
             shutting_down: AtomicBool::new(false),
+            turn_gate: parking_lot::RwLock::new(()),
+            presence_stop_pending: AtomicBool::new(false),
             team_cache: Arc::new(TeamCache::new()),
         })
     }
 
     // -- wiring --------------------------------------------------------------
 
-    /// Attach the event bus. Separate from construction because the bus needs a
-    /// window and the manager is built during boot.
-    pub fn set_events(&self, events: EventBus) {
-        *self.events.lock() = Some(events);
-    }
-
     /// The team views relayed so far (`supervise::health` reads them).
     pub fn team_cache(&self) -> &Arc<TeamCache> {
         &self.team_cache
     }
 
-    /// Install the reaper hook (T11's `sweep_generation`).
+    /// Install the reaper hook.
     pub fn set_sweeper(&self, sweeper: Arc<dyn GenerationSweeper>) {
         *self.sweeper.lock() = Some(sweeper);
     }
 
-    /// Replace the fleet configuration. Takes effect on the next handshake, and
-    /// immediately through `mesh.configure` when a sidecar is up.
-    pub async fn configure(&self, mesh: MeshConfig) -> Result<()> {
-        *self.mesh.lock() = mesh.clone();
-        if self.client().is_some() {
-            let params = ConfigureParams {
-                binaries: mesh.binaries,
-                accounts: mesh.accounts,
-            };
-            let _: Value = self.call(method::CONFIGURE, params).await?;
-        }
-        Ok(())
+    /// Install the binary resolver (`agents::resolve_binary`, §6.0). Without
+    /// one, a binary comes from `configure`, else from the user's pinned
+    /// `agents.binaries` setting, else from the resolved `PATH` — realpath'd,
+    /// stat'ed, never executed.
+    pub fn set_binary_resolver(&self, resolver: BinaryResolver) {
+        *self.binary_resolver.lock() = Some(resolver);
     }
 
-    /// Every `mesh.event` notification, tagged with the generation that produced
-    /// it. The dispatch engine (T22) is the intended subscriber.
+    /// The accounts the sidecar may run under (env key names and config dirs
+    /// only). Re-sent through `mesh.configure` when the sidecar is up.
+    pub async fn set_accounts(&self, accounts: Vec<wire::AccountEnv>) -> std::result::Result<(), IpcError> {
+        *self.accounts.lock() = accounts;
+        self.reconfigure().await
+    }
+
+    /// The accounts currently configured.
+    pub fn accounts(&self) -> Vec<wire::AccountEnv> {
+        self.accounts.lock().clone()
+    }
+
+    /// Orchestrator presence (§5.10, B13): registers or removes the sidecar's
+    /// `orch.*` methods, and — present — starts the sidecar lazily (B12).
+    ///
+    /// A11.6: unchanged → nothing. Changed while no sidecar runs → stored; the
+    /// next (lazy) start's `mesh.hello` carries it. Changed while one runs → the
+    /// in-flight requests and turns finish, then it is stopped gracefully
+    /// (`mesh.shutdown`, then SIGTERM — never SIGKILL, never mid-turn); the next
+    /// lazy start carries the new value, so `orch.*` exists only while present.
+    /// When the orchestrator appears, that start is kicked at once (its observer
+    /// is the need, B12).
+    pub async fn set_orchestrator_present(&self, present: bool) {
+        let was = self.orchestrator.swap(present, Ordering::SeqCst);
+        if was == present {
+            return;
+        }
+        let running = {
+            let state = self.state.lock();
+            state.client.as_ref().map(|_| state.generation)
+        };
+        match running {
+            None => {
+                if present {
+                    self.kick_lazy_start();
+                }
+            }
+            Some(generation) => {
+                let Some(me) = self.me.upgrade() else { return };
+                if self.presence_stop_pending.swap(true, Ordering::SeqCst) {
+                    return; // a waiter is already on it; it re-reads the value
+                }
+                tokio::spawn(async move {
+                    me.stop_when_idle(generation).await;
+                    me.presence_stop_pending.store(false, Ordering::SeqCst);
+                    if me.orchestrator.load(Ordering::SeqCst) {
+                        me.kick_lazy_start();
+                    }
+                });
+            }
+        }
+    }
+
+    /// What a presence stop finds on the generation it waits for.
+    fn presence_check(&self, generation: i64) -> PresenceCheck {
+        let state = self.state.lock();
+        let Some(client) = state.client.as_ref() else { return PresenceCheck::Gone };
+        if state.generation != generation {
+            return PresenceCheck::Gone;
+        }
+        if state.state == SidecarState::Ready
+            && state.hello_orchestrator == Some(self.orchestrator.load(Ordering::SeqCst))
+        {
+            return PresenceCheck::Unchanged; // toggled back before it went idle
+        }
+        let turns = self.turns.iter().any(|e| e.value().generation == generation);
+        if turns || client.pending() > 0 || state.state != SidecarState::Ready {
+            PresenceCheck::Busy
+        } else {
+            PresenceCheck::Idle
+        }
+    }
+
+    /// Wait until the generation is idle, then stop it gracefully (A11.6).
+    async fn stop_when_idle(self: &Arc<Self>, generation: i64) {
+        loop {
+            match self.presence_check(generation) {
+                PresenceCheck::Gone | PresenceCheck::Unchanged => return,
+                PresenceCheck::Busy => {
+                    tokio::time::sleep(PRESENCE_IDLE_POLL).await;
+                    continue;
+                }
+                PresenceCheck::Idle => {}
+            }
+            let _lifecycle = self.lifecycle.lock().await;
+            let detached = {
+                // No turn can claim a route on this generation from here on.
+                let _gate = self.turn_gate.write();
+                match self.presence_check(generation) {
+                    PresenceCheck::Gone | PresenceCheck::Unchanged => return,
+                    PresenceCheck::Busy => None,
+                    PresenceCheck::Idle => {
+                        self.state.lock().retired = Some(generation);
+                        self.detach()
+                    }
+                }
+            };
+            let Some(detached) = detached else {
+                drop(_lifecycle);
+                tokio::time::sleep(PRESENCE_IDLE_POLL).await;
+                continue;
+            };
+            tracing::info!(target: "sidecar", generation, "the orchestrator presence changed; stopping the idle sidecar");
+            if let Some(client) = &detached.client {
+                if let Err(err) = client
+                    .call_value(method::SHUTDOWN, json!({"graceMs": 0}), Some(SHUTDOWN_GRACE))
+                    .await
+                {
+                    tracing::debug!(target: "sidecar", error = %err, "mesh.shutdown did not answer; signalling");
+                }
+            }
+            self.finish_detached(detached, "the orchestrator presence changed", true, Escalate::Never)
+                .await;
+            self.set_state(SidecarState::Down, None);
+            return;
+        }
+    }
+
+    /// Whether the orchestrator is present (as last told).
+    pub fn orchestrator_present(&self) -> bool {
+        self.orchestrator.load(Ordering::SeqCst)
+    }
+
+    /// Replace the fleet configuration (legacy shape). Takes effect on the next
+    /// handshake, and immediately through `mesh.configure` when a sidecar is up.
+    pub async fn configure(&self, mesh: MeshConfig) -> Result<()> {
+        *self.binaries.lock() = binaries_of(&mesh.binaries);
+        *self.accounts.lock() = account_envs_of(&mesh.accounts, &self.env_base.home);
+        self.reconfigure()
+            .await
+            .map_err(|e| GildeError::Internal(format!("mesh.configure failed: {}", e.code.as_str())))
+    }
+
+    /// Every orchestrator team view relayed from now on (T02's orchestrator
+    /// mapping subscribes; the cache holds the latest of each).
+    pub fn subscribe_orchestrator(&self) -> broadcast::Receiver<OrchTeamSnapshot> {
+        self.orch_snapshots.subscribe()
+    }
+
+    /// Legacy: protocol 2 has no `mesh.event`; nothing is ever sent here.
     pub fn subscribe_run_events(&self) -> broadcast::Receiver<RunEventEnvelope> {
         self.run_events.subscribe()
     }
 
-    /// Lifecycle transitions, for anything that must react to `down`/`ready`.
+    /// Lifecycle transitions.
     pub fn subscribe_status(&self) -> broadcast::Receiver<SidecarStatus> {
         self.statuses.subscribe()
     }
 
-    /// One message per dead generation. Runs that were in flight belong in
-    /// `interrupted` (DESIGN §5-10).
+    /// One message per dead generation.
     pub fn subscribe_deaths(&self) -> broadcast::Receiver<SidecarDeath> {
         self.deaths.subscribe()
     }
@@ -491,7 +1008,28 @@ impl SidecarManager {
         self.state.lock().generation
     }
 
-    pub fn status(&self) -> SidecarStatus {
+    /// The current state.
+    pub fn state(&self) -> SidecarState {
+        self.state.lock().state
+    }
+
+    /// The status with its state rendered as `S` (see [`SidecarStatus`]).
+    pub fn status<S: DeserializeOwned + Default>(&self) -> SidecarStatus<S> {
+        let s = self.current_status();
+        SidecarStatus {
+            state: serde_json::from_value(Value::String(s.state.as_str().to_string())).unwrap_or_default(),
+            generation: s.generation,
+            restarts: s.restarts,
+            last_error: s.last_error,
+            node_path: s.node_path,
+            script_path: s.script_path,
+            version_mismatch: s.version_mismatch,
+            stays_down: s.stays_down,
+        }
+    }
+
+    /// The status, typed.
+    pub fn current_status(&self) -> SidecarStatus {
         let state = self.state.lock();
         SidecarStatus {
             state: state.state,
@@ -500,6 +1038,8 @@ impl SidecarManager {
             last_error: state.last_error.clone(),
             node_path: Some(self.runtime.node.display().to_string()),
             script_path: Some(self.runtime.script.display().to_string()),
+            version_mismatch: state.version_mismatch,
+            stays_down: state.stays_down,
         }
     }
 
@@ -507,35 +1047,50 @@ impl SidecarManager {
         &self.runtime
     }
 
-    /// The handshake result of the live generation, when there is one.
-    pub fn hello(&self) -> Option<HelloResult> {
-        self.state.lock().hello.clone()
+    /// The adapter roster of the live handshake (`mesh.hello.adapters`).
+    pub fn roster(&self) -> Vec<wire::AdapterInfo> {
+        self.state.lock().roster.clone()
     }
 
-    /// The adapter roster, read off the live handshake. Empty while down.
+    /// Legacy shape of [`SidecarManager::roster`].
     pub fn adapters(&self) -> Vec<AdapterInfo> {
-        self.state
-            .lock()
-            .hello
-            .as_ref()
-            .map(|h| h.adapters.clone())
-            .unwrap_or_default()
+        let state = self.state.lock();
+        state
+            .roster
+            .iter()
+            .map(|a| AdapterInfo {
+                vendor: a.vendor.as_str().to_string(),
+                capabilities: AdapterCapabilities {
+                    resume: a.resume,
+                    stream: a.stream,
+                    quota: a.quota,
+                    ..AdapterCapabilities::default()
+                },
+                binary: state.configured.get(&a.vendor).map(|p| p.to_string()).unwrap_or_default(),
+                binary_path: state.configured.get(&a.vendor).map(|p| p.to_string()),
+                installed: a.installed,
+                extra: Extra::new(),
+            })
+            .collect()
     }
 
-    /// Whether a vendor streams — read from `AdapterCapabilities`, never from a
-    /// hardcoded list (DESIGN §5-8).
+    /// Whether a vendor streams — read off the live roster, never hardcoded.
     pub fn can_stream(&self, vendor: &str) -> bool {
         self.state
             .lock()
-            .hello
-            .as_ref()
-            .map(|h| h.can_stream(vendor))
-            .unwrap_or(false)
+            .roster
+            .iter()
+            .any(|a| a.vendor.as_str() == vendor && a.stream)
     }
 
-    /// The last [`STDERR_TAIL_LINES`] stderr lines — the down banner's content.
+    /// The last [`STDERR_TAIL_LINES`] stderr lines.
     pub fn stderr_tail(&self) -> Vec<String> {
         self.stderr_tail.lock().iter().cloned().collect()
+    }
+
+    /// Turns with a live route (diagnostics, tests).
+    pub fn live_turns(&self) -> usize {
+        self.turns.len()
     }
 
     fn client(&self) -> Option<SidecarClient> {
@@ -544,7 +1099,7 @@ impl SidecarManager {
 
     // -- calls ---------------------------------------------------------------
 
-    /// Call the sidecar, mapping every failure to an [`GildeError`].
+    /// Call the sidecar, mapping every failure to a [`GildeError`].
     pub async fn call<P: Serialize, R: DeserializeOwned>(&self, method: &str, params: P) -> Result<R> {
         self.call_detailed(method, params, None)
             .await
@@ -552,10 +1107,6 @@ impl SidecarManager {
     }
 
     /// The same call, keeping the typed failure.
-    ///
-    /// Callers that must distinguish "the agent failed" from "the app failed"
-    /// (the dispatch engine settling a run as `error` versus `interrupted`) use
-    /// this one and read [`SidecarCallError::is_infrastructure`].
     pub async fn call_detailed<P: Serialize, R: DeserializeOwned>(
         &self,
         method: &str,
@@ -566,22 +1117,38 @@ impl SidecarManager {
         client.call(method, params, timeout).await
     }
 
+    /// The contract error of a failed call (§4.4).
+    pub fn ipc_error(&self, err: SidecarCallError) -> IpcError {
+        if self.state.lock().version_mismatch {
+            return IpcError::version_mismatch();
+        }
+        match err {
+            SidecarCallError::Down | SidecarCallError::Gone { .. } => IpcError::sidecar_down(),
+            SidecarCallError::Timeout { .. } => IpcError::timeout(),
+            SidecarCallError::Rpc(rpc) => ipc_error_of_rpc(&rpc),
+            SidecarCallError::Decode { method, .. } => {
+                tracing::warn!(target: "sidecar", method = %method, "an answer did not match the contract shape");
+                IpcError::internal(&correlation_id())
+            }
+        }
+    }
+
     // -- lifecycle -----------------------------------------------------------
 
-    /// Start the sidecar: resolve, self-test, spawn, handshake.
-    ///
-    /// Returns once `mesh.hello` has answered — a caller that gets `Ok` can
-    /// immediately issue `mesh.*` calls. A failure leaves the manager `down`
-    /// with `last_error` set; the app stays usable either way.
+    /// Start the sidecar: resolve, self-test, spawn, handshake (hello + configure).
+    /// Returns once both answered. A failure leaves the manager `down` with
+    /// `last_error` set; the app stays usable either way.
     pub async fn start(self: &Arc<Self>) -> Result<()> {
         let _lock = self.lifecycle.lock().await;
         self.shutting_down.store(false, Ordering::SeqCst);
         if self.state.lock().client.is_some() {
             return Ok(());
         }
-        // `sidecar.enabled = false` is a supported configuration, not an error:
-        // the interactive lane is fully usable without the headless one, and the
-        // UI reads `down` with a reason rather than a failure toast.
+        if self.state.lock().version_mismatch {
+            return Err(GildeError::Spawn(
+                "the sidecar is from another build; restart Gilde to finish updating".to_string(),
+            ));
+        }
         if !self.supervisor.config().get().sidecar.enabled {
             tracing::info!(target: "sidecar", "the sidecar is disabled in config; not starting it");
             self.set_state(
@@ -593,8 +1160,9 @@ impl SidecarManager {
         self.start_locked().await
     }
 
-    /// Kill the current generation and start a fresh one. Resets the breaker,
-    /// because this is a deliberate user action.
+    /// Kill the current generation and start a fresh one. Clears the
+    /// stays-down rule, because this is a deliberate user action (a build
+    /// mismatch stays: only a new Gilde fixes that).
     pub async fn restart(self: &Arc<Self>) -> Result<SidecarStatus> {
         let _lock = self.lifecycle.lock().await;
         self.shutting_down.store(false, Ordering::SeqCst);
@@ -603,11 +1171,12 @@ impl SidecarManager {
         }
         {
             let mut state = self.state.lock();
-            state.crash_streak = 0;
+            state.deaths.clear();
+            state.stays_down = false;
             state.last_error = None;
         }
         match self.start_locked().await {
-            Ok(()) => Ok(self.status()),
+            Ok(()) => Ok(self.current_status()),
             Err(err) => {
                 self.set_state(SidecarState::Down, Some(err.to_string()));
                 Err(err)
@@ -622,94 +1191,133 @@ impl SidecarManager {
 
         if let Some(client) = self.client() {
             let graceful = client
-                .call_value(
-                    method::SHUTDOWN,
-                    json!({"graceMs": 0}),
-                    Some(SHUTDOWN_GRACE),
-                )
+                .call_value(method::SHUTDOWN, json!({"graceMs": 0}), Some(SHUTDOWN_GRACE))
                 .await;
             if let Err(err) = graceful {
                 tracing::debug!(target: "sidecar", error = %err, "mesh.shutdown did not answer; signalling");
             }
         }
         self.take_down("shutdown", true).await;
-        // Announce it here rather than leaving it to the exit watcher: a caller
-        // that awaits `shutdown()` must be able to observe `down` afterwards,
-        // and on a clean stop there is no error to report.
         self.set_state(SidecarState::Down, None);
         Ok(())
     }
 
-    /// Spawn one generation. The lifecycle lock must be held.
+    /// Start lazily in the background (B12) unless one is already starting,
+    /// running, latched as mismatched, staying down, or disabled.
+    fn kick_lazy_start(&self) {
+        let Some(me) = self.me.upgrade() else { return };
+        {
+            let mut state = self.state.lock();
+            if state.starting
+                || state.client.is_some()
+                || state.version_mismatch
+                || state.stays_down
+                || matches!(state.state, SidecarState::Restarting)
+            {
+                return;
+            }
+            state.starting = true;
+        }
+        tokio::spawn(async move {
+            if let Err(err) = me.start().await {
+                tracing::warn!(target: "sidecar", error = %err, "the lazy sidecar start failed");
+                me.note_start_failure();
+            }
+            me.state.lock().starting = false;
+            me.publish_status();
+        });
+    }
+
+    /// A failed lazy start counts like a death (§10.4): three within five
+    /// minutes and the sidecar stays down instead of being retried per command.
+    fn note_start_failure(&self) {
+        let mut state = self.state.lock();
+        if state.version_mismatch {
+            return;
+        }
+        let now = Instant::now();
+        state.deaths.push_back(now);
+        while state
+            .deaths
+            .front()
+            .is_some_and(|t| now.duration_since(*t) > DEATH_WINDOW)
+        {
+            state.deaths.pop_front();
+        }
+        if state.deaths.len() >= DEATHS_BEFORE_STAYING_DOWN {
+            state.stays_down = true;
+        }
+    }
+
+    /// Spawn one generation. The lifecycle lock must be held. Any failure
+    /// leaves the manager `Down` with the reason (never stuck in `Starting`).
     async fn start_locked(self: &Arc<Self>) -> Result<()> {
         let generation = self.state.lock().generation + 1;
         self.set_state_generation(SidecarState::Starting, generation, None);
+        let started = self.start_generation(generation).await;
+        if let Err(err) = &started {
+            if self.state.lock().state == SidecarState::Starting {
+                self.set_state(SidecarState::Down, Some(err.to_string()));
+            }
+        }
+        started
+    }
 
-        // 1. Self-test the runtime before the real spawn (DESIGN §5-11). A
-        //    broken runtime becomes a typed error with the path and the stderr,
-        //    not an unexplained hang at the first `mesh.hello`.
+    async fn start_generation(self: &Arc<Self>, generation: i64) -> Result<()> {
+        // A13.3: the resolved node may run as the sidecar and its own
+        // `--version` probe — no other kind.
+        crate::supervise::spawn::allow_executable(&self.runtime.node, &[SpawnKind::Sidecar, SpawnKind::Probe]);
+
+        // 1. Self-test the runtime before the real spawn.
         self.self_test().await?;
 
-        // 2. The durable registry row lands before the process exists (§8-3).
-        let argv = vec![
-            self.runtime.node.display().to_string(),
-            self.runtime.script.display().to_string(),
-        ];
+        // 2. The durable registry row lands before the process exists.
         let cwd = self
             .runtime
             .script
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("/"));
-        let plan = SpawnPlan::new(ProcKind::Sidecar, argv, cwd.clone()).generation(generation);
-        let guard = Arc::new(self.supervisor.plan_spawn(plan).await?);
+        let ticket = self
+            .plan(SpawnRequest {
+                kind: SpawnKind::Sidecar,
+                argv0: abs_path(&self.runtime.node)?,
+                args: vec![self.runtime.script.display().to_string()],
+                cwd: AbsPath::parse(cwd.display().to_string()).ok(),
+                env_keys: self.env_keys(),
+                parent_uid: None,
+                generation: Some(generation),
+                turn_id: None,
+            })
+            .await?;
 
         let env = self
             .supervisor
-            .compose_env(self.env_base.clone(), None, guard.env_marker());
+            .compose_env(self.env_base.clone(), None, &ticket.env_marker);
 
         let mut cmd = tokio_command_grouped(&self.runtime.node);
         cmd.arg(&self.runtime.script)
             .current_dir(&cwd)
             .env_clear()
             .envs(env)
-            // The sidecar's parent-death watchdog (INT-C). It also has
-            // `process.ppid`, which needs nothing from us, but that only sees our
-            // *direct* parentage; this is the identity of the process whose death
-            // must end it, stated explicitly. Set after `envs` so it wins over any
-            // `agents.envPassthrough` entry of the same name.
+            // The sidecar's parent-death watchdog (INT-C). Set after `envs` so it
+            // wins over any `agents.envPassthrough` entry of the same name.
             .env(ENV_HOST_PID, std::process::id().to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        // `kill_on_drop` is never set anywhere in this app (M1-PLAN T19.4): a
-        // child must outlive a dropped handle so the registry — not a Rust
-        // destructor ordering accident — decides when it dies.
 
-        // A failed spawn drops the guard while it is still armed, which is what
-        // marks the row `lost` — the registry never keeps a `planned` row for a
-        // process that was never created (DESIGN §8-3).
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| GildeError::Spawn(format!("could not start the sidecar: {e}")))?;
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                self.spawns.mark_exited(&ticket, ExitInfo { code: None, signal: None }).await;
+                return Err(GildeError::Spawn(format!("could not start the sidecar: {e}")));
+            }
+        };
 
         let pid = child.id().map(|p| p as i32).unwrap_or(-1);
-        // `process_group(0)` made the child its own group leader, so pgid == pid.
-        // `mark_running` reads the kernel start time (a blocking `libproc` call)
-        // and then writes SQLite with `synchronous=FULL`; neither belongs on the
-        // reactor thread, so it goes to the blocking pool like every other
-        // registry write in this module.
-        {
-            let guard = guard.clone();
-            match tokio::task::spawn_blocking(move || guard.mark_running(pid, pid)).await {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => tracing::warn!(
-                    target: "sidecar", error = %err, "could not mark the sidecar row running"
-                ),
-                Err(err) => tracing::warn!(
-                    target: "sidecar", error = %err, "the sidecar registry write panicked"
-                ),
-            }
+        if let Err(err) = self.spawns.mark_running(&ticket, pid).await {
+            tracing::warn!(target: "sidecar", code = err.code.as_str(), "could not mark the sidecar row running");
         }
 
         let stdout = child.stdout.take().ok_or_else(|| GildeError::spawn("no stdout"))?;
@@ -727,83 +1335,214 @@ impl SidecarManager {
             let mut state = self.state.lock();
             state.client = Some(client.clone());
             state.child_pid = Some(pid);
-            state.guard = Some(guard.clone());
+            state.guard = Some(ticket.clone());
             state.started_at = Some(Instant::now());
-            state.hello = None;
+            state.roster.clear();
+            state.configured.clear();
         }
 
         self.spawn_stderr_drain(generation, stderr);
-        self.spawn_exit_watcher(generation, child, guard.clone());
+        self.spawn_exit_watcher(generation, child, ticket.clone());
         self.spawn_fault_watcher(generation, fault_rx);
 
-        // 3. Handshake. A protocol mismatch is fatal for this generation: we
-        //    kill it rather than guess what the other side means (§5-3).
+        // 3. Handshake. A protocol or build mismatch is fatal for this generation.
         match self.handshake(&client).await {
             Ok(hello) => {
                 tracing::info!(
                     target: "sidecar",
                     generation,
                     pid,
-                    node = %hello.node,
-                    version = %hello.sidecar_version,
+                    build_id = %hello.build_id,
                     adapters = hello.adapters.len(),
                     node_source = self.runtime.node_source.as_str(),
                     "sidecar ready"
                 );
-                {
-                    let mut state = self.state.lock();
-                    state.hello = Some(hello);
-                }
+                self.state.lock().roster = hello.adapters;
                 self.set_state(SidecarState::Ready, None);
                 self.spawn_health_loop(generation, client);
-                self.spawn_healthy_start_reset(generation);
                 Ok(())
             }
-            Err(err) => {
-                let detail = err.to_string();
-                self.take_down(&format!("handshake failed: {detail}"), true)
-                    .await;
+            Err(HandshakeError::VersionMismatch(detail)) => {
+                tracing::error!(target: "sidecar", generation, detail = %detail, "the sidecar is from another build; not restarting it");
+                {
+                    let mut state = self.state.lock();
+                    state.version_mismatch = true;
+                    state.retired = Some(generation);
+                }
+                self.take_down(&format!("build mismatch: {detail}"), true).await;
+                self.set_state(SidecarState::Down, Some(format!("build mismatch: {detail}")));
+                Err(GildeError::Spawn(format!("sidecar build mismatch: {detail}")))
+            }
+            Err(HandshakeError::Other(detail)) => {
+                // A refused handshake (e.g. a protocol-1 peer) is stopped, not
+                // restarted: the same peer would refuse again. The next need
+                // tries anew, under the start-failure rule.
+                self.state.lock().retired = Some(generation);
+                self.take_down(&format!("handshake failed: {detail}"), true).await;
                 self.set_state(SidecarState::Down, Some(detail.clone()));
                 Err(GildeError::Spawn(format!("sidecar handshake failed: {detail}")))
             }
         }
     }
 
-    async fn handshake(&self, client: &SidecarClient) -> std::result::Result<HelloResult, String> {
-        let mesh = self.mesh.lock().clone();
-        let params = HelloParams {
-            protocol: PROTOCOL_VERSION,
-            host_version: self.supervisor.version().to_string(),
-            app_instance_id: self.supervisor.app_instance_id().to_string(),
-            boot_id: self.supervisor.current_boot_id().to_string(),
-            binaries: mesh.binaries,
-            defaults: mesh.defaults,
-            accounts: mesh.accounts,
+    async fn handshake(&self, client: &SidecarClient) -> std::result::Result<wire::MeshHelloResult, HandshakeError> {
+        let providers = wire::Providers {
+            orchestrator: self.orchestrator.load(Ordering::SeqCst),
         };
-        let hello: HelloResult = client
-            .call(method::HELLO, params, Some(Duration::from_secs(30)))
+        let params = wire::MeshHelloParams {
+            protocol: wire::PROTOCOL,
+            build_id: HOST_BUILD_ID.to_string(),
+            app_instance_id: self.supervisor.app_instance_id().to_string(),
+            providers,
+        };
+        let hello: wire::MeshHelloResult = match client
+            .call(method::HELLO, params, Some(HANDSHAKE_DEADLINE))
             .await
-            .map_err(|e| e.to_string())?;
-        if hello.protocol != PROTOCOL_VERSION {
-            return Err(format!(
-                "protocol mismatch: host speaks {PROTOCOL_VERSION}, sidecar speaks {}",
+        {
+            Ok(hello) => hello,
+            Err(SidecarCallError::Rpc(err)) if err.code == code::BUILD_MISMATCH => {
+                return Err(HandshakeError::VersionMismatch(format!(
+                    "host {HOST_BUILD_ID}, sidecar {}",
+                    err.data
+                        .as_ref()
+                        .and_then(|d| d.get("expected"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("?")
+                )));
+            }
+            Err(SidecarCallError::Rpc(err)) if err.code == code::PROTOCOL_MISMATCH => {
+                return Err(HandshakeError::Other(format!(
+                    "protocol mismatch: host speaks {}, the sidecar refused it",
+                    wire::PROTOCOL
+                )));
+            }
+            Err(err) => return Err(HandshakeError::Other(err.to_string())),
+        };
+        if hello.protocol != wire::PROTOCOL {
+            return Err(HandshakeError::Other(format!(
+                "protocol mismatch: host speaks {}, sidecar speaks {}",
+                wire::PROTOCOL,
                 hello.protocol
-            ));
+            )));
+        }
+        if hello.build_id != HOST_BUILD_ID {
+            return Err(HandshakeError::VersionMismatch(format!(
+                "host {HOST_BUILD_ID}, sidecar {}",
+                hello.build_id
+            )));
+        }
+        let mut configure = self.configure_params().await;
+        // configure carries the same presence the hello did.
+        configure.providers = providers;
+        let _: wire::MeshConfigureResult = client
+            .call(method::CONFIGURE, &configure, Some(HANDSHAKE_DEADLINE))
+            .await
+            .map_err(|e| HandshakeError::Other(format!("mesh.configure: {e}")))?;
+        {
+            let mut state = self.state.lock();
+            state.configured = configure.binaries.clone();
+            state.hello_orchestrator = Some(providers.orchestrator);
         }
         Ok(hello)
     }
 
+    /// `mesh.configure` from the current binaries, accounts and providers. The
+    /// binaries are resolved afresh each time (A12.6).
+    async fn configure_params(&self) -> wire::MeshConfigureParams {
+        let mut binaries = self.binaries.lock().clone();
+        let resolver = self.binary_resolver.lock().clone();
+        for vendor in Vendor::ALL {
+            if binaries.contains_key(&vendor) {
+                continue;
+            }
+            let found = match &resolver {
+                Some(resolve) => resolve(vendor).await,
+                None => self.default_binary(vendor),
+            };
+            if let Some(path) = found {
+                binaries.insert(vendor, path);
+            }
+        }
+        wire::MeshConfigureParams {
+            binaries,
+            accounts: self.accounts.lock().clone(),
+            providers: wire::Providers {
+                orchestrator: self.orchestrator.load(Ordering::SeqCst),
+            },
+        }
+    }
+
+    /// The pinned `agents.binaries` setting, else the first executable of the
+    /// vendor's command name on the resolved `PATH`; realpath'd. Never executed.
+    fn default_binary(&self, vendor: Vendor) -> Option<AbsPath> {
+        let (key, name) = match vendor {
+            Vendor::Claude => ("claude", "claude"),
+            Vendor::Codex => ("codex", "codex"),
+            Vendor::Cursor => ("cursorAgent", "cursor-agent"),
+            Vendor::Agy => ("agy", "agy"),
+        };
+        let pinned = self
+            .supervisor
+            .config()
+            .get()
+            .agent_binary(key)
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute() && crate::agents::path::is_executable(p));
+        let found = pinned.or_else(|| {
+            let dirs: Vec<PathBuf> = std::env::split_paths(&self.env_base.path).collect();
+            which_on(&dirs, name)
+        })?;
+        canonical_abs(&found)
+    }
+
+    /// Re-send `mesh.configure` when a sidecar is up (presence or accounts changed).
+    async fn reconfigure(&self) -> std::result::Result<(), IpcError> {
+        let Some(client) = self.client() else { return Ok(()) };
+        let mut configure = self.configure_params().await;
+        // The live generation keeps the presence its hello sent (A11.6).
+        if let Some(hello) = self.state.lock().hello_orchestrator {
+            configure.providers.orchestrator = hello;
+        }
+        match client
+            .call::<_, wire::MeshConfigureResult>(method::CONFIGURE, &configure, Some(HANDSHAKE_DEADLINE))
+            .await
+        {
+            Ok(_) => {
+                self.state.lock().configured = configure.binaries;
+                Ok(())
+            }
+            Err(err) => Err(self.ipc_error(err)),
+        }
+    }
+
+    /// Plan a spawn through the supervisor (A12.8): the §9.3 allowlist, then a
+    /// durable row before the process exists.
+    async fn plan(&self, request: SpawnRequest) -> Result<SpawnTicket> {
+        self.spawns.plan_spawn(request).await.map_err(|err| match err.code {
+            ErrorCode::Refused => GildeError::Refused {
+                reason: err
+                    .params
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("refused")
+                    .to_string(),
+            },
+            code => GildeError::Spawn(format!("the supervisor did not plan the spawn ({})", code.as_str())),
+        })
+    }
+
+    /// The key NAMES of the env the sidecar's processes get (never values).
+    fn env_keys(&self) -> Vec<String> {
+        self.supervisor
+            .compose_env(self.env_base.clone(), None, "")
+            .into_keys()
+            .chain(std::iter::once(ENV_HOST_PID.to_string()))
+            .collect()
+    }
+
     /// `<runtime> --version`, 5 s cap, through the registry like every spawn.
     async fn self_test(&self) -> Result<()> {
-        let argv = vec![
-            self.runtime.node.display().to_string(),
-            "--version".to_string(),
-        ];
-        let plan = SpawnPlan::new(ProcKind::Probe, argv, PathBuf::from("/"));
-        // `Arc` only so the blocking `mark_running` below can own a handle; the
-        // guard still lives to the end of this function, and dropping it while
-        // armed still closes the row as `lost`.
-        let guard = Arc::new(self.supervisor.plan_spawn(plan).await?);
+        let ticket = self.plan(self_test_request(&self.runtime.node, self.env_keys())?).await?;
 
         let mut cmd = tokio_command_grouped(&self.runtime.node);
         cmd.arg("--version")
@@ -811,38 +1550,37 @@ impl SidecarManager {
             .env_clear()
             .envs(
                 self.supervisor
-                    .compose_env(self.env_base.clone(), None, guard.env_marker()),
+                    .compose_env(self.env_base.clone(), None, &ticket.env_marker),
             )
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        // As above: dropping the armed guard closes the row as `lost`.
-        let child = cmd
-            .spawn()
-            .map_err(|e| GildeError::SidecarRuntimeUnusable {
-                path: self.runtime.node.display().to_string(),
-                stderr: e.to_string(),
-            })?;
+        let child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                self.spawns.mark_exited(&ticket, ExitInfo { code: None, signal: None }).await;
+                return Err(GildeError::SidecarRuntimeUnusable {
+                    path: self.runtime.node.display().to_string(),
+                    stderr: e.to_string(),
+                });
+            }
+        };
         let pid = child.id().map(|p| p as i32).unwrap_or(-1);
-        {
-            // Same reason as `start_locked`: kernel start time + a durable write.
-            let guard = guard.clone();
-            let _ = tokio::task::spawn_blocking(move || guard.mark_running(pid, pid)).await;
-        }
+        let _ = self.spawns.mark_running(&ticket, pid).await;
 
         let output = match tokio::time::timeout(SELF_TEST_TIMEOUT, child.wait_with_output()).await {
             Ok(Ok(output)) => output,
             Ok(Err(e)) => {
-                let _ = guard.mark_exited(None, None);
+                self.spawns.mark_exited(&ticket, ExitInfo { code: None, signal: None }).await;
                 return Err(GildeError::SidecarRuntimeUnusable {
                     path: self.runtime.node.display().to_string(),
                     stderr: e.to_string(),
                 });
             }
             Err(_) => {
-                let signal = terminate_group(pid, Duration::from_millis(500)).await;
-                let _ = guard.mark_exited(None, signal);
+                let signal = terminate_group(pid, Duration::from_millis(500), Escalate::IfIgnored).await;
+                self.spawns.mark_exited(&ticket, ExitInfo { code: None, signal }).await;
                 return Err(GildeError::SidecarRuntimeUnusable {
                     path: self.runtime.node.display().to_string(),
                     stderr: format!(
@@ -854,7 +1592,7 @@ impl SidecarManager {
         };
 
         let code = output.status.code();
-        let _ = guard.mark_exited(code, None);
+        self.spawns.mark_exited(&ticket, ExitInfo { code, signal: None }).await;
         if !output.status.success() {
             return Err(GildeError::SidecarRuntimeUnusable {
                 path: self.runtime.node.display().to_string(),
@@ -862,14 +1600,6 @@ impl SidecarManager {
                     .unwrap_or_else(|e| format!("<{} non-utf8 stderr bytes>", e.as_bytes().len())),
             });
         }
-        let version = String::from_utf8(output.stdout).unwrap_or_default();
-        tracing::debug!(
-            target: "sidecar",
-            runtime = %self.runtime.node.display(),
-            version = %version.trim(),
-            source = self.runtime.node_source.as_str(),
-            "sidecar runtime self-test passed"
-        );
         Ok(())
     }
 
@@ -878,54 +1608,82 @@ impl SidecarManager {
     /// Close the channel and make sure the process is gone. Returns the
     /// generation that was taken down, if any.
     async fn take_down(&self, reason: &str, deliberate: bool) -> Option<i64> {
-        let (client, pid, guard, generation) = {
-            let mut state = self.state.lock();
-            if state.client.is_none() && state.child_pid.is_none() {
-                return None;
-            }
-            (
-                state.client.take(),
-                state.child_pid.take(),
-                state.guard.take(),
-                state.generation,
-            )
-        };
+        let detached = self.detach()?;
+        Some(self.finish_detached(detached, reason, deliberate, Escalate::IfIgnored).await)
+    }
 
+    /// Take the live generation out of the state (synchronously).
+    fn detach(&self) -> Option<Detached> {
+        let mut state = self.state.lock();
+        if state.client.is_none() && state.child_pid.is_none() {
+            return None;
+        }
+        state.roster.clear();
+        state.configured.clear();
+        state.hello_orchestrator = None;
+        Some(Detached {
+            client: state.client.take(),
+            pid: state.child_pid.take(),
+            guard: state.guard.take(),
+            generation: state.generation,
+        })
+    }
+
+    /// Close and stop a detached generation; its turns end, its orphans are
+    /// left for the sweep.
+    async fn finish_detached(&self, detached: Detached, reason: &str, deliberate: bool, escalate: Escalate) -> i64 {
+        let Detached {
+            client,
+            pid,
+            guard,
+            generation,
+        } = detached;
         if let Some(client) = client {
             client.close(reason);
         }
         let mut signal = None;
         if let Some(pid) = pid.filter(|p| *p > 0) {
-            signal = terminate_group(pid, TERMINATE_GRACE).await;
+            signal = terminate_group(pid, TERMINATE_GRACE, escalate).await;
         }
-        if let Some(guard) = guard {
-            // `signal` is what `terminate_group` ended up using — SIGKILL when
-            // the sidecar ignored the SIGTERM — not the one we opened with.
-            let _ = guard.mark_exited(None, signal);
+        if let Some(ticket) = guard {
+            self.spawns.mark_exited(&ticket, ExitInfo { code: None, signal }).await;
         }
         self.settle_orphan_guards(reason);
+        self.fail_turns_of(generation);
         let _ = self.deaths.send(SidecarDeath {
             generation,
             reason: reason.to_string(),
             deliberate,
         });
-        Some(generation)
+        generation
     }
 
-    /// Every child the dead generation had registered but never reported an exit
-    /// for. The rows stay `running` for the reaper (it owns the fence check and
-    /// the kill); what we close here is only our own bookkeeping.
+    /// Every child the dead generation had registered but never reported an
+    /// exit for: the rows stay `running` for the reaper's fenced sweep.
     fn settle_orphan_guards(&self, reason: &str) {
         let ids: Vec<String> = self.guards.iter().map(|e| e.key().clone()).collect();
         for id in ids {
-            if let Some((_, guard)) = self.guards.remove(&id) {
+            if let Some((_, ticket)) = self.guards.remove(&id) {
                 tracing::debug!(
                     target: "sidecar",
-                    spawn_id = %guard.spawn_id(),
+                    spawn_id = %ticket.spawn_id,
                     reason,
                     "a sidecar child outlived its generation; leaving the row for the sweep"
                 );
             }
+        }
+    }
+
+    /// End every turn of a dead generation with one `Error{HELPER_RESTARTED}`.
+    fn fail_turns_of(&self, generation: i64) {
+        let doomed: Vec<Arc<TurnRoute>> = self
+            .turns
+            .iter()
+            .filter(|e| e.value().generation <= generation)
+            .map(|e| e.value().clone())
+            .collect();
+        for route in doomed {
+            route.fail_helper_restarted();
         }
     }
 
@@ -939,27 +1697,20 @@ impl SidecarManager {
             None => tracing::debug!(
                 target: "sidecar",
                 generation = dead_generation,
-                "no generation sweeper installed yet (T11); rows are left for the boot sweep"
+                "no generation sweeper installed; rows are left for the boot sweep"
             ),
         }
     }
 
     // -- supervision tasks ---------------------------------------------------
 
-    fn spawn_stderr_drain(
-        self: &Arc<Self>,
-        generation: i64,
-        stderr: tokio::process::ChildStderr,
-    ) {
+    fn spawn_stderr_drain(self: &Arc<Self>, generation: i64, stderr: tokio::process::ChildStderr) {
         let manager = Arc::downgrade(self);
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             loop {
                 match lines.next_line().await {
                     Ok(Some(line)) => {
-                        // stderr is not the protocol: it is plain log text
-                        // (DESIGN §5-1). It goes to `tracing` under its own
-                        // target and into the tail kept for the down banner.
                         tracing::info!(target: "sidecar", generation, "{line}");
                         let Some(manager) = manager.upgrade() else { return };
                         let mut tail = manager.stderr_tail.lock();
@@ -982,22 +1733,25 @@ impl SidecarManager {
         self: &Arc<Self>,
         generation: i64,
         mut child: tokio::process::Child,
-        guard: Arc<SpawnGuard>,
+        ticket: SpawnTicket,
     ) {
         let manager = Arc::downgrade(self);
+        let spawns = self.spawns.clone();
         tokio::spawn(async move {
             let status = child.wait().await;
             let (code, signal) = match &status {
-                Ok(status) => (
-                    status.code(),
-                    crate::supervise::spawn::exit_signal_of(status),
-                ),
+                Ok(status) => (status.code(), crate::supervise::spawn::exit_signal_of(status)),
                 Err(_) => (None, None),
             };
-            let _ = guard.mark_exited(code, signal);
+            spawns.mark_exited(&ticket, ExitInfo { code, signal }).await;
 
             let Some(manager) = manager.upgrade() else { return };
+            if code == Some(wire::EXIT_BUILD_MISMATCH) {
+                // The sidecar refused our build id (§4.5): latch, never restart.
+                manager.state.lock().version_mismatch = true;
+            }
             let reason = match (code, signal) {
+                (Some(78), _) => "the sidecar is from another build (exit 78)".to_string(),
                 (_, Some(sig)) => format!("sidecar killed by signal {sig}"),
                 (Some(code), _) => format!("sidecar exited with code {code}"),
                 _ => "sidecar exited".to_string(),
@@ -1006,11 +1760,7 @@ impl SidecarManager {
         });
     }
 
-    fn spawn_fault_watcher(
-        self: &Arc<Self>,
-        generation: i64,
-        mut faults: mpsc::UnboundedReceiver<ClientFault>,
-    ) {
+    fn spawn_fault_watcher(self: &Arc<Self>, generation: i64, mut faults: mpsc::UnboundedReceiver<ClientFault>) {
         let manager = Arc::downgrade(self);
         tokio::spawn(async move {
             while let Some(fault) = faults.recv().await {
@@ -1021,7 +1771,7 @@ impl SidecarManager {
                 match fault {
                     ClientFault::OversizeLine { bytes } => {
                         // A protocol violation, not a crash: kill the process so
-                        // the exit watcher takes the normal restart path.
+                        // the exit watcher takes the restart path (generation + 1).
                         manager.set_fault_reason(format!(
                             "the sidecar sent a {bytes} byte line (cap {MAX_LINE_BYTES}); restarting"
                         ));
@@ -1031,8 +1781,6 @@ impl SidecarManager {
                     ClientFault::Io { detail } => {
                         manager.note_error(format!("sidecar channel io error: {detail}"));
                     }
-                    // The exit watcher owns this transition; a closed pipe with a
-                    // live process is handled by the health loop.
                     ClientFault::StreamEnded => return,
                 }
             }
@@ -1058,16 +1806,8 @@ impl SidecarManager {
                     Ok(_) => misses = 0,
                     Err(SidecarCallError::Timeout { .. }) => {
                         misses += 1;
-                        tracing::warn!(
-                            target: "sidecar",
-                            generation,
-                            misses,
-                            "mesh.ping missed its deadline"
-                        );
+                        tracing::warn!(target: "sidecar", generation, misses, "mesh.ping missed its deadline");
                         if misses >= PING_MISSES_BEFORE_HANG {
-                            // *Hung*, which is not the same as *dead*: the
-                            // process is alive and unresponsive, so we kill it
-                            // ourselves and take the restart path (DESIGN §5-3).
                             manager.set_fault_reason(format!(
                                 "the sidecar missed {misses} consecutive pings; killing it"
                             ));
@@ -1076,8 +1816,6 @@ impl SidecarManager {
                             return;
                         }
                     }
-                    // Anything else means the channel is already gone; the exit
-                    // watcher owns that transition.
                     Err(_) => return,
                 }
             }
@@ -1093,21 +1831,19 @@ impl SidecarManager {
             state.child_pid
         };
         if let Some(pid) = pid.filter(|p| *p > 0) {
-            terminate_group(pid, TERMINATE_GRACE).await;
+            terminate_group(pid, TERMINATE_GRACE, Escalate::IfIgnored).await;
         }
     }
 
     /// The single funnel for "a generation is no longer usable".
     async fn on_generation_died(self: Arc<Self>, dead_generation: i64, reason: String) {
-        let deliberate = self.shutting_down.load(Ordering::SeqCst);
-        // A fault we diagnosed ourselves outranks the exit status: "signal 15"
-        // is how it died, not why.
+        let deliberate = self.shutting_down.load(Ordering::SeqCst)
+            || self.state.lock().retired == Some(dead_generation);
         let reason = match self.take_fault_reason() {
             Some(fault) => format!("{fault} — {reason}"),
             None => reason,
         };
         {
-            // Stage 1 — tear the generation down under the lifecycle lock.
             let _lock = self.lifecycle.lock().await;
             {
                 let state = self.state.lock();
@@ -1115,102 +1851,92 @@ impl SidecarManager {
                     return; // already superseded
                 }
             }
-
-            let short_lived = {
+            let had_client = {
                 let mut state = self.state.lock();
-                let short = state
-                    .started_at
-                    .map(|at| at.elapsed() < CRASH_WINDOW)
-                    .unwrap_or(false);
+                let had = state.client.is_some() || state.child_pid.is_some();
                 if let Some(client) = state.client.take() {
                     client.close(&reason);
                 }
                 state.child_pid = None;
                 state.guard = None;
-                state.hello = None;
+                state.roster.clear();
+                state.configured.clear();
                 state.started_at = None;
-                short
+                had
             };
 
             self.settle_orphan_guards(&reason);
-            let _ = self.deaths.send(SidecarDeath {
-                generation: dead_generation,
-                reason: reason.clone(),
-                deliberate,
-            });
+            self.fail_turns_of(dead_generation);
+            if had_client {
+                let _ = self.deaths.send(SidecarDeath {
+                    generation: dead_generation,
+                    reason: reason.clone(),
+                    deliberate,
+                });
+            }
 
-            if deliberate {
-                self.set_state(SidecarState::Down, None);
+            let mismatch = self.state.lock().version_mismatch;
+            if deliberate || mismatch {
+                self.set_state(SidecarState::Down, mismatch.then(|| reason.clone()));
                 self.run_sweeper(dead_generation).await;
                 return;
             }
 
             tracing::warn!(target: "sidecar", generation = dead_generation, reason = %reason, "sidecar generation died");
             self.note_error(reason.clone());
+
+            // §10.4: three deaths within five minutes → it stays down.
+            let stays_down = {
+                let mut state = self.state.lock();
+                let now = Instant::now();
+                state.deaths.push_back(now);
+                while state
+                    .deaths
+                    .front()
+                    .is_some_and(|t| now.duration_since(*t) > DEATH_WINDOW)
+                {
+                    state.deaths.pop_front();
+                }
+                if state.deaths.len() >= DEATHS_BEFORE_STAYING_DOWN {
+                    state.stays_down = true;
+                }
+                state.stays_down
+            };
             self.set_state(SidecarState::Restarting, Some(reason.clone()));
 
-            // The sweep runs BEFORE any replacement can take work, which is what
-            // stops a crash loop from stacking orphaned `claude -p` children
-            // (DESIGN §5-10 rule 3).
+            // The sweep runs BEFORE any replacement can take work.
             self.run_sweeper(dead_generation).await;
 
-            let over_limit = {
-                let mut state = self.state.lock();
-                if short_lived {
-                    state.crash_streak += 1;
-                } else {
-                    state.crash_streak = 0;
-                }
-                state.crash_streak >= CRASH_LIMIT
-            };
-            if over_limit {
-                let tail = self.stderr_tail();
+            if stays_down {
                 tracing::error!(
                     target: "sidecar",
-                    crashes = CRASH_LIMIT,
-                    "circuit breaker open: the sidecar keeps crashing; not restarting"
+                    deaths = DEATHS_BEFORE_STAYING_DOWN,
+                    window_secs = DEATH_WINDOW.as_secs(),
+                    "the sidecar keeps dying; it stays down (SIDECAR_DOWN for its commands)"
                 );
                 self.set_state(
                     SidecarState::Down,
                     Some(format!(
-                        "the sidecar crashed {CRASH_LIMIT} times within {}s of starting; last stderr: {}",
-                        CRASH_WINDOW.as_secs(),
-                        tail.last().cloned().unwrap_or_default()
+                        "the sidecar died {DEATHS_BEFORE_STAYING_DOWN} times within {} minutes; last: {reason}",
+                        DEATH_WINDOW.as_secs() / 60
                     )),
                 );
                 return;
             }
         }
-
-        // Stage 2 — back off, then try again. The lock is released while we
-        // sleep so a user-initiated restart is never queued behind a backoff.
         self.clone().restart_with_backoff(dead_generation).await;
     }
 
     async fn restart_with_backoff(self: Arc<Self>, dead_generation: i64) {
         loop {
-            // The ladder is indexed by the **consecutive** crash count, not by
-            // the lifetime restart total. A sidecar that has been up for a week
-            // and dies once must come back after 1 s; indexing by `restarts`
-            // meant its fifth restart of the week waited a full minute for no
-            // reason, and the counter never came back down.
-            //
-            // `restarts` is still incremented — it is the number the status bar
-            // shows — it just no longer decides how long we wait.
             let (attempt, restarts) = {
                 let mut state = self.state.lock();
                 state.restarts += 1;
-                (state.crash_streak.max(1), state.restarts)
+                (state.deaths.len().max(1), state.restarts)
             };
-            let index = ((attempt as usize) - 1).min(RESTART_BACKOFF_SECS.len() - 1);
+            let index = (attempt - 1).min(RESTART_BACKOFF_SECS.len() - 1);
             let wait = Duration::from_secs(RESTART_BACKOFF_SECS[index]);
-            tracing::info!(
-                target: "sidecar",
-                crash_streak = attempt,
-                restarts,
-                wait_secs = wait.as_secs(),
-                "restarting the sidecar after a backoff"
-            );
+            tracing::info!(target: "sidecar", restarts, wait_secs = wait.as_secs(), "restarting the sidecar after a backoff");
             tokio::time::sleep(wait).await;
 
             let _lock = self.lifecycle.lock().await;
@@ -1219,60 +1945,33 @@ impl SidecarManager {
             }
             {
                 let state = self.state.lock();
-                if state.client.is_some() || state.generation != dead_generation {
-                    return; // someone else already brought one up
+                if state.client.is_some()
+                    || state.generation != dead_generation
+                    || state.version_mismatch
+                    || state.stays_down
+                {
+                    return;
                 }
             }
             match self.start_locked().await {
                 Ok(()) => return,
                 Err(err) => {
                     tracing::error!(target: "sidecar", error = %err, "sidecar restart failed");
-                    self.set_state(SidecarState::Down, Some(err.to_string()));
-                    let over_limit = {
+                    let give_up = {
                         let mut state = self.state.lock();
-                        state.crash_streak += 1;
-                        state.crash_streak >= CRASH_LIMIT
+                        state.deaths.push_back(Instant::now());
+                        if state.deaths.len() >= DEATHS_BEFORE_STAYING_DOWN {
+                            state.stays_down = true;
+                        }
+                        state.stays_down || state.version_mismatch
                     };
-                    if over_limit {
-                        tracing::error!(
-                            target: "sidecar",
-                            "circuit breaker open: giving up on restarting the sidecar"
-                        );
+                    self.set_state(SidecarState::Down, Some(err.to_string()));
+                    if give_up {
                         return;
                     }
                 }
             }
         }
-    }
-
-    /// Clear the consecutive-crash counter once this generation has been up
-    /// longer than [`CRASH_WINDOW`] — the definition of a *healthy start*.
-    ///
-    /// Without it the counter only ever fell at a death that happened to be
-    /// long-lived, so a sidecar that came up cleanly still carried four old
-    /// crashes into its next backoff, and the circuit breaker could open on
-    /// five failures spread across an entire session. It is deliberately gated
-    /// on uptime rather than on `Ready`: a generation that handshakes and then
-    /// dies at 4.9 s is exactly the crash loop the breaker exists to catch.
-    fn spawn_healthy_start_reset(self: &Arc<Self>, generation: i64) {
-        let weak = Arc::downgrade(self);
-        tokio::spawn(async move {
-            tokio::time::sleep(CRASH_WINDOW).await;
-            let Some(manager) = weak.upgrade() else {
-                return;
-            };
-            let mut state = manager.state.lock();
-            // Still the same, still up: this start earned the reset.
-            if state.generation == generation && state.client.is_some() && state.crash_streak > 0 {
-                tracing::info!(
-                    target: "sidecar",
-                    generation,
-                    cleared = state.crash_streak,
-                    "sidecar has been healthy past the crash window; clearing the crash streak"
-                );
-                state.crash_streak = 0;
-            }
-        });
     }
 
     // -- state bookkeeping ---------------------------------------------------
@@ -1281,8 +1980,6 @@ impl SidecarManager {
         self.state.lock().last_error = Some(detail);
     }
 
-    /// Record *why* we are about to kill this generation, so the restart reports
-    /// the cause rather than the signal we used to act on it.
     fn set_fault_reason(&self, reason: String) {
         self.note_error(reason.clone());
         *self.fault_reason.lock() = Some(reason);
@@ -1320,22 +2017,32 @@ impl SidecarManager {
     }
 
     fn publish_status(&self) {
-        let status = self.status();
-        let _ = self.statuses.send(status.clone());
-        if let Some(events) = self.events.lock().clone() {
-            events.emit(
-                SIDECAR_STATE,
-                SidecarStateEvent {
-                    state: status.state,
-                    generation: status.generation.max(0) as u64,
-                    restarts: status.restarts,
-                    last_error: status.last_error.clone(),
-                },
-            );
-        }
+        let _ = self.statuses.send(self.current_status());
     }
 
-    // -- the supervision seam (DESIGN §5-5) ----------------------------------
+    // -- the supervision seam (§4.5 host.*) ----------------------------------
+
+    /// Whether `cmd` may be spawned by the sidecar (§4.5, §9.3): exactly a
+    /// binary the live generation was configured with, or the bundled node.
+    fn spawn_allowed(&self, cmd: &str) -> bool {
+        let path = Path::new(cmd);
+        if !path.is_absolute() {
+            return false;
+        }
+        let canonical = std::fs::canonicalize(path).ok();
+        let same = |allowed: &Path| -> bool {
+            allowed == path
+                || std::fs::canonicalize(allowed)
+                    .ok()
+                    .zip(canonical.as_ref())
+                    .is_some_and(|(a, c)| &a == c)
+        };
+        if same(&self.runtime.node) {
+            return true;
+        }
+        let state = self.state.lock();
+        state.configured.values().any(|p| same(Path::new(p.as_str())))
+    }
 
     async fn handle_host_call(
         self: Arc<Self>,
@@ -1345,126 +2052,70 @@ impl SidecarManager {
     ) -> std::result::Result<Value, RpcErrorObject> {
         match method {
             host_method::REGISTER_SPAWN => {
-                let p: RegisterSpawnParams = decode(params)?;
-                let kind = match p.kind.as_str() {
-                    "probe" => ProcKind::Probe,
-                    "gateway" => ProcKind::Gateway,
-                    _ => ProcKind::Headless,
-                };
-                let mut argv = Vec::with_capacity(p.args.len() + 1);
-                argv.push(p.cmd.clone());
-                argv.extend(p.args.iter().cloned());
-
-                let cwd = p
-                    .cwd
-                    .clone()
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from("/"));
-                let mut plan = SpawnPlan::new(kind, argv, cwd).generation(generation);
-                if !p.vendor.is_empty() && p.vendor != "unknown" {
-                    plan = plan.vendor(p.vendor.clone());
+                let p: wire::RegisterSpawnParams = decode(params)?;
+                if !self.spawn_allowed(&p.cmd) {
+                    tracing::warn!(
+                        target: "sidecar",
+                        generation,
+                        kind = ?p.kind,
+                        "refused a sidecar spawn: argv[0] is not a configured vendor binary"
+                    );
+                    return Err(RpcErrorObject::new(code::REFUSED, "notAllowlisted")
+                        .with_data(json!({"reason": "notAllowlisted"})));
                 }
-                if !p.run_id.is_empty() {
-                    plan = plan.run(p.run_id.clone());
-                }
-
-                // The durable INSERT completes before this returns — that is the
-                // whole reason the channel is bidirectional (DESIGN §5-5).
-                let guard = self.supervisor.plan_spawn(plan).await.map_err(|e| {
-                    RpcErrorObject::new(
-                        code::INTERNAL_ERROR,
-                        format!("could not record the spawn: {e}"),
-                    )
-                })?;
-                let marker = guard.env_marker().to_string();
+                let request = register_spawn_request(&p, generation)?;
+                // The durable INSERT completes before this returns — the reason
+                // the channel is bidirectional.
+                let ticket = self.spawns.plan_spawn(request).await.map_err(|e| rpc_error_of_plan(&e))?;
                 tracing::debug!(
                     target: "sidecar",
                     generation,
-                    sidecar_spawn_id = %p.spawn_id,
-                    spawn_id = %marker,
-                    vendor = %p.vendor,
-                    kind = %p.kind,
+                    spawn_id = %ticket.spawn_id,
+                    kind = ?p.kind,
                     // Key NAMES only: an env value must never reach a host log.
                     env_keys = p.env_keys.len(),
                     "registered a sidecar spawn"
                 );
-                self.guards.insert(p.spawn_id.clone(), Arc::new(guard));
-                to_value(RegisterSpawnResult {
+                let marker = ticket.env_marker.clone();
+                self.guards.insert(p.spawn_id.clone(), ticket);
+                to_value(wire::RegisterSpawnResult {
                     ok: true,
                     env_marker: marker,
                 })
             }
             host_method::SPAWNED => {
-                let spawn_id = spawn_id_of(&params)?;
-                let p: SpawnedParams = decode(params)?;
-                match self.guards.get(&spawn_id).map(|g| g.clone()) {
-                    Some(guard) => {
-                        let pgid = if p.pgid > 0 { p.pgid } else { p.pid };
-                        // `mark_running` reads the kernel start time, which is a
-                        // blocking `libproc` call plus a SQLite write.
-                        let result = tokio::task::spawn_blocking(move || {
-                            guard.mark_running(p.pid, pgid)
-                        })
-                        .await;
-                        match result {
-                            Ok(Ok(())) => to_value(json!({"ok": true})),
-                            Ok(Err(e)) => Err(RpcErrorObject::new(
-                                code::INTERNAL_ERROR,
-                                format!("could not mark the child running: {e}"),
-                            )),
-                            Err(e) => Err(RpcErrorObject::new(
-                                code::INTERNAL_ERROR,
-                                format!("registry write panicked: {e}"),
-                            )),
-                        }
-                    }
-                    None => Err(RpcErrorObject::new(
-                        code::INVALID_PARAMS,
-                        format!("unknown spawnId: {spawn_id}"),
-                    )),
+                let p: wire::SpawnedParams = decode(params)?;
+                match self.guards.get(&p.spawn_id).map(|g| g.clone()) {
+                    Some(ticket) => match self.spawns.mark_running(&ticket, p.pid).await {
+                        Ok(()) => to_value(json!({"ok": true})),
+                        Err(e) => Err(RpcErrorObject::new(
+                            code::INTERNAL_ERROR,
+                            format!("could not mark the child running ({})", e.code.as_str()),
+                        )),
+                    },
+                    None => Err(RpcErrorObject::new(code::INVALID_PARAMS, "unknown spawnId")),
                 }
             }
             host_method::EXITED => {
-                let spawn_id = spawn_id_of(&params)?;
-                let p: ExitedParams = decode(params)?;
-                match self.guards.remove(&spawn_id) {
-                    Some((_, guard)) => {
-                        // The name → number map is the registry's, not Node's:
-                        // `proc_registry.exit_signal` is an integer column that
-                        // the Process Monitor renders.
+                let p: wire::ExitedParams = decode(params)?;
+                match self.guards.remove(&p.spawn_id) {
+                    Some((_, ticket)) => {
                         let signal = p.signal.as_deref().and_then(types::signal_number);
-                        // T17 note: `exitCode: null` + `SIGKILL` is how the
-                        // duplex usage probe ends a CLI it has already read the
-                        // answer from. The row records signal 9 either way —
-                        // that is what happened — but it is logged as the
-                        // deliberate close it is, so a reader of the sidecar log
-                        // does not chase a crash that never happened.
                         if types::is_deliberate_close(p.exit_code, p.signal.as_deref()) {
-                            tracing::debug!(
-                                target: "sidecar",
-                                generation,
-                                sidecar_spawn_id = %spawn_id,
-                                spawn_id = %guard.spawn_id(),
-                                "a sidecar child was closed deliberately after its output was read"
-                            );
+                            tracing::debug!(target: "sidecar", generation, "a sidecar child was closed after its output was read");
                         }
-                        let result =
-                            tokio::task::spawn_blocking(move || guard.mark_exited(p.exit_code, signal))
-                                .await;
-                        match result {
-                            Ok(Ok(())) => to_value(json!({"ok": true})),
-                            Ok(Err(e)) => Err(RpcErrorObject::new(
-                                code::INTERNAL_ERROR,
-                                format!("could not settle the child row: {e}"),
-                            )),
-                            Err(e) => Err(RpcErrorObject::new(
-                                code::INTERNAL_ERROR,
-                                format!("registry write panicked: {e}"),
-                            )),
-                        }
+                        self.spawns
+                            .mark_exited(
+                                &ticket,
+                                ExitInfo {
+                                    code: p.exit_code,
+                                    signal,
+                                },
+                            )
+                            .await;
+                        to_value(json!({"ok": true}))
                     }
-                    // Not an error worth failing the sidecar over: the row is
-                    // settled by the reaper either way.
+                    // The row is settled by the reaper either way.
                     None => to_value(json!({"ok": true})),
                 }
             }
@@ -1479,84 +2130,404 @@ impl SidecarManager {
         }
     }
 
-    /// `cco.team.snapshot` (team contract v2 §8.2): one team's whole view from the
-    /// read-only observer, relayed as `gilde://team/snapshot` — see
-    /// [`team_snapshot_event`] for what is checked and stamped on the way.
-    fn team_snapshot(&self, generation: i64, params: Value) {
+    /// `turn.event` → the turn's route. Unknown fields, an unknown turn or an
+    /// out-of-order `seq` are dropped and logged, never guessed (§13.7).
+    fn turn_event(&self, generation: i64, params: Value) {
+        let p: wire::TurnEventParams = match serde_json::from_value(params) {
+            Ok(p) => p,
+            Err(err) => {
+                tracing::warn!(target: "sidecar", generation, error = %err, "turn.event did not match the contract; dropped");
+                return;
+            }
+        };
+        let Some(route) = self.turns.get(&p.turn_id).map(|r| r.clone()) else {
+            tracing::warn!(target: "sidecar", generation, "turn.event for an unknown turn; dropped");
+            return;
+        };
+        if route.generation != generation {
+            tracing::warn!(target: "sidecar", generation, "turn.event from another generation; dropped");
+            return;
+        }
+        if route.push(p.seq, p.event) == Admit::Rejected {
+            tracing::warn!(target: "sidecar", generation, seq = p.seq, "turn.event out of order or after the end; dropped");
+        }
+    }
+
+    /// `orch.snapshot` → the team cache and the subscribers.
+    fn orch_snapshot(&self, generation: i64, params: Value) {
         let Some(event) = team_snapshot_event(generation, params, owner_start_ms) else {
             return;
         };
         self.team_cache
             .apply_view(event.generation, event.rev, &event.team_id, event.view.as_ref());
-        if let Some(events) = self.events.lock().clone() {
-            events.emit(TEAM_SNAPSHOT, event);
-        }
+        let _ = self.orch_snapshots.send(event);
     }
 
     fn host_log(&self, params: Value) {
-        let Ok(p) = serde_json::from_value::<HostLogParams>(params) else {
+        let Ok(p) = serde_json::from_value::<wire::HostLogParams>(params) else {
+            tracing::warn!(target: "sidecar", "host.log did not match the contract; dropped");
             return;
         };
-        let fields = p
-            .fields
-            .as_ref()
-            .map(ToString::to_string)
-            .unwrap_or_default();
-        match p.level.as_str() {
-            "error" => tracing::error!(target: "sidecar", fields = %fields, "{}", p.msg),
-            "warn" => tracing::warn!(target: "sidecar", fields = %fields, "{}", p.msg),
-            "debug" => tracing::debug!(target: "sidecar", fields = %fields, "{}", p.msg),
-            _ => tracing::info!(target: "sidecar", fields = %fields, "{}", p.msg),
+        let fields = Value::Object(p.fields).to_string();
+        match p.level {
+            wire::HostLogLevel::Error => tracing::error!(target: "sidecar", fields = %fields, "{}", p.msg),
+            wire::HostLogLevel::Warn => tracing::warn!(target: "sidecar", fields = %fields, "{}", p.msg),
+            wire::HostLogLevel::Debug => tracing::debug!(target: "sidecar", fields = %fields, "{}", p.msg),
+            wire::HostLogLevel::Info => tracing::info!(target: "sidecar", fields = %fields, "{}", p.msg),
+        }
+    }
+
+    // -- the SidecarApi plumbing ---------------------------------------------
+
+    /// Wait for `Ready` up to `wait`, starting lazily if nothing is running.
+    async fn await_ready(&self, wait: Duration) -> std::result::Result<(), IpcError> {
+        {
+            let state = self.state.lock();
+            if state.version_mismatch {
+                return Err(IpcError::version_mismatch());
+            }
+            if state.stays_down {
+                return Err(IpcError::sidecar_down());
+            }
+            if state.client.is_some() && state.state == SidecarState::Ready {
+                return Ok(());
+            }
+            if state.state == SidecarState::Restarting {
+                return Err(IpcError::sidecar_down());
+            }
+        }
+        if !self.supervisor.config().get().sidecar.enabled {
+            return Err(IpcError::sidecar_down().param("reason", "disabled"));
+        }
+        let mut statuses = self.statuses.subscribe();
+        self.kick_lazy_start();
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            {
+                let state = self.state.lock();
+                if state.version_mismatch {
+                    return Err(IpcError::version_mismatch());
+                }
+                if state.client.is_some() && state.state == SidecarState::Ready {
+                    return Ok(());
+                }
+                if state.stays_down {
+                    return Err(IpcError::sidecar_down());
+                }
+                if !state.starting && state.state == SidecarState::Down && state.last_error.is_some() && state.client.is_none() {
+                    // The start failed (runtime unusable, handshake refused…).
+                    return Err(IpcError::sidecar_down());
+                }
+            }
+            match tokio::time::timeout_at(deadline, statuses.recv()).await {
+                Ok(Ok(_)) | Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => {
+                    return Err(IpcError::not_ready("sidecarStarting"));
+                }
+            }
+        }
+    }
+
+    async fn probe_call<R: DeserializeOwned>(&self, method_name: &str, p: &wire::ProbeParams) -> std::result::Result<R, IpcError> {
+        self.await_ready(ENSURE_WAIT).await?;
+        self.call_detailed::<_, R>(method_name, p, Some(PROBE_DEADLINE))
+            .await
+            .map_err(|e| self.ipc_error(e))
+    }
+}
+
+/// Whether a stop may escalate to SIGKILL: only a crashed or hung generation
+/// of Gilde's own helper (§9.8); a presence stop never does (A11.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Escalate {
+    IfIgnored,
+    Never,
+}
+
+/// A generation taken out of the live state, still to be closed and stopped.
+struct Detached {
+    client: Option<SidecarClient>,
+    pid: Option<i32>,
+    guard: Option<SpawnTicket>,
+    generation: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PresenceCheck {
+    /// No sidecar, or another generation: nothing to stop.
+    Gone,
+    /// The running generation already has the wanted value.
+    Unchanged,
+    /// Requests or turns in flight (or not ready yet): wait.
+    Busy,
+    Idle,
+}
+
+/// How often a presence stop re-checks for idleness.
+const PRESENCE_IDLE_POLL: Duration = Duration::from_millis(100);
+
+#[derive(Debug)]
+enum HandshakeError {
+    VersionMismatch(String),
+    Other(String),
+}
+
+/// Legacy binaries → protocol-2 binaries (absolute, canonical paths only).
+fn binaries_of(paths: &BinaryPaths) -> BTreeMap<Vendor, AbsPath> {
+    let mut out = BTreeMap::new();
+    for (vendor, path) in [
+        (Vendor::Claude, &paths.claude),
+        (Vendor::Codex, &paths.codex),
+        (Vendor::Cursor, &paths.cursor_agent),
+        (Vendor::Agy, &paths.agy),
+    ] {
+        if let Some(p) = path.as_deref().filter(|p| Path::new(p).is_absolute()) {
+            if let Some(abs) = canonical_abs(Path::new(p)) {
+                out.insert(vendor, abs);
+            }
+        }
+    }
+    out
+}
+
+/// A fresh correlation id for an `INTERNAL` error (never content).
+fn correlation_id() -> String {
+    format!("sc-{}", uuid::Uuid::now_v7().simple())
+}
+
+/// The contract error of a JSON-RPC error from the sidecar (§4.4, §4.5).
+pub fn ipc_error_of_rpc(err: &RpcErrorObject) -> IpcError {
+    let data = err.data.as_ref();
+    let str_of = |key: &str| data.and_then(|d| d.get(key)).and_then(Value::as_str);
+    match err.code {
+        code::INVALID_PARAMS => match (str_of("field"), str_of("rule")) {
+            (Some(field), Some(rule)) => IpcError::invalid_argument(field, rule),
+            _ => IpcError::internal(&correlation_id()),
+        },
+        code::METHOD_NOT_FOUND => IpcError::unsupported("sidecarMethod"),
+        code::UNSUPPORTED => IpcError::unsupported(str_of("cap").unwrap_or("sidecar")),
+        code::ADAPTER_ERROR => {
+            let class = match str_of("class") {
+                Some("auth") => VendorErrorClass::Auth,
+                Some("quota") => VendorErrorClass::Quota,
+                Some("exec") => VendorErrorClass::Exec,
+                _ => VendorErrorClass::Unknown,
+            };
+            IpcError::vendor_error(class, matches!(class, VendorErrorClass::Exec | VendorErrorClass::Unknown))
+        }
+        code::BUILD_MISMATCH => IpcError::version_mismatch(),
+        code::NOT_READY => IpcError::not_ready("sidecarStarting"),
+        code::REFUSED => IpcError::refused(str_of("reason").unwrap_or("refused")),
+        code::CHANNEL_CLOSED => IpcError::sidecar_down(),
+        code::TIMEOUT => IpcError::timeout(),
+        code::PROTOCOL_MISMATCH => IpcError::version_mismatch(),
+        _ => IpcError::internal(&correlation_id()),
+    }
+}
+
+#[async_trait]
+impl SidecarApi for SidecarManager {
+    async fn ensure_started(&self) -> std::result::Result<(), IpcError> {
+        self.await_ready(ENSURE_WAIT).await
+    }
+
+    async fn auth_status(&self, p: wire::ProbeParams) -> std::result::Result<wire::AuthStatus, IpcError> {
+        self.probe_call(method::PROBE_AUTH_STATUS, &p).await
+    }
+
+    async fn models(&self, p: wire::ProbeParams) -> std::result::Result<Vec<wire::ModelInfo>, IpcError> {
+        self.probe_call(method::PROBE_MODELS, &p).await
+    }
+
+    async fn quota(&self, p: wire::ProbeParams) -> std::result::Result<Option<Quota>, IpcError> {
+        self.probe_call(method::PROBE_QUOTA, &p).await
+    }
+
+    async fn turn_start(
+        &self,
+        p: wire::TurnStartParams,
+        sink: Arc<dyn TurnEventSink>,
+    ) -> std::result::Result<(), IpcError> {
+        if p.turn_id.is_empty() || p.turn_id.len() > 128 || !p.turn_id.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
+            return Err(IpcError::invalid_argument("turnId", "pattern"));
+        }
+        // The route exists before the request: events may follow the answer at
+        // once. It is claimed under the turn gate on a READY generation, so a
+        // presence stop (A11.6) never takes a generation with a turn on it; a
+        // generation detached meanwhile means waiting for the next one.
+        let mut attempts = 0;
+        let route = loop {
+            self.await_ready(ENSURE_WAIT).await?;
+            let _gate = self.turn_gate.read();
+            let generation = {
+                let state = self.state.lock();
+                (state.client.is_some() && state.state == SidecarState::Ready).then_some(state.generation)
+            };
+            let Some(generation) = generation else {
+                attempts += 1;
+                if attempts >= 3 {
+                    return Err(IpcError::not_ready("sidecarStarting"));
+                }
+                continue;
+            };
+            let route = Arc::new(TurnRoute {
+                generation,
+                sink: sink.clone(),
+                queue: Mutex::new(TurnQueue::default()),
+                wake: Notify::new(),
+                done: AtomicBool::new(false),
+            });
+            match self.turns.entry(p.turn_id.clone()) {
+                dashmap::mapref::entry::Entry::Occupied(_) => return Err(IpcError::conflict("turnId")),
+                dashmap::mapref::entry::Entry::Vacant(slot) => {
+                    slot.insert(route.clone());
+                }
+            }
+            break route;
+        };
+        spawn_turn_delivery(self.me.clone(), p.turn_id.clone(), route);
+        match self
+            .call_detailed::<_, wire::TurnStartResult>(method::TURN_START, &p, Some(TURN_CALL_DEADLINE))
+            .await
+        {
+            Ok(res) if res.accepted => Ok(()),
+            Ok(_) => {
+                self.drop_route(&p.turn_id);
+                Err(IpcError::internal(&correlation_id()))
+            }
+            Err(err) => {
+                self.drop_route(&p.turn_id);
+                if matches!(err, SidecarCallError::Timeout { .. }) {
+                    // The sidecar may have started it after all: nobody listens
+                    // any more, so it is cancelled rather than left running.
+                    let cancel = wire::TurnCancelParams {
+                        turn_id: p.turn_id.clone(),
+                    };
+                    if let Some(client) = self.client() {
+                        tokio::spawn(async move {
+                            let _ = client
+                                .call::<_, wire::TurnCancelResult>(method::TURN_CANCEL, &cancel, Some(TURN_CALL_DEADLINE))
+                                .await;
+                        });
+                    }
+                }
+                Err(self.ipc_error(err))
+            }
+        }
+    }
+
+    async fn turn_cancel(&self, turn_id: &str) -> std::result::Result<bool, IpcError> {
+        if self.client().is_none() {
+            // The generation is gone: its turns already ended (HELPER_RESTARTED)
+            // and the sweep stops its children; nothing to signal.
+            return Ok(false);
+        }
+        self.call_detailed::<_, wire::TurnCancelResult>(
+            method::TURN_CANCEL,
+            &wire::TurnCancelParams {
+                turn_id: turn_id.to_string(),
+            },
+            Some(TURN_CALL_DEADLINE),
+        )
+        .await
+        .map(|r| r.signalled)
+        .map_err(|e| self.ipc_error(e))
+    }
+}
+
+impl SidecarManager {
+    fn drop_route(&self, turn_id: &str) {
+        if let Some((_, route)) = self.turns.remove(turn_id) {
+            route.done.store(true, Ordering::SeqCst);
+            route.wake.notify_one();
         }
     }
 }
 
-/// Turn a `cco.team.snapshot` notification into the `gilde://team/snapshot`
-/// payload, or `None` when it must be dropped.
-///
-/// Checked before it reaches the UI: the payload must decode into the serde
-/// mirror and name ONE team consistently, or it is dropped with a warning (it is
-/// a latest-wins snapshot — the next one, or the next `cco_team_list`, repairs
-/// the view). Then the two fields that are Rust's own are stamped: the
-/// generation, and L7's `believed`, because only Rust can read the owner host's
-/// start time without spawning anything (`start_ms_of_live_pid`).
+/// One delivery task per turn: pops the queue in order and calls the sink;
+/// ends (and forgets the route) after the terminal event.
+fn spawn_turn_delivery(manager: Weak<SidecarManager>, turn_id: String, route: Arc<TurnRoute>) {
+    tokio::spawn(async move {
+        loop {
+            let next = route.queue.lock().pop();
+            match next {
+                Some((seq, event)) => {
+                    let terminal = TurnQueue::is_terminal(&event);
+                    route.sink.event(seq, event);
+                    if terminal {
+                        route.done.store(true, Ordering::SeqCst);
+                        if let Some(manager) = manager.upgrade() {
+                            manager.turns.remove_if(&turn_id, |_, r| Arc::ptr_eq(r, &route));
+                        }
+                        return;
+                    }
+                }
+                None => {
+                    if route.done.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    route.wake.notified().await;
+                }
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// orchestrator snapshots
+// ---------------------------------------------------------------------------
+
+/// Turn an `orch.snapshot` notification into the relayed view, or `None` when
+/// it must be dropped. The envelope is the contract's `OrchSnapshotParams`
+/// (strict); the `team` payload is the observer's `{teamId, view}`, which must
+/// decode into the mirror and name ONE team consistently. Then the fields that
+/// are Rust's own are stamped: the generation key, and L7's `believed`.
 pub(crate) fn team_snapshot_event(
-    generation: i64,
+    host_generation: i64,
     params: Value,
     start_ms_of_live_pid: impl Fn(i64) -> Option<i64>,
-) -> Option<TeamSnapshotEvent<CcoTeamView>> {
-    let snapshot: CcoTeamSnapshotParams = match serde_json::from_value(params) {
+) -> Option<OrchTeamSnapshot> {
+    let envelope: wire::OrchSnapshotParams = match serde_json::from_value(params) {
+        Ok(envelope) => envelope,
+        Err(err) => {
+            tracing::warn!(target: "sidecar", error = %err, "orch.snapshot did not match the contract; dropped");
+            return None;
+        }
+    };
+    let mut team = envelope.team;
+    if let Value::Object(map) = &mut team {
+        map.insert("rev".to_string(), json!(envelope.rev));
+    }
+    let snapshot: CcoTeamSnapshotParams = match serde_json::from_value(team) {
         Ok(snapshot) => snapshot,
         Err(err) => {
-            tracing::warn!(target: "sidecar", error = %err, "cco.team.snapshot did not decode; dropped");
+            tracing::warn!(target: "sidecar", error = %err, "orch.snapshot team did not decode; dropped");
             return None;
         }
     };
     if !is_cco_team_id(&snapshot.team_id) {
-        tracing::warn!(target: "sidecar", "cco.team.snapshot without a team id; dropped");
+        tracing::warn!(target: "sidecar", "orch.snapshot without a team id; dropped");
         return None;
     }
+    let generation = orch_generation_key(host_generation, envelope.generation);
     let mut view = snapshot.view;
     if let Some(view) = view.as_mut() {
         if view.team_id != snapshot.team_id || !view.is_consistent() {
-            tracing::warn!(target: "sidecar", "cco.team.snapshot names two teams; dropped");
+            tracing::warn!(target: "sidecar", "orch.snapshot names two teams; dropped");
             return None;
         }
         view.apply_belief(generation, start_ms_of_live_pid);
     }
-    Some(TeamSnapshotEvent {
+    Some(OrchTeamSnapshot {
         generation,
-        rev: snapshot.rev,
+        rev: envelope.rev,
         team_id: snapshot.team_id,
         view,
     })
 }
 
 /// The start time, in epoch milliseconds, of `pid` when it is alive — the probe
-/// L7 needs ([`cco_believed`]). libproc reports whole seconds, as `ps` does for
-/// the engine's own `hostStartedAt`, and the comparison allows
-/// [`CCO_START_SLACK_MS`] either way. `None` for a dead, impossible or
-/// unreadable pid: "host gone" is the safe display.
+/// L7 needs ([`cco_believed`]). `None` for a dead, impossible or unreadable pid.
 pub(crate) fn owner_start_ms(pid: i64) -> Option<i64> {
     let pid = i32::try_from(pid).ok().filter(|p| *p > 1)?;
     if !is_alive(pid) {
@@ -1566,24 +2537,14 @@ pub(crate) fn owner_start_ms(pid: i64) -> Option<i64> {
 }
 
 fn decode<T: DeserializeOwned>(params: Value) -> std::result::Result<T, RpcErrorObject> {
-    serde_json::from_value(params)
-        .map_err(|e| RpcErrorObject::new(code::INVALID_PARAMS, e.to_string()))
+    serde_json::from_value(params).map_err(|e| RpcErrorObject::new(code::INVALID_PARAMS, e.to_string()))
 }
 
 fn to_value<T: Serialize>(value: T) -> std::result::Result<Value, RpcErrorObject> {
-    serde_json::to_value(value)
-        .map_err(|e| RpcErrorObject::new(code::INTERNAL_ERROR, e.to_string()))
+    serde_json::to_value(value).map_err(|e| RpcErrorObject::new(code::INTERNAL_ERROR, e.to_string()))
 }
 
-fn spawn_id_of(params: &Value) -> std::result::Result<String, RpcErrorObject> {
-    params
-        .get("spawnId")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .ok_or_else(|| RpcErrorObject::new(code::INVALID_PARAMS, "spawnId is required"))
-}
-
-/// The `host.*` surface, bound to one generation.
+/// The `host.*` surface and the notifications, bound to one generation.
 struct HostMethods {
     manager: Weak<SidecarManager>,
     generation: i64,
@@ -1595,10 +2556,7 @@ impl HostHandler for HostMethods {
         let generation = self.generation;
         Box::pin(async move {
             let Some(manager) = manager.upgrade() else {
-                return Err(RpcErrorObject::new(
-                    code::INTERNAL_ERROR,
-                    "the host is shutting down",
-                ));
+                return Err(RpcErrorObject::new(code::INTERNAL_ERROR, "the host is shutting down"));
             };
             manager.handle_host_call(generation, &method, params).await
         })
@@ -1609,30 +2567,81 @@ impl HostHandler for HostMethods {
             return;
         };
         match method {
-            host_method::EVENT => {
-                let run_id = params
-                    .get("runId")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                let event = params.get("event").cloned().unwrap_or(Value::Null);
-                if run_id.is_empty() || event.is_null() {
-                    tracing::warn!(target: "sidecar", "mesh.event without a runId or an event");
-                    return;
-                }
-                // A dropped receiver is not a failure: `mesh.event` is lossy by
-                // contract, and the run's terminal state also arrives through
-                // the response and the disk artifacts (DESIGN §5-8).
-                let _ = manager.run_events.send(RunEventEnvelope {
-                    run_id,
-                    event,
-                    generation: self.generation,
-                });
-            }
+            host_method::TURN_EVENT => manager.turn_event(self.generation, params),
+            host_method::TEAM_SNAPSHOT => manager.orch_snapshot(self.generation, params),
             host_method::LOG => manager.host_log(params),
-            host_method::TEAM_SNAPSHOT => manager.team_snapshot(self.generation, params),
-            other => tracing::warn!(target: "sidecar", method = other, "unknown notification"),
+            other => tracing::warn!(target: "sidecar", method = other, "unknown notification; ignored"),
         }
+    }
+}
+
+/// A path as the contract's absolute path (`argv0` of a spawn request).
+/// The registry request for a child the sidecar registers
+/// (`host.registerSpawn`), through `SupervisorApi` (A12.8: §9.3 allowlist,
+/// A13.1 ids): a turn child is `Turn` with its generation and turn id; a probe
+/// of a vendor CLI is `Vendorcli` with the generation too (A15.1), so the
+/// dead-generation sweep finds a probe orphaned by a sidecar crash.
+fn register_spawn_request(
+    p: &wire::RegisterSpawnParams,
+    generation: i64,
+) -> std::result::Result<SpawnRequest, RpcErrorObject> {
+    let (kind, turn_id) = match p.kind {
+        wire::SidecarSpawnKind::Probe => (SpawnKind::Vendorcli, None),
+        wire::SidecarSpawnKind::Turn => (SpawnKind::Turn, p.turn_id.clone().filter(|t| !t.is_empty())),
+    };
+    let argv0 = AbsPath::parse(p.cmd.clone())
+        .map_err(|_| RpcErrorObject::new(code::REFUSED, "notAllowlisted").with_data(json!({"reason": "notAllowlisted"})))?;
+    Ok(SpawnRequest {
+        kind,
+        argv0,
+        args: p.args.clone(),
+        cwd: p.cwd.clone().and_then(|c| AbsPath::parse(c).ok()),
+        env_keys: p.env_keys.clone(),
+        parent_uid: None,
+        generation: Some(generation),
+        turn_id,
+    })
+}
+
+/// The node `<runtime> --version` self-test: a `Probe` row of no generation
+/// (A13.3: node is allowlisted as Sidecar + Probe only; A15.1 leaves Probe's
+/// generation reserved).
+fn self_test_request(node: &Path, env_keys: Vec<String>) -> Result<SpawnRequest> {
+    Ok(SpawnRequest {
+        kind: SpawnKind::Probe,
+        argv0: abs_path(node)?,
+        args: vec!["--version".to_string()],
+        cwd: None,
+        env_keys,
+        parent_uid: None,
+        generation: None,
+        turn_id: None,
+    })
+}
+
+fn abs_path(path: &Path) -> Result<AbsPath> {
+    AbsPath::parse(path.display().to_string())
+        .map_err(|_| GildeError::Spawn(format!("not an absolute path: {}", path.display())))
+}
+
+/// The RPC answer to the sidecar for a spawn the supervisor would not plan.
+fn rpc_error_of_plan(err: &IpcError) -> RpcErrorObject {
+    match err.code {
+        ErrorCode::Refused => {
+            let reason = err
+                .params
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("notAllowlisted")
+                .to_string();
+            RpcErrorObject::new(code::REFUSED, reason.clone()).with_data(json!({ "reason": reason }))
+        }
+        ErrorCode::InvalidArgument => RpcErrorObject::new(code::INVALID_PARAMS, "invalid spawn request")
+            .with_data(json!({ "field": err.params.get("field"), "rule": err.params.get("rule") })),
+        other => RpcErrorObject::new(
+            code::INTERNAL_ERROR,
+            format!("could not record the spawn ({})", other.as_str()),
+        ),
     }
 }
 
@@ -1640,18 +2649,12 @@ impl HostHandler for HostMethods {
 // signals
 // ---------------------------------------------------------------------------
 
-/// `SIGTERM` the group, wait out the grace, then `SIGKILL` what is left.
-///
-/// Deliberately narrow: it signals **one process group we created ourselves**
-/// (`process_group(0)` made the child its leader), never a pid we merely found.
-/// The general escalation with its identity fences is `supervise::kill`.
 /// SIGTERM the group, wait out `grace`, escalate to SIGKILL if it is still
-/// there. Returns **the signal that actually ended it**, which is what the
-/// registry row records: writing `SIGTERM` for a process we had to SIGKILL
-/// makes the Process Monitor lie about how the sidecar died.
-///
-/// `None` means no signal was sent at all (an impossible pid).
-async fn terminate_group(pid: i32, grace: Duration) -> Option<i32> {
+/// there. Only ever used on the SIDECAR's own node process group (created with
+/// `process_group(0)`), a Gilde helper that §9.8 allows to escalate — never on a
+/// vendor CLI, whose stops go through the fenced kill path. Returns the signal
+/// that actually ended it (`None`: no signal was sent).
+async fn terminate_group(pid: i32, grace: Duration, escalate: Escalate) -> Option<i32> {
     use nix::sys::signal::{killpg, Signal};
     use nix::unistd::Pid;
 
@@ -1668,6 +2671,18 @@ async fn terminate_group(pid: i32, grace: Duration) -> Option<i32> {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    if escalate == Escalate::Never {
+        // A11.6: a repeated SIGTERM, never SIGKILL; a survivor is logged.
+        let _ = killpg(group, Signal::SIGTERM);
+        let deadline = Instant::now() + grace;
+        while Instant::now() < deadline && is_alive(pid) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        if is_alive(pid) {
+            tracing::warn!(target: "sidecar", pid, "the sidecar outlived two SIGTERMs; left to its parent watchdog");
+        }
+        return Some(libc::SIGTERM);
+    }
     if is_alive(pid) {
         tracing::warn!(target: "sidecar", pid, "sidecar ignored SIGTERM; escalating to SIGKILL");
         let _ = killpg(group, Signal::SIGKILL);
@@ -1679,18 +2694,89 @@ async fn terminate_group(pid: i32, grace: Duration) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contract::error::ErrorCode;
+    use crate::contract::sidecar::{TurnEvent, TurnUsage};
+
+    fn register(kind: wire::SidecarSpawnKind, turn_id: Option<&str>) -> wire::RegisterSpawnParams {
+        wire::RegisterSpawnParams {
+            spawn_id: "sc-1".into(),
+            turn_id: turn_id.map(str::to_string),
+            vendor: Some(crate::contract::common::Vendor::Claude),
+            kind,
+            cmd: "/opt/bin/claude".into(),
+            args: vec!["--version".into()],
+            cwd: None,
+            env_keys: vec!["PATH".into()],
+        }
+    }
+
+    /// A15.1: a vendor-CLI probe the sidecar registers carries the sidecar's
+    /// generation (the dead-generation sweep finds it after a crash), and the
+    /// validator of the one spawn path accepts it.
+    #[test]
+    fn a_sidecar_probe_child_carries_the_generation() {
+        let req = register_spawn_request(&register(wire::SidecarSpawnKind::Probe, None), 7).expect("request");
+        assert_eq!(req.kind, SpawnKind::Vendorcli);
+        assert_eq!(req.generation, Some(7));
+        assert_eq!(req.turn_id, None);
+        crate::supervise::registry::validate_spawn_ids(req.kind, req.generation, req.turn_id.as_deref())
+            .expect("a Vendorcli generation ≥ 1 is valid");
+        let turn = register_spawn_request(&register(wire::SidecarSpawnKind::Turn, Some("t-1")), 7).expect("turn");
+        assert_eq!((turn.kind, turn.generation, turn.turn_id.as_deref()), (SpawnKind::Turn, Some(7), Some("t-1")));
+    }
+
+    /// A13.3/A15.1: the node `--version` self-test stays a `Probe` row with
+    /// no generation (reserved for Probe).
+    #[test]
+    fn the_node_self_test_is_a_probe_without_a_generation() {
+        let req = self_test_request(Path::new("/opt/node/bin/node"), vec!["PATH".into()]).expect("request");
+        assert_eq!(req.kind, SpawnKind::Probe);
+        assert_eq!(req.generation, None);
+        crate::supervise::registry::validate_spawn_ids(req.kind, req.generation, None).expect("valid");
+        let err = crate::supervise::registry::validate_spawn_ids(SpawnKind::Probe, Some(7), None)
+            .expect_err("a Probe generation is reserved");
+        assert_eq!(err.params["rule"], "reserved");
+    }
+
+    /// A15.1: a `Vendorcli` probe from a caller other than the sidecar (the
+    /// app's own detection) has no generation, and that is valid too.
+    #[test]
+    fn an_app_vendorcli_probe_has_no_generation() {
+        crate::supervise::registry::validate_spawn_ids(SpawnKind::Vendorcli, None, None).expect("valid without");
+        let err = crate::supervise::registry::validate_spawn_ids(SpawnKind::Vendorcli, Some(0), None)
+            .expect_err("< 1 is out of range");
+        assert_eq!(err.params["rule"], "range");
+    }
 
     #[test]
-    fn the_backoff_ladder_is_the_one_design_specifies() {
-        assert_eq!(RESTART_BACKOFF_SECS, [1, 2, 5, 15, 60]);
+    fn the_backoff_ladder_doubles_to_sixty_seconds() {
+        assert_eq!(RESTART_BACKOFF_SECS, [1, 2, 4, 8, 16, 32, 60]);
+        assert_eq!(DEATHS_BEFORE_STAYING_DOWN, 3);
+        assert_eq!(DEATH_WINDOW, Duration::from_secs(300));
+    }
+
+    /// T-buildId-rule, the core-of-the-sidecar half: the same rule as A8.1.
+    #[test]
+    fn t_build_id_rule() {
+        assert_eq!(build_id_from(None, "0.4.0"), "0.4.0");
+        assert_eq!(build_id_from(Some(""), "0.4.0"), "0.4.0", "empty = unset");
+        assert_eq!(
+            build_id_from(Some("2.0.0+b425b5e.20261022T073000"), "0.4.0"),
+            "2.0.0+b425b5e.20261022T073000"
+        );
+        assert!(is_valid_build_id(HOST_BUILD_ID));
+        assert!(is_valid_build_id(env!("CARGO_PKG_VERSION")));
+        assert!(is_valid_build_id("2.0.0+b425b5e.20261022T073000"));
+        assert!(is_valid_build_id(&"a".repeat(64)));
+        for bad in ["", " 0.4.0", "0.4.0\n", "0.4.0 ", "a/b", ".hidden", "-flag", "é", &"a".repeat(65)] {
+            assert!(!is_valid_build_id(bad), "{bad:?} must be rejected");
+        }
     }
 
     #[test]
     fn a_missing_script_is_a_typed_runtime_error() {
         let err = SidecarRuntime::resolve(Some(PathBuf::from("/nope/sidecar.cjs")), None, &[])
             .expect_err("must fail when no script exists");
-        // The dev fallback also misses only when the source tree is absent; in
-        // this repo it exists, so assert on whichever error the machine gives.
         match err {
             GildeError::SidecarRuntimeUnusable { .. } => {}
             other => panic!("expected SidecarRuntimeUnusable, got {other:?}"),
@@ -1700,7 +2786,6 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn dev_mode_runs_the_source_tree_bundle_with_a_system_node() {
-        // A `node` planted in a directory the caller offers as its resolved PATH.
         let dir = tempfile::tempdir().expect("tempdir");
         let node = dir.path().join("node");
         std::fs::write(&node, "#!/bin/sh\nexit 0\n").expect("write");
@@ -1716,17 +2801,10 @@ mod tests {
         std::env::remove_var("GILDE_SIDECAR_DEV");
 
         let runtime = runtime.expect("dev mode resolves");
-        assert_eq!(runtime.script, dev_script(), "the source tree bundle");
+        assert_eq!(runtime.script, dev_script());
         assert_eq!(runtime.node, node);
         assert_eq!(runtime.node_source, NodeSource::System);
-        assert!(
-            runtime
-                .warnings
-                .iter()
-                .any(|w| w.contains("nodeSource: system")),
-            "a system node is reported, never silently accepted: {:?}",
-            runtime.warnings
-        );
+        assert!(runtime.warnings.iter().any(|w| w.contains("nodeSource: system")));
     }
 
     #[test]
@@ -1745,89 +2823,187 @@ mod tests {
         assert_eq!(runtime.node_source, NodeSource::Configured);
     }
 
-    #[test]
-    fn node_source_is_reported_not_hidden() {
-        assert_eq!(NodeSource::System.as_str(), "system");
-        assert_eq!(NodeSource::Vendored.as_str(), "vendored");
+    // -- turn routing ------------------------------------------------------------
+
+    fn text(s: &str) -> TurnEvent {
+        TurnEvent::Text { delta: s.to_string() }
     }
 
-    // -- team mode, read-only preview ----------------------------------------
+    fn done() -> TurnEvent {
+        TurnEvent::Done {
+            status: wire::TurnDoneStatus::Ok,
+            conversation_id: "c".to_string(),
+            usage: None,
+            cost_usd: None,
+        }
+    }
 
-    /// A `cco.team.snapshot` exactly as the sidecar sent it (written by
-    /// `sidecar/test/cco-team.mjs` with `CCO_FIXTURE_OUT`).
+    #[test]
+    fn a_turn_queue_merges_text_on_overflow_and_never_drops_the_terminal() {
+        let mut q = TurnQueue::default();
+        let cap = wire::MAX_PENDING_TURN_EVENTS as u64;
+        for seq in 1..=cap {
+            assert_eq!(q.admit(seq, text("a")), Admit::Queued);
+        }
+        assert_eq!(q.len(), cap as usize);
+        // Overflow: merged into the trailing text, nothing lost.
+        assert_eq!(q.admit(cap + 1, text("b")), Admit::Merged);
+        assert_eq!(q.len(), cap as usize);
+        // A tool at the cap is still queued (never dropped)…
+        assert_eq!(
+            q.admit(cap + 2, TurnEvent::Tool { name: "Bash".into(), detail_preview: None }),
+            Admit::Queued
+        );
+        // …and a text after it makes room by joining an adjacent pair.
+        assert_eq!(q.admit(cap + 3, text("c")), Admit::Queued);
+        // The terminal always gets in, and nothing follows it.
+        assert_eq!(q.admit(cap + 4, done()), Admit::Queued);
+        assert_eq!(q.admit(cap + 5, text("late")), Admit::Rejected);
+        let mut all = String::new();
+        let mut last_seq = 0;
+        let mut terminals = 0;
+        while let Some((seq, ev)) = q.pop() {
+            assert!(seq > last_seq, "seq stays strictly increasing");
+            last_seq = seq;
+            match ev {
+                TurnEvent::Text { delta } => all.push_str(&delta),
+                TurnEvent::Done { .. } | TurnEvent::Error { .. } => terminals += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(all, format!("{}b", "a".repeat(cap as usize)) + "c", "every byte of text kept, in order");
+        assert_eq!(terminals, 1);
+    }
+
+    #[test]
+    fn a_turn_queue_rejects_out_of_order_seq_and_coalesces_usage_at_the_cap() {
+        let mut q = TurnQueue::default();
+        assert_eq!(q.admit(5, text("x")), Admit::Queued);
+        assert_eq!(q.admit(5, text("dup")), Admit::Rejected);
+        assert_eq!(q.admit(3, text("old")), Admit::Rejected);
+        let usage = |n| TurnEvent::Usage {
+            usage: TurnUsage { input_tokens: Some(n), output_tokens: None, cached_input_tokens: None },
+        };
+        let mut seq = 6;
+        while q.len() < wire::MAX_PENDING_TURN_EVENTS {
+            q.admit(seq, usage(seq));
+            seq += 1;
+        }
+        assert_eq!(q.admit(seq, usage(999)), Admit::Merged, "the latest usage replaces the trailing one");
+        assert_eq!(q.rejected, 2);
+    }
+
+    // -- errors ------------------------------------------------------------------
+
+    /// The typed error mapping (contract §4.4 / §4.5): every sidecar error code
+    /// becomes a documented `IpcError` code.
+    #[test]
+    fn sidecar_errors_map_to_the_contract_codes() {
+        let rpc = |code: i64, data: Value| RpcErrorObject::new(code, "x").with_data(data);
+        let cases: Vec<(RpcErrorObject, ErrorCode)> = vec![
+            (rpc(code::ADAPTER_ERROR, json!({"class": "auth"})), ErrorCode::VendorError),
+            (rpc(code::BUILD_MISMATCH, json!({})), ErrorCode::VersionMismatch),
+            (rpc(code::NOT_READY, json!({})), ErrorCode::NotReady),
+            (rpc(code::REFUSED, json!({"reason": "notAllowlisted"})), ErrorCode::Refused),
+            (rpc(code::UNSUPPORTED, json!({"cap": "vendorNotInstalled"})), ErrorCode::Unsupported),
+            (rpc(code::INVALID_PARAMS, json!({"field": "model", "rule": "required"})), ErrorCode::InvalidArgument),
+            (rpc(code::INVALID_PARAMS, json!({})), ErrorCode::Internal),
+            (rpc(code::METHOD_NOT_FOUND, json!({})), ErrorCode::Unsupported),
+            (rpc(code::CHANNEL_CLOSED, json!({})), ErrorCode::SidecarDown),
+            (rpc(code::TIMEOUT, json!({})), ErrorCode::Timeout),
+            (rpc(-31999, json!({})), ErrorCode::Internal),
+        ];
+        for (err, want) in cases {
+            assert_eq!(ipc_error_of_rpc(&err).code, want, "{err:?}");
+        }
+        let auth = ipc_error_of_rpc(&rpc(code::ADAPTER_ERROR, json!({"class": "quota"})));
+        assert_eq!(auth.params.get("class"), Some(&json!("quota")));
+        let refused = ipc_error_of_rpc(&rpc(code::REFUSED, json!({"reason": "notAllowlisted"})));
+        assert_eq!(refused.params.get("reason"), Some(&json!("notAllowlisted")));
+        let invalid = ipc_error_of_rpc(&rpc(code::INVALID_PARAMS, json!({"field": "model", "rule": "required"})));
+        assert_eq!(invalid.params.get("field"), Some(&json!("model")));
+    }
+
+    // -- accounts ----------------------------------------------------------------
+
+    /// T-env-defaultAccount (sidecar half): the default claude/codex login is
+    /// `envKey: null` (the variable is UNSET, C8); another dir carries its realpath.
+    #[test]
+    fn legacy_accounts_become_account_envs_with_the_c8_rule() {
+        let home = tempfile::tempdir().expect("home");
+        let home_path = std::fs::canonicalize(home.path()).expect("canonical");
+        std::fs::create_dir_all(home_path.join(".claude")).expect("mkdir");
+        std::fs::create_dir_all(home_path.join(".claude-work")).expect("mkdir");
+        let accounts = vec![
+            Account::new("claude"),
+            Account::new("claude").with_config_dir(Some(home_path.join(".claude").display().to_string())),
+            Account::new("claude").with_config_dir(Some(home_path.join(".claude-work").display().to_string())),
+            Account::new("gemini").with_config_dir(Some("/somewhere".to_string())),
+            Account::new("vim"),
+        ];
+        let envs = account_envs_of(&accounts, &home_path);
+        assert_eq!(envs.len(), 3, "the two spellings of the default login are one account: {envs:?}");
+        let default = &envs[0];
+        assert_eq!(default.env_key, None);
+        assert_eq!(default.config_dir, None);
+        let work = &envs[1];
+        assert_eq!(work.env_key.as_deref(), Some("CLAUDE_CONFIG_DIR"));
+        assert_eq!(
+            work.config_dir.as_ref().map(AbsPath::as_str),
+            Some(home_path.join(".claude-work").to_str().expect("utf8"))
+        );
+        let agy = &envs[2];
+        assert_eq!((agy.vendor, agy.env_key.as_deref(), agy.config_dir.as_ref()), (Vendor::Agy, None, None));
+        assert_eq!(agy.account_id, crate::contract::ids::AccountId::derive_default_login(Vendor::Agy));
+    }
+
+    // -- team mode, read-only preview ----------------------------------------------
+
+    /// A `cco.team.snapshot` payload exactly as the observer composes it (the
+    /// `team` of an `orch.snapshot`), from `sidecar/test/cco-team.mjs`.
     const TEAM_SNAPSHOT_FIXTURE: &str = include_str!("../../tests/fixtures/cco/team-snapshot.json");
+
+    fn envelope(observer_generation: u64) -> Value {
+        let inner: Value = serde_json::from_str(TEAM_SNAPSHOT_FIXTURE).expect("fixture is JSON");
+        json!({
+            "generation": observer_generation,
+            "rev": inner["rev"],
+            "team": {"teamId": inner["teamId"], "view": inner["view"]},
+        })
+    }
 
     #[test]
     fn a_real_sidecar_snapshot_relays_with_rusts_own_fields_stamped() {
-        let params: Value = serde_json::from_str(TEAM_SNAPSHOT_FIXTURE).expect("fixture is JSON");
-        let event = team_snapshot_event(7, params.clone(), |_| None).expect("relayed");
-        assert_eq!(event.generation, 7);
+        let event = team_snapshot_event(7, envelope(1), |_| None).expect("relayed");
+        assert_eq!(event.generation, orch_generation_key(7, 1));
         assert_eq!(event.team_id, "tmabcdefghi1");
         let view = event.view.as_ref().expect("a view");
-        assert_eq!(view.generation, 7);
-        assert!(
-            view.live && view.believed,
-            "a live subscription is believed as it is"
-        );
+        assert_eq!(view.generation, orch_generation_key(7, 1));
+        assert!(view.live && view.believed, "a live subscription is believed as it is");
         assert_eq!(view.state.members.len(), 2);
         assert!(view.activity.iter().any(|a| a.member == "alice"));
         assert!(view.messages.iter().any(|m| m.id == "m11"));
-
-        // The emitted payload keeps the wire's names, and decodes back to itself.
-        let json = serde_json::to_value(&event).expect("encode");
-        assert_eq!(json["teamId"], params["teamId"]);
-        assert_eq!(
-            json["view"]["state"]["members"][0]["tokens"],
-            params["view"]["state"]["members"][0]["tokens"]
-        );
-        let back: TeamSnapshotEvent<CcoTeamView> = serde_json::from_value(json).expect("decode");
-        assert_eq!(back, event);
     }
 
     #[test]
-    fn a_disk_view_of_an_active_team_is_believed_only_with_its_owner() {
-        let mut params: Value = serde_json::from_str(TEAM_SNAPSHOT_FIXTURE).expect("fixture");
-        params["view"]["live"] = Value::Bool(false);
-        params["view"]["source"] = Value::String("disk".into());
-        let owner_pid = params["view"]["state"]["owner"]["hostPid"]
-            .as_i64()
-            .expect("owner pid");
-        let started = params["view"]["state"]["owner"]["hostStartedAt"]
-            .as_i64()
-            .expect("started");
-        let gone = team_snapshot_event(1, params.clone(), |_| None).expect("relayed");
-        assert!(
-            !gone.view.expect("view").believed,
-            "a dead owner renders as host gone"
-        );
-        let alive = team_snapshot_event(1, params, |pid| {
-            (pid == owner_pid).then_some(started + 1_000)
-        })
-        .expect("relayed");
-        assert!(alive.view.expect("view").believed);
+    fn a_new_observer_or_a_new_sidecar_outranks_every_older_view() {
+        assert!(orch_generation_key(1, 2) > orch_generation_key(1, 1));
+        assert!(orch_generation_key(2, 1) > orch_generation_key(1, 9));
     }
 
     #[test]
-    fn a_snapshot_that_names_two_teams_or_none_is_dropped() {
-        let mut params: Value = serde_json::from_str(TEAM_SNAPSHOT_FIXTURE).expect("fixture");
-        params["view"]["state"]["id"] = Value::String("tmothertea12".into());
-        assert!(team_snapshot_event(1, params, |_| None).is_none());
-        assert!(
-            team_snapshot_event(1, json!({"rev": 1, "teamId": "../x", "view": null}), |_| {
-                None
-            })
-            .is_none()
-        );
+    fn a_snapshot_that_breaks_the_envelope_or_names_two_teams_is_dropped() {
+        let mut two = envelope(1);
+        two["team"]["view"]["state"]["id"] = Value::String("tmothertea12".into());
+        assert!(team_snapshot_event(1, two, |_| None).is_none());
+        let mut extra = envelope(1);
+        extra["unknown"] = json!(1);
+        assert!(team_snapshot_event(1, extra, |_| None).is_none(), "unknown envelope fields are rejected");
+        assert!(team_snapshot_event(1, json!({"generation": 1, "rev": 1, "team": {"teamId": "../x", "view": null}}), |_| None).is_none());
         assert!(team_snapshot_event(1, json!("not an object"), |_| None).is_none());
-        assert!(
-            team_snapshot_event(1, json!({"rev": "seven", "teamId": "tmabcdefghi1"}), |_| {
-                None
-            })
-            .is_none()
-        );
         let withdrawn = team_snapshot_event(
             1,
-            json!({"rev": 9, "teamId": "tmabcdefghi1", "view": null}),
+            json!({"generation": 1, "rev": 9, "team": {"teamId": "tmabcdefghi1", "view": null}}),
             |_| None,
         )
         .expect("a withdrawal is relayed");
@@ -1836,13 +3012,45 @@ mod tests {
     }
 
     #[test]
+    fn a_disk_view_of_an_active_team_is_believed_only_with_its_owner() {
+        let mut params = envelope(1);
+        params["team"]["view"]["live"] = Value::Bool(false);
+        params["team"]["view"]["source"] = Value::String("disk".into());
+        let owner_pid = params["team"]["view"]["state"]["owner"]["hostPid"].as_i64().expect("owner pid");
+        let started = params["team"]["view"]["state"]["owner"]["hostStartedAt"].as_i64().expect("started");
+        let gone = team_snapshot_event(1, params.clone(), |_| None).expect("relayed");
+        assert!(!gone.view.expect("view").believed, "a dead owner renders as host gone");
+        let alive = team_snapshot_event(1, params, |pid| (pid == owner_pid).then_some(started + 1_000)).expect("relayed");
+        assert!(alive.view.expect("view").believed);
+    }
+
+    #[test]
     fn an_impossible_owner_pid_is_never_probed_as_alive() {
         assert_eq!(owner_start_ms(0), None);
         assert_eq!(owner_start_ms(1), None, "launchd/init is never a host");
         assert_eq!(owner_start_ms(i64::from(i32::MAX) + 1), None);
-        assert!(
-            owner_start_ms(i64::from(std::process::id())).is_some(),
-            "this process is alive"
-        );
+        assert!(owner_start_ms(i64::from(std::process::id())).is_some(), "this process is alive");
+    }
+
+    #[test]
+    fn the_status_renders_into_any_type_that_decodes_its_name() {
+        #[derive(Debug, Default, PartialEq, Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        enum Other {
+            Ready,
+            #[default]
+            Down,
+        }
+        let s: SidecarStatus<Other> = SidecarStatus {
+            state: serde_json::from_value(json!(SidecarState::Ready.as_str())).unwrap_or_default(),
+            generation: 1,
+            restarts: 0,
+            last_error: None,
+            node_path: None,
+            script_path: None,
+            version_mismatch: false,
+            stays_down: false,
+        };
+        assert_eq!(s.state, Other::Ready);
     }
 }

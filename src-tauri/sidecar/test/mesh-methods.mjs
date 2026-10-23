@@ -1,890 +1,151 @@
 #!/usr/bin/env node
 /**
- * mesh-methods.mjs — stub-host integration test for the `mesh.*` run surface.
+ * mesh-methods.mjs — the protocol-2 lifecycle surface (contract §4.5): `mesh.hello`,
+ * `mesh.configure`, `mesh.ping`, `mesh.shutdown`, and what is NOT on the channel.
  *
- * `test/stub-host.mjs` proves the TRANSPORT and the supervision seam. This script
- * proves the layer above it: the methods of DESIGN §5-4, driven end to end over the
- * same NDJSON channel, with `fake_agent` standing in for the `claude` binary so the
- * assertions are deterministic and cost nothing.
+ * `stub-host.mjs` proves the transport and the supervision seam, `turns.mjs` the
+ * turn surface, `probes.mjs` the probes, `lifecycle.mjs` the exits (incl. 78). This
+ * file pins the strictness of protocol 2 — "both ends reject unknown fields" — and
+ * the method set:
  *
- * What is pinned here:
+ *   A. mesh.hello      — protocol 1 → -32002 with {expected: 2, received}; an unknown
+ *                        field, a missing one, a malformed instance id → -32602 naming
+ *                        it; a good hello answers {protocol, buildId, adapters}.
+ *   B. mesh.configure  — before hello → -32006; binaries must be absolute canonical
+ *                        paths keyed by contract vendors (never agent-mesh's
+ *                        "gemini"); accounts carry only an env KEY that is the vendor's
+ *                        own variable (C8) and a directory; duplicates and unknown
+ *                        fields are refused; reconfiguration works.
+ *   C. mesh.ping       — {nonce?} only; the nonce comes back.
+ *   D. method set      — every v1 run/introspection method is gone (-32601): mesh.run,
+ *                        mesh.stream, mesh.resume, mesh.cancel, mesh.authStatus,
+ *                        mesh.availableModels, mesh.quota, mesh.adapters, fleet.route,
+ *                        and the unrenamed cco.* names; a host notification for an
+ *                        unknown method is ignored, never fatal.
+ *   E. orch gating     — `providers.orchestrator` registers `orch.*`; false removes it.
+ *   F. mesh.shutdown   — {graceMs ≤ 60000}; out of range → -32602; a good one exits 0.
  *
- *   A. handshake        — `capabilities` come off the adapter INSTANCES, and a
- *                         `protocol` mismatch is a hard error, not a guess.
- *   B. mesh.run         — one run produces exactly registerSpawn → spawned →
- *                         exited, and the `RunResult` comes back verbatim.
- *   C. mesh.stream      — `{accepted:true}` first, then events; `text` merged over a
- *                         50ms window; EXACTLY ONE terminal `done`.
- *   D. terminal synth   — a stream that ends with no result event still yields
- *                         exactly one terminal event, an `error`.
- *   E. 16 KiB cap       — no merged `text` message exceeds the cap, and no
- *                         character is lost or duplicated across the split.
- *   F. errors           — an adapter failure is a JSON-RPC error carrying the
- *                         AgentMesh error NAME, and the process survives it.
- *   G. task validation  — a relative or non-existent `cwd` is -32602.
- *   H. mesh.steer       — not registered: -32601 method not found (it was removed).
- *   I. mesh.cancel      — a live run's process group is signalled and the child
- *                         dies; an unknown run is an honest `{stopped:false}`.
- *   J. fleet.route      — the only method that picks a vendor; NoRouteError maps.
- *   K. robustness       — a malformed line and a 9 MiB line are both survivable
- *                         (the host-side halves of these live in the Rust tests).
- *   L. defaults         — `mesh.hello`'s `defaults.permissionMode` reaches argv,
- *                         and the prompt stays the final argv element.
- *   M. terminal synth   — driven through a SCRIPTED event source, because no real
- *                         adapter can be talked into throwing without a terminal
- *                         event: an iterator that throws, one that just ends, and
- *                         one that emits a second terminal all resolve to exactly
- *                         one terminal event.
- *   N. codex listing    — agent-mesh 0.1.4's `spawn` seam: `mesh.availableModels`
- *                         for codex runs `<binary> app-server` through the REGISTERED
- *                         spawner (registry row kind probe, runId introspect, env
- *                         marker, spawned → exited), with a fake app-server only; a
- *                         listing that never answers is killed at the adapter's 15 s
- *                         deadline — the whole process group — and its row settles.
- *
- * Run:  node test/mesh-methods.mjs        (from src-tauri/sidecar)
- * Exit: 0 all green, 1 on the first failed assertion.
- *
- * Requires `fake_agent` (T06). Build it with:
- *   cargo build --manifest-path ../Cargo.toml --bin fake_agent
+ * Run:  node test/mesh-methods.mjs   (from src-tauri/sidecar, after `npm run build`)
  */
 
-import { spawn, execFileSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
 
-const sidecarDir = join(dirname(fileURLToPath(import.meta.url)), '..');
-const bundle = join(sidecarDir, 'sidecar.cjs');
-const repoRoot = join(sidecarDir, '..', '..');
-const NODE = process.execPath;
-/** Real tools a registered spawn must never launch from this file (see the host handler). */
-const REAL_TOOLS = new Set(['claude', 'codex', 'cursor-agent', 'agy', 'gemini', 'security']);
-const PROTOCOL = 1;
-const APP_INSTANCE = 'mesh-methods-instance';
+import { accountId, bundleBuildId, harness, installFakeVendors, startSidecar } from './fixtures/host.mjs';
 
-const fakeAgent = ['debug', 'release']
-  .map((profile) => join(repoRoot, 'src-tauri', 'target', profile, 'fake_agent'))
-  .find((p) => existsSync(p));
+const { check, eq, deepEq, summary } = harness('mesh-methods');
+const home = realpathSync(mkdtempSync(join(tmpdir(), 'gilde-mesh-home-')));
+const host = startSidecar({ env: { HOME: home } });
+const { binaries } = installFakeVendors();
 
-if (fakeAgent === undefined) {
-  process.stdout.write(
-    'mesh-methods: fake_agent is not built.\n' +
-      '  cargo build --manifest-path ../Cargo.toml --bin fake_agent\n',
-  );
-  process.exit(1);
-}
-
-const work = mkdtempSync(join(tmpdir(), 'gilde-mesh-methods-'));
-
-/** One JSON object: what `claude -p --output-format json` prints. */
-const runResultFile = join(work, 'run-result.json');
-writeFileSync(
-  runResultFile,
-  `${JSON.stringify({
-    type: 'result',
-    session_id: 'conv-run-1',
-    result: 'OK',
-    is_error: false,
-    model: 'claude-sonnet-5',
-    usage: { input_tokens: 11, output_tokens: 3, cache_read_input_tokens: 2 },
-  })}\n`,
-);
-
-/** A stream-json transcript: init, many tiny text blocks, a tool, then a result. */
-const TEXT_BLOCKS = 40;
-const streamFile = join(work, 'stream.jsonl');
-{
-  const lines = [JSON.stringify({ type: 'system', subtype: 'init', session_id: 'conv-stream-1' })];
-  for (let i = 0; i < TEXT_BLOCKS; i += 1) {
-    lines.push(
-      JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: `t${i};` }] } }),
-    );
-  }
-  lines.push(
-    JSON.stringify({
-      type: 'assistant',
-      message: { content: [{ type: 'tool_use', name: 'Read', input: { file: 'a.txt' } }] },
-    }),
-  );
-  lines.push(
-    JSON.stringify({
-      type: 'result',
-      session_id: 'conv-stream-1',
-      result: 'done',
-      is_error: false,
-      usage: { input_tokens: 5, output_tokens: 7 },
-    }),
-  );
-  writeFileSync(streamFile, `${lines.join('\n')}\n`);
-}
-const EXPECTED_STREAM_TEXT = Array.from({ length: TEXT_BLOCKS }, (_, i) => `t${i};`).join('');
-
-/** A stream that ends WITHOUT a result event — the terminal-synthesis fixture. */
-const truncatedFile = join(work, 'truncated.jsonl');
-writeFileSync(
-  truncatedFile,
-  `${JSON.stringify({ type: 'system', subtype: 'init', session_id: 'conv-trunc' })}\n` +
-    `${JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'partial' }] } })}\n`,
-);
-
-/** One 40000-character text block: forces the 16 KiB per-message cap to split. */
-const BIG_TEXT_LEN = 40_000;
-const bigTextFile = join(work, 'big-text.jsonl');
-writeFileSync(
-  bigTextFile,
-  `${JSON.stringify({
-    type: 'assistant',
-    message: { content: [{ type: 'text', text: 'a'.repeat(BIG_TEXT_LEN) }] },
-  })}\n` +
-    `${JSON.stringify({ type: 'result', session_id: 'conv-big', result: 'ok', is_error: false })}\n`,
-);
-
-// ── assertion harness ────────────────────────────────────────────────────────
-let failures = 0;
-let checks = 0;
-function check(name, ok, detail) {
-  checks += 1;
-  if (ok) process.stdout.write(`  ok   ${name}\n`);
-  else {
-    failures += 1;
-    process.stdout.write(`  FAIL ${name}${detail === undefined ? '' : ` — ${detail}`}\n`);
-  }
-}
-function eq(name, actual, expected) {
-  check(
-    name,
-    Object.is(actual, expected),
-    `expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`,
-  );
-}
-
-// ── channel ──────────────────────────────────────────────────────────────────
-function startSidecar(envPatch = {}) {
-  const env = {
-    ...process.env,
-    GILDE_APP_INSTANCE: APP_INSTANCE,
-    GILDE_SIDECAR_SELFTEST: '1',
-    AGENT_CLI_CREDENTIAL_STORE: 'memory',
-  };
-  for (const [key, value] of Object.entries(envPatch)) {
-    if (value === undefined) delete env[key];
-    else env[key] = value;
-  }
-  const child = spawn(NODE, [bundle], {
-    cwd: sidecarDir,
-    // GILDE_SIDECAR_SELFTEST unlocks `dev.streamScript` (section M): the scripted
-    // driver for the terminal-event invariant. It is off in production.
-    //
-    // AGENT_CLI_CREDENTIAL_STORE=memory: since agent-mesh 0.1.3 cursor has a real
-    // quota(), which reads the developer's macOS keychain (`security
-    // find-generic-password`) or ~/.cursor/auth.json and calls Cursor's usage
-    // endpoint. `fleet.route` asks every candidate for its quota, so without this the
-    // J section would reach the machine's real Cursor login. The "memory" store has no
-    // keychain and no login file, so cursor's quota() is `null` without any I/O.
-    env,
-    stdio: ['pipe', 'pipe', 'pipe'],
-  });
-
-  const state = {
-    child,
-    journal: [],
-    events: [],
-    stderrLines: [],
-    skipped: 0,
-    pending: new Map(),
-    nextId: 0,
-    buffered: '',
-    /** Launches this host refused because they would have run a real tool. */
-    refusedSpawns: [],
-  };
-
-  child.stdout.setEncoding('utf8');
-  child.stdout.on('data', (chunk) => {
-    state.buffered += chunk;
-    for (;;) {
-      const nl = state.buffered.indexOf('\n');
-      if (nl === -1) break;
-      const line = state.buffered.slice(0, nl);
-      state.buffered = state.buffered.slice(nl + 1);
-      if (line.trim().length > 0) onLine(state, line);
-    }
-  });
-  child.stderr.setEncoding('utf8');
-  child.stderr.on('data', (d) => {
-    for (const l of d.split('\n')) if (l.trim().length > 0) state.stderrLines.push(l);
-  });
-  return state;
-}
-
-function onLine(state, line) {
-  let msg;
-  try {
-    msg = JSON.parse(line);
-  } catch {
-    state.skipped += 1;
-    return;
-  }
-  if (msg.jsonrpc !== '2.0') {
-    state.skipped += 1;
-    return;
-  }
-
-  if (typeof msg.method === 'string') {
-    if (msg.method === 'mesh.event') state.events.push(msg.params);
-    else if (msg.method.startsWith('host.') && msg.method !== 'host.log') {
-      state.journal.push({ method: msg.method, params: msg.params });
-    }
-    if (msg.id === undefined || msg.id === null) return;
-    let result = { ok: true };
-    if (msg.method === 'host.registerSpawn') {
-      // Hermeticity backstop: this file never runs a real vendor CLI or the keychain
-      // tool. Refusing the plan row makes the sidecar's registered seam reject
-      // BEFORE spawning, and the refusal is recorded so a check can fail on it.
-      const cmd = String(msg.params?.cmd ?? '');
-      if (REAL_TOOLS.has(basename(cmd))) {
-        state.refusedSpawns.push(cmd);
-        state.child.stdin.write(
-          `${JSON.stringify({ jsonrpc: '2.0', id: msg.id, error: { code: -32000, message: `test host refuses to launch ${cmd}` } })}\n`,
-        );
-        return;
-      }
-      result = { ok: true, envMarker: `marker-${msg.params.spawnId}` };
-    }
-    state.child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: msg.id, result })}\n`);
-    return;
-  }
-
-  const entry = state.pending.get(msg.id);
-  if (entry === undefined) return;
-  state.pending.delete(msg.id);
-  clearTimeout(entry.timer);
-  if (msg.error !== undefined) {
-    const err = new Error(msg.error.message);
-    err.code = msg.error.code;
-    err.data = msg.error.data;
-    entry.reject(err);
-  } else entry.resolve(msg.result);
-}
-
-function call(state, method, params, timeoutMs = 60_000) {
-  const id = ++state.nextId;
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      state.pending.delete(id);
-      reject(new Error(`sidecar did not answer ${method} within ${timeoutMs}ms`));
-    }, timeoutMs);
-    state.pending.set(id, { resolve, reject, timer });
-    state.child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
-  });
-}
-
-/** Await a rejection and return the JSON-RPC error, or `null` when it resolved. */
-async function expectError(promise) {
-  try {
-    await promise;
-    return null;
-  } catch (err) {
-    return err;
-  }
-}
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-const trace = (state, spawnId) =>
-  state.journal.filter((e) => e.params?.spawnId === spawnId).map((e) => e.method);
-
-function psArgs(pid) {
-  try {
-    return execFileSync('ps', ['-o', 'args=', '-p', String(pid)], { encoding: 'utf8' }).trim();
-  } catch {
-    return '';
-  }
-}
-
-const eventsFor = (state, runId) => state.events.filter((e) => e.runId === runId).map((e) => e.event);
-
-/** Wait until `runId` has emitted a terminal event, or the deadline passes. */
-async function waitForTerminal(state, runId, timeoutMs = 30_000) {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    const evs = eventsFor(state, runId);
-    if (evs.some((e) => e.type === 'done' || e.type === 'error')) return evs;
-    if (Date.now() > deadline) return evs;
-    await sleep(25);
-  }
-}
-
-// ── the run ──────────────────────────────────────────────────────────────────
-const host = startSidecar();
+const goodHello = () => ({
+  protocol: 2,
+  buildId: bundleBuildId(),
+  appInstanceId: 'mesh-methods-instance',
+  providers: { orchestrator: false },
+});
 
 async function main() {
-  process.stdout.write(`mesh-methods: ${bundle}\nfixture:      ${fakeAgent}\n\n`);
+  // ── A. mesh.hello ──────────────────────────────────────────────────────────
+  const p1 = await host.callError('mesh.hello', { protocol: 1, hostVersion: '1.0.0', appInstanceId: 'x', bootId: 'y', binaries: {} });
+  eq('A1 a protocol-1 hello is -32002', p1?.code, -32002);
+  deepEq('A2 … saying what each side speaks', p1?.data, { expected: 2, received: 1 });
+  const extra = await host.callError('mesh.hello', { ...goodHello(), hostVersion: '2.0.0' });
+  deepEq('A3 an unknown field is refused, named', [extra?.code, extra?.data?.field, extra?.data?.rule], [-32602, 'hostVersion', 'unknown']);
+  const { providers, ...noProviders } = goodHello();
+  const missing = await host.callError('mesh.hello', noProviders);
+  deepEq('A4 a missing field is refused, named', [missing?.data?.field, missing?.data?.rule], ['providers', 'required']);
+  const badInstance = await host.callError('mesh.hello', { ...goodHello(), appInstanceId: 'has space' });
+  eq('A5 a malformed instance id is refused by value', badInstance?.data?.field, 'appInstanceId');
+  const badProviders = await host.callError('mesh.hello', { ...goodHello(), providers: { orchestrator: 'yes' } });
+  eq('A6 a non-boolean provider is refused', badProviders?.data?.field, 'providers.orchestrator');
+  const tooEarly = await host.callError('mesh.configure', { binaries: {}, accounts: [], providers: { orchestrator: false } });
+  eq('B1 mesh.configure before mesh.hello is -32006', tooEarly?.code, -32006);
+  const hello = await host.call('mesh.hello', goodHello());
+  deepEq('A7 a good hello answers {protocol, buildId, adapters}', [hello.protocol, hello.buildId, hello.adapters.length], [2, bundleBuildId(), 4]);
 
-  // ── A. handshake ───────────────────────────────────────────────────────────
-  const hello = await call(host, 'mesh.hello', {
-    protocol: PROTOCOL,
-    hostVersion: '0.1.0-mesh-methods',
-    appInstanceId: APP_INSTANCE,
-    bootId: 'mesh-methods-boot',
-    // fake_agent stands in for `claude`; the other three keep their real names.
-    binaries: { claude: fakeAgent },
-    // No default permissionMode on THIS channel: the adapter would put
-    // `--permission-mode <mode>` ahead of `extra.args`, and fake_agent reads its
-    // mode from argv[0]. The default is covered on its own channel in L below.
-    defaults: { timeoutMs: 45 * 60_000 },
-  });
-  const caps = Object.fromEntries((hello.adapters ?? []).map((a) => [a.vendor, a.capabilities]));
-  check(
-    'A1 capabilities are read off the adapter instances',
-    caps.claude?.stream === true &&
-      caps.claude?.steer === 'mid-run' &&
-      caps.claude?.quota === true &&
-      // agent-mesh 0.1.3: codex streams (new `lineStream` seam); cursor and gemini
-      // report quota.
-      caps.codex?.stream === true &&
-      caps.cursor?.quota === true &&
-      caps.gemini?.quota === true,
-    JSON.stringify(caps),
-  );
-  eq('A2 protocol echoed', hello.protocol, PROTOCOL);
+  // ── B. mesh.configure ──────────────────────────────────────────────────────
+  const cfg = (over) => ({ binaries: {}, accounts: [], providers: { orchestrator: false }, ...over });
+  const rel = await host.callError('mesh.configure', cfg({ binaries: { codex: 'bin/codex' } }));
+  deepEq('B2 a relative binary path is refused', [rel?.data?.field, rel?.data?.rule], ['binaries.codex', 'path']);
+  const trailing = await host.callError('mesh.configure', cfg({ binaries: { codex: `${binaries.codex}/` } }));
+  eq('B3 a non-canonical path (trailing /) is refused', trailing?.data?.rule, 'path');
+  const meshName = await host.callError('mesh.configure', cfg({ binaries: { gemini: binaries.agy } }));
+  eq('B4 agent-mesh\'s "gemini" is not a contract vendor', meshName?.data?.field, 'binaries.gemini');
+  const wrongKey = await host.callError('mesh.configure', cfg({ accounts: [{ accountId: accountId('c'), vendor: 'claude', envKey: 'CODEX_HOME', configDir: home }] }));
+  eq('B5 an env key that is not the vendor\'s own variable is refused', wrongKey?.data?.field, 'accounts[0].envKey');
+  const agyKey = await host.callError('mesh.configure', cfg({ accounts: [{ accountId: accountId('a'), vendor: 'agy', envKey: 'AGY_HOME', configDir: home }] }));
+  eq('B6 agy can never carry an account variable (AGY_HOME is ignored)', agyKey?.data?.field, 'accounts[0].envKey');
+  const keyNoDir = await host.callError('mesh.configure', cfg({ accounts: [{ accountId: accountId('c'), vendor: 'claude', envKey: 'CLAUDE_CONFIG_DIR', configDir: null }] }));
+  eq('B7 an env key without a directory is refused', keyNoDir?.data?.field, 'accounts[0].configDir');
+  const dupe = await host.callError('mesh.configure', cfg({ accounts: [{ accountId: accountId('c'), vendor: 'claude', envKey: null, configDir: null }, { accountId: accountId('c'), vendor: 'claude', envKey: null, configDir: null }] }));
+  eq('B8 a duplicate account id is refused', dupe?.data?.rule, 'unique');
+  const accountExtra = await host.callError('mesh.configure', cfg({ accounts: [{ accountId: accountId('c'), vendor: 'claude', envKey: null, configDir: null, token: 'x' }] }));
+  deepEq('B9 an account with an unknown field (e.g. a token) is refused', [accountExtra?.data?.field, accountExtra?.data?.rule], ['accounts[0].token', 'unknown']);
+  const badAccountId = await host.callError('mesh.configure', cfg({ accounts: [{ accountId: 'acct', vendor: 'claude', envKey: null, configDir: null }] }));
+  eq('B10 a malformed account id is refused by value', badAccountId?.data?.rule, 'pattern');
+  deepEq('B11 a good configure answers {}', await host.call('mesh.configure', cfg({ binaries: { codex: binaries.codex } })), {});
+  deepEq('B12 … and reconfiguring works', await host.call('mesh.configure', cfg({ binaries })), {});
 
-  // A mismatched protocol must be a HARD error on a fresh channel.
-  {
-    const other = startSidecar();
-    const err = await expectError(call(other, 'mesh.hello', { protocol: 99 }));
-    check('A3 a protocol mismatch is a hard error', err !== null && err.code === -32002, String(err));
-    other.child.kill('SIGKILL');
+  // ── C. mesh.ping ───────────────────────────────────────────────────────────
+  eq('C1 the nonce comes back', (await host.call('mesh.ping', { nonce: 7 })).nonce, 7);
+  eq('C2 no params is fine', (await host.call('mesh.ping', undefined)).nonce, null);
+  eq('C3 a string nonce is refused', (await host.callError('mesh.ping', { nonce: 'n' }))?.data?.field, 'nonce');
+  eq('C4 an unknown ping field is refused', (await host.callError('mesh.ping', { nonce: 1, at: 2 }))?.data?.rule, 'unknown');
+
+  // ── D. the method set ──────────────────────────────────────────────────────
+  for (const method of [
+    'mesh.run',
+    'mesh.stream',
+    'mesh.resume',
+    'mesh.cancel',
+    'mesh.steer',
+    'mesh.authStatus',
+    'mesh.availableModels',
+    'mesh.quota',
+    'mesh.adapters',
+    'fleet.route',
+    'cco.team.list',
+    'cco.team.get',
+    'cco.workers',
+  ]) {
+    eq(`D ${method} is not on the protocol-2 channel`, (await host.callError(method, {}))?.code, -32601);
   }
+  host.child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'host.surprise', params: { x: 1 } })}\n`);
+  eq('D a host notification for an unknown method is ignored, never fatal', (await host.call('mesh.ping', { nonce: 9 })).nonce, 9);
 
-  // ── B. mesh.run ────────────────────────────────────────────────────────────
-  const beforeB = host.journal.length;
-  const runResult = await call(host, 'mesh.run', {
-    runId: 'run-b',
-    vendor: 'claude',
-    task: {
-      prompt: 'reply with OK',
-      cwd: work,
-      timeoutMs: 30_000,
-      extra: { args: ['emit-jsonl', runResultFile] },
-    },
-  });
-  const bSpawnId = host.journal.slice(beforeB)[0]?.params?.spawnId;
-  check(
-    'B1 one run → registerSpawn → spawned → exited, in order',
-    trace(host, bSpawnId).join(' → ') === 'host.registerSpawn → host.spawned → host.exited',
-    trace(host, bSpawnId).join(' → '),
-  );
-  eq('B2 the spawn is attributed to the runId', host.journal.slice(beforeB)[0]?.params?.runId, 'run-b');
-  eq('B3 RunResult.vendor', runResult.vendor, 'claude');
-  eq('B4 RunResult.conversationId is verbatim', runResult.conversationId, 'conv-run-1');
-  eq('B5 RunResult.status', runResult.status, 'ok');
-  eq('B6 RunResult.text', runResult.text, 'OK');
-  check(
-    'B7 usage is mapped through verbatim',
-    runResult.usage?.inputTokens === 11 && runResult.usage?.cachedInputTokens === 2,
-    JSON.stringify(runResult.usage),
-  );
-  check('B8 raw vendor payload survives', runResult.raw?.session_id === 'conv-run-1', JSON.stringify(runResult.raw));
+  // ── E. orchestrator gating ─────────────────────────────────────────────────
+  eq('E1 orchestrator absent: orch.team.list does not exist', (await host.callError('orch.team.list', { roots: [], panePids: [] }))?.code, -32601);
+  await host.call('mesh.configure', cfg({ binaries, providers: { orchestrator: true } }));
+  const listed = await host.call('orch.team.list', { roots: [], panePids: [] });
+  check('E2 orchestrator present: orch.team.list answers', typeof listed === 'object' && listed !== null, JSON.stringify(listed).slice(0, 120));
+  check('E3 orch.workers answers too', typeof (await host.call('orch.workers', { roots: [], panePids: [] })) === 'object');
+  await host.call('mesh.configure', cfg({ binaries, providers: { orchestrator: false } }));
+  eq('E4 orchestrator gone: its methods are removed', (await host.callError('orch.team.get', { teamId: 'tmabcdefghi1' }))?.code, -32601);
+  const stats = await host.call('dev.stats', {});
+  eq('E5 the observer is disposed', stats.orchestrator, false);
 
-  // ── C. mesh.stream ─────────────────────────────────────────────────────────
-  const accepted = await call(host, 'mesh.stream', {
-    runId: 'run-c',
-    vendor: 'claude',
-    task: {
-      prompt: 'stream please',
-      cwd: work,
-      timeoutMs: 30_000,
-      extra: { args: ['emit-jsonl', streamFile] },
-    },
-  });
-  eq('C1 mesh.stream returns {accepted:true} immediately', accepted.accepted, true);
-  const cEvents = await waitForTerminal(host, 'run-c');
-  const cTerminals = cEvents.filter((e) => e.type === 'done' || e.type === 'error');
-  eq('C2 exactly one terminal event', cTerminals.length, 1);
-  eq('C3 the terminal event is a done', cTerminals[0]?.type, 'done');
-  eq('C4 done carries the conversationId', cTerminals[0]?.result?.conversationId, 'conv-stream-1');
-  const cText = cEvents.filter((e) => e.type === 'text');
-  eq('C5 no text is lost by merging', cText.map((e) => e.text).join(''), EXPECTED_STREAM_TEXT);
-  check(
-    `C6 ${TEXT_BLOCKS} source text blocks were merged into far fewer messages`,
-    cText.length > 0 && cText.length <= TEXT_BLOCKS / 4,
-    `${cText.length} text event(s)`,
-  );
-  check(
-    'C7 tool and usage events pass through unmerged',
-    cEvents.some((e) => e.type === 'tool' && e.name === 'Read') &&
-      cEvents.some((e) => e.type === 'usage'),
-    JSON.stringify(cEvents.map((e) => e.type)),
-  );
-  check(
-    'C8 the terminal event is last',
-    cEvents.indexOf(cTerminals[0]) === cEvents.length - 1,
-    JSON.stringify(cEvents.map((e) => e.type)),
-  );
-
-  // ── D. a stream with no result event still terminates exactly once ─────────
-  await call(host, 'mesh.stream', {
-    runId: 'run-d',
-    vendor: 'claude',
-    task: {
-      prompt: 'truncated',
-      cwd: work,
-      timeoutMs: 30_000,
-      extra: { args: ['emit-jsonl', truncatedFile] },
-    },
-  });
-  const dEvents = await waitForTerminal(host, 'run-d');
-  const dTerminals = dEvents.filter((e) => e.type === 'done' || e.type === 'error');
-  eq('D1 exactly one terminal event when the stream is truncated', dTerminals.length, 1);
-  eq('D2 that terminal event is an error', dTerminals[0]?.type, 'error');
-  check(
-    'D3 the partial text still reached the host',
-    dEvents.some((e) => e.type === 'text' && e.text === 'partial'),
-    JSON.stringify(dEvents.map((e) => e.type)),
-  );
-
-  // ── E. the 16 KiB per-message cap ──────────────────────────────────────────
-  await call(host, 'mesh.stream', {
-    runId: 'run-e',
-    vendor: 'claude',
-    task: {
-      prompt: 'big',
-      cwd: work,
-      timeoutMs: 30_000,
-      extra: { args: ['emit-jsonl', bigTextFile] },
-    },
-  });
-  const eEvents = await waitForTerminal(host, 'run-e');
-  const eText = eEvents.filter((e) => e.type === 'text');
-  check('E1 a 40000-char block was split', eText.length >= 2, `${eText.length} text event(s)`);
-  check(
-    'E2 no merged text message exceeds 16 KiB',
-    eText.every((e) => Buffer.byteLength(e.text, 'utf8') <= 16 * 1024),
-    JSON.stringify(eText.map((e) => Buffer.byteLength(e.text, 'utf8'))),
-  );
-  eq('E3 nothing was lost or duplicated in the split', eText.map((e) => e.text).join('').length, BIG_TEXT_LEN);
-  eq(
-    'E4 still exactly one terminal event',
-    eEvents.filter((e) => e.type === 'done' || e.type === 'error').length,
-    1,
-  );
-
-  // ── M. the terminal-event invariant, forced ────────────────────────────────
-  // All four agent-mesh adapters catch their own failures and always yield a
-  // terminal event, so these two branches are unreachable through them — and they
-  // are exactly the ones that would strand a run as `running` forever. The
-  // scripted source reaches them directly.
-  await call(host, 'dev.streamScript', {
-    runId: 'run-m1',
-    events: [{ type: 'text', text: 'partial' }],
-    end: 'throw',
-    throwMessage: 'iterator blew up',
-  });
-  const m1 = await waitForTerminal(host, 'run-m1');
-  const m1Terminals = m1.filter((e) => e.type === 'done' || e.type === 'error');
-  eq('M1 an iterator that throws still yields exactly one terminal', m1Terminals.length, 1);
-  check(
-    'M2 the synthesized terminal is an error carrying the cause',
-    m1Terminals[0]?.type === 'error' && m1Terminals[0]?.message.includes('iterator blew up'),
-    JSON.stringify(m1Terminals[0]),
-  );
-  check(
-    'M3 buffered text is flushed before the terminal',
-    m1[0]?.type === 'text' && m1[0]?.text === 'partial',
-    JSON.stringify(m1.map((e) => e.type)),
-  );
-
-  await call(host, 'dev.streamScript', {
-    runId: 'run-m2',
-    events: [{ type: 'text', text: 'x' }],
-    end: 'natural',
-  });
-  const m2 = await waitForTerminal(host, 'run-m2');
-  const m2Terminals = m2.filter((e) => e.type === 'done' || e.type === 'error');
-  eq('M4 an iterator that just ends is given a synthesized terminal', m2Terminals.length, 1);
-  eq('M5 that terminal is an error', m2Terminals[0]?.type, 'error');
-
-  const doneResult = { vendor: 'claude', conversationId: 'c-m3', text: 'ok', status: 'ok' };
-  await call(host, 'dev.streamScript', {
-    runId: 'run-m3',
-    events: [
-      { type: 'done', result: doneResult },
-      { type: 'text', text: 'after the end' },
-      { type: 'error', message: 'a second terminal' },
-    ],
-    end: 'natural',
-  });
-  await waitForTerminal(host, 'run-m3');
-  await sleep(150); // let anything that would wrongly follow the terminal arrive
-  const m3All = eventsFor(host, 'run-m3');
-  eq(
-    'M6 a second terminal event is suppressed',
-    m3All.filter((e) => e.type === 'done' || e.type === 'error').length,
-    1,
-  );
-  eq('M7 the surviving terminal is the first one', m3All[0]?.type, 'done');
-  eq('M8 nothing is emitted after the terminal', m3All.length, 1);
-
-  // ── F. adapter errors become typed JSON-RPC errors ─────────────────────────
-  const fErr = await expectError(
-    call(host, 'mesh.run', {
-      runId: 'run-f',
-      vendor: 'claude',
-      task: {
-        prompt: 'fail please',
-        cwd: work,
-        timeoutMs: 30_000,
-        extra: { args: ['normal', '3'] },
-      },
-    }),
-  );
-  check('F1 a failing agent rejects the call', fErr !== null, String(fErr));
-  eq('F2 the AgentMesh error name is in data', fErr?.data?.name, 'AdapterExecError');
-  eq('F3 the vendor is in data', fErr?.data?.vendor, 'claude');
-  eq('F4 the exit code is in data', fErr?.data?.exitCode, 3);
-  const aliveAfterF = await call(host, 'mesh.ping', { nonce: 'f' });
-  eq('F5 a thrown adapter error never kills the process', aliveAfterF.nonce, 'f');
-
-  const gone = await expectError(
-    call(host, 'mesh.run', {
-      runId: 'run-f2',
-      vendor: 'not-a-vendor',
-      task: { prompt: 'x', cwd: work, timeoutMs: 1000 },
-    }),
-  );
-  eq('F6 an unknown vendor is -32602', gone?.code, -32602);
-
-  // ── G. task validation (§5-4) ──────────────────────────────────────────────
-  const relative = await expectError(
-    call(host, 'mesh.run', {
-      runId: 'run-g1',
-      vendor: 'claude',
-      task: { prompt: 'x', cwd: 'relative/path', timeoutMs: 1000 },
-    }),
-  );
-  eq('G1 a relative cwd is -32602', relative?.code, -32602);
-  const missing = await expectError(
-    call(host, 'mesh.run', {
-      runId: 'run-g2',
-      vendor: 'claude',
-      task: { prompt: 'x', cwd: join(work, 'no-such-dir'), timeoutMs: 1000 },
-    }),
-  );
-  eq('G2 a non-existent cwd is -32602', missing?.code, -32602);
-
-  // ── H. mesh.steer was removed (it only ever refused) ───────────────────────
-  const steer = await expectError(
-    call(host, 'mesh.steer', { vendor: 'claude', conversationId: 'c', message: 'hi' }),
-  );
-  eq('H1 mesh.steer is not a method (-32601)', steer?.code, -32601);
-
-  // ── I. mesh.cancel ─────────────────────────────────────────────────────────
-  eq(
-    'I1 cancelling an unknown run is an honest {stopped:false, via:"none"}',
-    JSON.stringify(await call(host, 'mesh.cancel', { runId: 'never-started' })),
-    JSON.stringify({ stopped: false, via: 'none' }),
-  );
-
-  const beforeI = host.journal.length;
-  const hangingRun = expectError(
-    call(
-      host,
-      'mesh.run',
-      {
-        runId: 'run-i',
-        vendor: 'claude',
-        task: { prompt: 'hang', cwd: work, timeoutMs: 120_000, extra: { args: ['hang'] } },
-      },
-      90_000,
-    ),
-  );
-  // Let the child exist and its pid reach us before cancelling.
-  await sleep(900);
-  const iSpawned = host.journal.slice(beforeI).find((e) => e.method === 'host.spawned');
-  check('I2 the hanging child registered a pid', iSpawned !== undefined);
-  const cancel = await call(host, 'mesh.cancel', { runId: 'run-i' });
-  eq('I3 cancel reports stopped', cancel.stopped, true);
-  eq('I4 cancel went out as killpg', cancel.via, 'killpg');
-  const iErr = await hangingRun;
-  check('I5 the cancelled run settles instead of hanging', iErr !== null, 'the run resolved');
-  await sleep(300);
-  check(
-    'I6 the child is gone',
-    iSpawned === undefined || psArgs(iSpawned.params.pid) === '',
-    psArgs(iSpawned?.params?.pid ?? 0),
-  );
-  const secondCancel = await call(host, 'mesh.cancel', { runId: 'run-i' });
-  eq('I7 the run entry was released when it settled', secondCancel.via, 'none');
-
-  // ── J. fleet.route — the only router ───────────────────────────────────────
-  const route = await call(host, 'fleet.route', {
-    // cursor's quota() is `null` here without any I/O: the sidecar runs with
-    // AGENT_CLI_CREDENTIAL_STORE=memory (no keychain, no login file — see
-    // startSidecar), so this routes without touching a real CLI or credential.
-    task: { prompt: 'anything', cwd: work },
-    policy: { prefer: ['cursor'] },
-  });
-  eq('J1 fleet.route returns the chosen vendor', route.vendor, 'cursor');
-  check(
-    'J0 routing launched no real CLI and read no keychain',
-    host.refusedSpawns.length === 0 &&
-      !host.journal.some((e) => e.method === 'host.registerSpawn' && basename(String(e.params?.cmd ?? '')) === 'security'),
-    JSON.stringify(host.refusedSpawns),
-  );
-  const noRoute = await expectError(
-    call(host, 'fleet.route', { task: { prompt: 'x' }, policy: { prefer: ['nobody'] } }),
-  );
-  eq('J2 NoRouteError keeps its AgentMesh name', noRoute?.data?.name, 'NoRouteError');
-  const badPolicy = await expectError(
-    call(host, 'fleet.route', { task: { prompt: 'x' }, policy: { strategy: 'vibes' } }),
-  );
-  eq('J3 an unknown strategy is -32602, never silently defaulted', badPolicy?.code, -32602);
-
-  // ── K. robustness of the channel under this surface ────────────────────────
-  host.child.stdin.write('not json at all\n');
-  host.child.stdin.write(`${JSON.stringify({ id: 1, method: 'mesh.ping' })}\n`);
-  eq('K1 a malformed line is skipped, the session continues', (await call(host, 'mesh.ping', { nonce: 'k1' })).nonce, 'k1');
-  host.child.stdin.write(`${'x'.repeat(9 * 1024 * 1024)}\n`);
-  eq('K2 a 9 MiB line is a protocol violation, not a crash', (await call(host, 'mesh.ping', { nonce: 'k2' })).nonce, 'k2');
-  eq('K3 nothing but JSON-RPC ever reached stdout', host.skipped, 0);
-
-  // ── L. the handshake defaults reach the child's argv ───────────────────────
-  // On its own channel because `defaults` are fixed at `mesh.hello`, and a default
-  // permissionMode changes argv in a way the fake_agent fixture cannot survive.
-  {
-    const other = startSidecar();
-    await call(other, 'mesh.hello', {
-      protocol: PROTOCOL,
-      appInstanceId: `${APP_INSTANCE}-defaults`,
-      binaries: { claude: fakeAgent },
-      defaults: { timeoutMs: 7_000, permissionMode: 'acceptEdits' },
-    });
-    // The run fails (fake_agent sees `--permission-mode` as its mode) — the point
-    // is the argv the host was told about before it ever ran.
-    await expectError(
-      call(other, 'mesh.run', {
-        runId: 'run-l',
-        vendor: 'claude',
-        task: { prompt: 'x', cwd: work, extra: { args: ['normal', '0'] } },
-      }),
-    );
-    const registered = other.journal.find((e) => e.method === 'host.registerSpawn')?.params ?? {};
-    const args = registered.args ?? [];
-    check(
-      'L1 defaults.permissionMode is applied when the task names none',
-      args[0] === '--permission-mode' && args[1] === 'acceptEdits',
-      JSON.stringify(args),
-    );
-    check(
-      'L2 the prompt is still the final argv element',
-      args[args.length - 1] === 'x' && args[args.length - 2] === '--',
-      JSON.stringify(args.slice(-3)),
-    );
-    other.child.kill('SIGKILL');
-  }
-
-  await codexListingSection();
-
-  await call(host, 'mesh.shutdown', { graceMs: 0 });
-}
-
-// ── N. the codex app-server listing goes through the registered spawner ───────
-/**
- * A fake `codex app-server` (never the real CLI): JSON-RPC over stdio like the real
- * one. `ok` answers initialize and one model/list page, then exits 0 when stdin closes;
- * `hang` answers nothing and keeps a grandchild alive, so the deadline kill must take
- * the whole group. Each writes what it saw (pid, GILDE_SPAWN_ID, CODEX_HOME, argv) to
- * `<name>.seen.json` next to itself.
- */
-function writeFakeAppServer(dir, name, mode) {
-  const file = join(dir, name);
-  const seen = join(dir, `${name}.seen.json`);
-  const body = `#!${NODE}
-const fs = require('node:fs');
-const { spawn } = require('node:child_process');
-const seen = { pid: process.pid, argv: process.argv.slice(2), marker: process.env.GILDE_SPAWN_ID ?? null, codexHome: process.env.CODEX_HOME ?? null, grandchild: null };
-if (${JSON.stringify(mode)} === 'hang') {
-  const g = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
-  seen.grandchild = g.pid;
-}
-fs.writeFileSync(${JSON.stringify(seen)}, JSON.stringify(seen));
-if (${JSON.stringify(mode)} === 'hang') { setInterval(() => {}, 1000); return; }
-let buf = '';
-process.stdin.setEncoding('utf8');
-process.stdin.on('data', (d) => {
-  buf += d;
-  let nl;
-  while ((nl = buf.indexOf('\\n')) !== -1) {
-    const line = buf.slice(0, nl); buf = buf.slice(nl + 1);
-    if (!line.trim()) continue;
-    const m = JSON.parse(line);
-    if (m.method === 'initialize') process.stdout.write(JSON.stringify({ id: m.id, result: { userAgent: 'fake-app-server' } }) + '\\n');
-    else if (m.method === 'model/list') process.stdout.write(JSON.stringify({ id: m.id, result: { data: [{ id: 'fake-live-model', displayName: 'Fake Live', isDefault: true }], nextCursor: null } }) + '\\n');
-  }
-});
-process.stdin.on('end', () => process.exit(0));
-`;
-  writeFileSync(file, body);
-  chmodSync(file, 0o755);
-  return { file, seen };
-}
-
-function alive(pid) {
-  if (typeof pid !== 'number' || pid <= 1) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function codexListingSection() {
-  const dir = join(work, 'codex-listing');
-  const codexHome = join(dir, 'codex-home'); // empty: no auth.json, so the gate passes the list as is
-  mkdirSync(codexHome, { recursive: true });
-  const ok = writeFakeAppServer(dir, 'fake-codex-ok', 'ok');
-  const hang = writeFakeAppServer(dir, 'fake-codex-hang', 'hang');
-  // Never the developer's ~/.codex: the adapter reads <CODEX_HOME>/auth.json for the gate.
-  const envPatch = { CODEX_HOME: codexHome, OPENAI_API_KEY: undefined };
-  const helloFor = (binary, suffix) => ({
-    protocol: PROTOCOL,
-    appInstanceId: `${APP_INSTANCE}-${suffix}`,
-    binaries: { claude: fakeAgent, codex: binary },
-    defaults: { timeoutMs: 60_000 },
-  });
-  const started = [];
-  try {
-    // N1–N4: a listing that answers.
-    {
-      const ch = startSidecar(envPatch);
-      started.push(ch);
-      await call(ch, 'mesh.hello', helloFor(ok.file, 'codex-ok'));
-      const models = await call(ch, 'mesh.availableModels', { vendor: 'codex' });
-      const reg = ch.journal.find((e) => e.method === 'host.registerSpawn' && e.params?.cmd === ok.file)?.params ?? {};
-      const spawned = ch.journal.find((e) => e.method === 'host.spawned' && e.params?.spawnId === reg.spawnId)?.params;
-      const exited = ch.journal.find((e) => e.method === 'host.exited' && e.params?.spawnId === reg.spawnId)?.params;
-      const seen = existsSync(ok.seen) ? JSON.parse(readFileSync(ok.seen, 'utf8')) : {};
-      check(
-        'N1 the codex app-server listing is registered before it runs: kind probe, runId introspect, vendor codex, argv app-server',
-        reg.spawnId !== undefined && reg.kind === 'probe' && reg.runId === 'introspect' && reg.vendor === 'codex' &&
-          JSON.stringify(reg.args) === '["app-server"]',
-        JSON.stringify(reg),
-      );
-      check(
-        'N2 registerSpawn → spawned → exited, in order; the row ends with exit 0',
-        trace(ch, reg.spawnId).join(' → ') === 'host.registerSpawn → host.spawned → host.exited' &&
-          exited?.exitCode === 0 && exited?.signal === null,
-        JSON.stringify({ trace: trace(ch, reg.spawnId), exited }),
-      );
-      check(
-        'N3 the child is the registered one: its pid is host.spawned\'s, GILDE_SPAWN_ID is the host\'s marker, CODEX_HOME the account home (keys only reported)',
-        spawned?.pid === seen.pid && seen.marker === `marker-${reg.spawnId}` && seen.codexHome === codexHome &&
-          Array.isArray(reg.envKeys) && reg.envKeys.includes('CODEX_HOME') && !JSON.stringify(reg).includes(codexHome),
-        JSON.stringify({ spawnedPid: spawned?.pid, seen, envKeys: (reg.envKeys ?? []).length }),
-      );
-      check(
-        'N4 the listing answered through the proxied pipes: the live model is in the result',
-        Array.isArray(models) && models.some((m) => m.id === 'fake-live-model' && m.label === 'Fake Live'),
-        JSON.stringify(models),
-      );
-      ch.child.kill('SIGKILL');
-    }
-
-    // N5–N7: a listing that never answers → the adapter's deadline kill.
-    {
-      const ch = startSidecar(envPatch);
-      started.push(ch);
-      await call(ch, 'mesh.hello', helloFor(hang.file, 'codex-hang'));
-      const t0 = Date.now();
-      const models = await call(ch, 'mesh.availableModels', { vendor: 'codex' }, 60_000);
-      const waited = Date.now() - t0;
-      const reg = ch.journal.find((e) => e.method === 'host.registerSpawn' && e.params?.cmd === hang.file)?.params ?? {};
-      // host.exited may land just after the answer (the kill → close → report chain).
-      const deadline = Date.now() + 5_000;
-      let exited;
-      while (Date.now() < deadline) {
-        exited = ch.journal.find((e) => e.method === 'host.exited' && e.params?.spawnId === reg.spawnId)?.params;
-        if (exited !== undefined) break;
-        await sleep(25);
-      }
-      const seen = existsSync(hang.seen) ? JSON.parse(readFileSync(hang.seen, 'utf8')) : {};
-      await sleep(200);
-      check(
-        `N5 a listing that never answers is given up at the adapter's deadline (${waited} ms ≥ 14.5 s) with the static list`,
-        waited >= 14_500 && Array.isArray(models) && models.length > 0 && !models.some((m) => m.id === 'fake-live-model'),
-        JSON.stringify({ waited, n: Array.isArray(models) ? models.length : models }),
-      );
-      check(
-        'N6 the deadline kill reaches the registered child: its row settles with SIGKILL (spawned before, exited after)',
-        trace(ch, reg.spawnId).join(' → ') === 'host.registerSpawn → host.spawned → host.exited' && exited?.signal === 'SIGKILL',
-        JSON.stringify({ trace: trace(ch, reg.spawnId), exited }),
-      );
-      check(
-        'N7 the whole process group is gone: the app-server and the grandchild it started',
-        typeof seen.pid === 'number' && typeof seen.grandchild === 'number' && !alive(seen.pid) && !alive(seen.grandchild),
-        JSON.stringify({ pid: seen.pid, pidAlive: alive(seen.pid), grandchild: seen.grandchild, grandchildAlive: alive(seen.grandchild) }),
-      );
-      check('N8 no real CLI was asked for on either channel', started.every((c) => c.refusedSpawns.length === 0), JSON.stringify(started.map((c) => c.refusedSpawns)));
-      ch.child.kill('SIGKILL');
-    }
-  } finally {
-    for (const ch of started) {
-      try {
-        ch.child.kill('SIGKILL');
-      } catch {
-        /* gone */
-      }
-    }
-    // Only the fakes this section started, and only if a failure left them behind.
-    for (const f of [ok.seen, hang.seen]) {
-      if (!existsSync(f)) continue;
-      const seen = JSON.parse(readFileSync(f, 'utf8'));
-      for (const pid of [seen.pid, seen.grandchild]) {
-        if (alive(pid)) {
-          try {
-            process.kill(pid, 'SIGKILL');
-          } catch {
-            /* gone */
-          }
-        }
-      }
-    }
-  }
+  // ── F. mesh.shutdown ───────────────────────────────────────────────────────
+  eq('F1 a grace out of range is refused', (await host.callError('mesh.shutdown', { graceMs: 120_000 }))?.data?.field, 'graceMs');
+  deepEq('F2 a good shutdown answers', await host.call('mesh.shutdown', { graceMs: 0 }), { ok: true });
+  const exit = await host.waitExit(4_000);
+  eq('F3 … and the process exits 0', exit?.code, 0);
+  check('Z1 nothing but JSON-RPC reached stdout', host.skipped === 0, String(host.skipped));
 }
 
 const guard = setTimeout(() => {
   process.stdout.write('\nmesh-methods: TIMED OUT\n');
   host.child.kill('SIGKILL');
   process.exit(1);
-}, 240_000);
+}, 60_000);
 guard.unref();
 
 main()
-  .then(() => {
-    process.stdout.write(`\nmesh-methods: ${checks - failures}/${checks} checks passed\n`);
-    if (failures > 0) {
-      process.stdout.write('sidecar stderr:\n');
-      for (const l of host.stderrLines.slice(-30)) process.stdout.write(`  ${l}\n`);
-    }
-    setTimeout(() => {
-      try {
-        host.child.kill('SIGKILL');
-      } catch {
-        /* already gone */
-      }
-      process.exit(failures > 0 ? 1 : 0);
-    }, 300);
-  })
-  .catch((err) => {
-    process.stdout.write(`\nmesh-methods: ERROR ${err.message}\n`);
-    for (const l of host.stderrLines.slice(-30)) process.stdout.write(`  ${l}\n`);
-    try {
-      host.child.kill('SIGKILL');
-    } catch {
-      /* already gone */
-    }
-    process.exit(1);
+  .catch((err) => check('no unexpected exception', false, err?.stack ?? String(err)))
+  .finally(async () => {
+    await host.close();
+    const failures = summary();
+    if (failures > 0) for (const l of host.stderrLines.slice(-20)) process.stdout.write(`  | ${l}\n`);
+    process.exit(failures > 0 ? 1 : 0);
   });

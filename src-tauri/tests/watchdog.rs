@@ -18,22 +18,19 @@
 
 mod fixtures;
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gilde_code_lib::commands::monitor;
 use gilde_code_lib::config::ConfigStore;
-use gilde_code_lib::events::bus::{EventBus, RecordingSink};
-use gilde_code_lib::model::graph::GraphHandle;
+use gilde_code_lib::events::{Events, RecordingEvents};
 use gilde_code_lib::store::models::{ProcKind, PtySessionRow};
 use gilde_code_lib::store::{dao, Db};
 use gilde_code_lib::supervise::kill::{is_gone, KillOpts, KillTarget};
 use gilde_code_lib::supervise::procscan::ps_snapshot;
 use gilde_code_lib::supervise::reaper;
-use gilde_code_lib::supervise::registry::{SpawnPlan, Supervisor};
+use gilde_code_lib::supervise::registry::Supervisor;
 use gilde_code_lib::supervise::spawn::is_alive;
 use gilde_code_lib::supervise::watchdog::Watchdog;
 use gilde_code_lib::supervise::{Alarm, ProcGroupKind, ProcTag, ScanFilter};
@@ -41,6 +38,46 @@ use gilde_code_lib::supervise::{Alarm, ProcGroupKind, ProcTag, ScanFilter};
 use rusty_fork::rusty_fork_test;
 use serde_json::json;
 use std::os::unix::process::CommandExt as _;
+
+/// A fixture's spawn request on the one spawn path (`SupervisorApi`'s
+/// checks, A12.8/A22.3; the legacy `Supervisor::plan_spawn(SpawnPlan)` is
+/// gone): `headless` rows are the turn runs they became, and a sidecar or
+/// turn row belongs to `generation` (1 unless given).
+#[allow(dead_code)]
+fn fixture_request(
+    kind: ProcKind,
+    argv: &[String],
+    cwd: impl AsRef<std::path::Path>,
+    parent: Option<&str>,
+    generation: Option<i64>,
+) -> gilde_code_lib::contract::services::SpawnRequest {
+    use gilde_code_lib::contract::process::ProcKind as C;
+    let kind = match kind {
+        ProcKind::Pty => C::Pty,
+        ProcKind::Convo => C::Convo,
+        ProcKind::Pane => C::Pane,
+        ProcKind::Attach => C::Attach,
+        ProcKind::Turn | ProcKind::Headless => C::Turn,
+        ProcKind::Sidecar => C::Sidecar,
+        ProcKind::Probe => C::Probe,
+        ProcKind::Vendorcli => C::Vendorcli,
+        ProcKind::Git => C::Git,
+        ProcKind::Ide => C::Ide,
+        other => panic!("no fixture kind for {other:?}"),
+    };
+    let needs_generation = matches!(kind, C::Turn | C::Sidecar);
+    gilde_code_lib::contract::services::SpawnRequest {
+        kind,
+        argv0: gilde_code_lib::contract::common::AbsPath::parse(argv[0].clone()).expect("absolute argv[0]"),
+        args: argv[1..].to_vec(),
+        cwd: gilde_code_lib::contract::common::AbsPath::parse(cwd.as_ref().to_string_lossy().into_owned()).ok(),
+        env_keys: Vec::new(),
+        parent_uid: parent.map(|p| gilde_code_lib::contract::ids::SessionUid::parse(p).expect("uid")),
+        generation: generation.or(needs_generation.then_some(1)),
+        turn_id: (kind == C::Turn).then(|| "t-fixture".to_string()),
+    }
+}
+
 
 /// How long a test waits for the kernel to catch up with reality.
 const SETTLE: Duration = Duration::from_secs(20);
@@ -75,10 +112,9 @@ fn block_on<F: std::future::Future>(f: F) -> F::Output {
 struct Harness {
     sup: Arc<Supervisor>,
     config: Arc<ConfigStore>,
-    sink: Arc<RecordingSink>,
-    bus: EventBus,
+    sink: Arc<RecordingEvents>,
+    bus: Events,
     db: Db,
-    _graph: GraphHandle,
     dir: tempfile::TempDir,
 }
 
@@ -90,9 +126,8 @@ async fn harness(supervision: serde_json::Value) -> Harness {
     config
         .patch(json!({ "supervision": supervision }))
         .expect("patch settings");
-    let graph = GraphHandle::new();
-    let sink = Arc::new(RecordingSink::default());
-    let bus = EventBus::with_sink(sink.clone(), graph.state().clone());
+    let sink = RecordingEvents::new();
+    let bus = Events::new(sink.clone());
     let sup = Arc::new(
         Supervisor::open_instance(&db, config.clone(), "0.0.0-test")
             .await
@@ -105,7 +140,6 @@ async fn harness(supervision: serde_json::Value) -> Harness {
         sink,
         bus,
         db,
-        _graph: graph,
         dir,
     }
 }
@@ -218,6 +252,12 @@ fn spawn_child(argv: &[String], cwd: &Path, marker: &str) -> Kid {
     kid
 }
 
+/// The §9.3 allowlist admits only resolved binaries: a fixture is
+/// allowlisted for the kind it is planned as before it is planned (A12.8).
+fn allow(argv: &[String], kind: ProcKind) {
+    gilde_code_lib::supervise::spawn::allow_executable(std::path::Path::new(&argv[0]), &[kind]);
+}
+
 /// Plan a row, start the process it describes, mark it running — DESIGN §8-3.
 async fn register(
     sup: &Supervisor,
@@ -225,11 +265,26 @@ async fn register(
     cwd: &Path,
     session_id: Option<&str>,
 ) -> (String, Kid) {
-    let mut plan = SpawnPlan::new(ProcKind::Pty, argv.to_vec(), cwd).vendor("claude");
-    if let Some(session_id) = session_id {
-        plan = plan.session(session_id);
-    }
-    let guard = sup.plan_spawn(plan).await.expect("plan_spawn");
+    allow(argv, ProcKind::Pty);
+    let guard = sup
+        .plan_guarded(fixture_request(ProcKind::Pty, argv, cwd, None, None))
+        .await
+        .expect("plan_spawn");
+    // What `SupervisorApi` cannot express, the fixture sets on the row: the
+    // PTY session the watchdog attributes by, and the vendor the fixture
+    // stands in for.
+    let id = guard.spawn_id().to_string();
+    let session = session_id.map(str::to_string);
+    sup.db()
+        .write(move |conn| {
+            conn.execute(
+                "UPDATE proc_registry SET vendor = 'claude', session_id = ?2 WHERE spawn_id = ?1",
+                rusqlite::params![id, session],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("fixture columns");
     let kid = spawn_child(argv, cwd, guard.env_marker());
     let pid = kid.pid();
     guard.mark_running(pid, pid).expect("mark_running");
@@ -308,8 +363,13 @@ fn wait_until_gone(pid: i32) {
 // ===========================================================================
 
 rusty_fork_test! {
+    /// G5 benchmark (A10.7): the same rule against a real allocation and the
+    /// kernel's RSS, which needs wall-clock waits (the RSS settle, ticks until
+    /// the compressor lets the crossing happen). The functional version is
+    /// [`a_session_over_the_soft_budget_alerts_exactly_once`] below.
     #[test]
-    fn a_session_over_the_soft_budget_alerts_exactly_once() {
+    #[ignore = "G5 benchmark (A10.7): real RSS of a real allocation, timing-dependent"]
+    fn watchdog_bench_a_session_over_the_soft_budget_alerts_exactly_once() {
         block_on(async {
             let mib = alloc_mib();
             // Two thirds of what the session will allocate: crossed on the very
@@ -406,8 +466,8 @@ rusty_fork_test! {
             assert!(scans[0]["rows"].as_array().is_some_and(|r| !r.is_empty()));
             assert!(scans[0]["totals"]["physicalRamBytes"].as_u64().unwrap_or(0) > 0);
 
-            // acceptance 2: the session's subtree RSS reached `proc_sample` and
-            // the graph's metric lane.
+            // acceptance 2: the session's subtree RSS reached `proc_sample` (the
+            // graph's metric lane went with the graph projection, A22.3).
             let samples = h
                 .db
                 .read(|conn| dao::proc_sample::range(conn, "session", Some("sess-1"), 0, i64::MAX))
@@ -426,12 +486,85 @@ rusty_fork_test! {
                     .any(|s| s.rss_bytes >= (soft * 1024 * 1024) as i64),
                 "the sample is the subtree, not a single process"
             );
-            assert!(
-                h.sink.patch_count() > 0,
-                "the session's metrics reached the graph"
-            );
         });
     }
+}
+
+/// A10.7 functional version: the watchdog reads the shared scan (A12.2),
+/// so the session's subtree RSS is whatever that scan says — deterministic,
+/// no allocation, no RSS wait. Twelve scans over the soft budget: one alarm,
+/// one alert, one toast, a scan event and a `proc_sample` row per tick.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_over_the_soft_budget_alerts_exactly_once() {
+    use gilde_code_lib::contract::ids::ProcessKey;
+    use gilde_code_lib::contract::services::{ProcInfo, ProcSnapshot};
+    use gilde_code_lib::supervise::procscan::{start_time_of, ScanHub};
+
+    const MIB: u64 = 1024 * 1024;
+    let soft: u64 = 64;
+    let h = harness(json!({
+        "softRssMiB": soft,
+        "hardRssMiB": 100_000,
+        "idleTimeoutMinutes": 0,
+        "autoKillOverHardCeiling": false,
+        "globalWarnPct": 100,
+        "globalCriticalPct": 100,
+    }))
+    .await;
+    let cwd = h.dir.path().to_path_buf();
+    let argv = argv_of(&[&fake_agent().to_string_lossy(), "hang"]);
+    let (spawn_id, kid) = register(&h.sup, &argv, &cwd, Some("sess-1")).await;
+    h.open_session("sess-1", &spawn_id, Some(gilde_code_lib::store::now_ms())).await;
+    let pid = kid.pid();
+    let start = start_time_of(pid).expect("the fixture's start time");
+    let hub = ScanHub::new();
+    let watchdog = h.watchdog().with_scan_hub(hub.clone());
+    // SAFETY: `getuid` has no failure mode.
+    let uid = unsafe { libc::getuid() };
+    let scan = |rss_bytes: u64| ProcSnapshot {
+        taken_at: gilde_code_lib::store::now_ms(),
+        procs: vec![ProcInfo {
+            key: ProcessKey::new(pid as u32, start as u64),
+            pid,
+            ppid: std::process::id() as i32,
+            uid,
+            start_sec: start,
+            exec_path: Some(argv[0].clone()),
+            argv_redacted: argv.clone(),
+            labels: Default::default(),
+            cwd: None,
+            rss_bytes,
+            cpu_ns: 0,
+            cco_team_member: None,
+            gilde_app_instance: None,
+            vendor: None,
+        }],
+    };
+
+    let mut soft_alarms = 0;
+    for _ in 0..12 {
+        hub.publish(scan(soft * 2 * MIB));
+        let report = watchdog.tick().await;
+        assert_eq!(report.sessions, 1, "the session is attributed every tick");
+        assert!(report.undo_tokens.is_empty(), "a soft crossing never arms a termination");
+        soft_alarms += report.alarms.iter().filter(|a| matches!(a, Alarm::Soft { .. })).count();
+    }
+    assert_eq!(soft_alarms, 1, "twelve ticks over the budget, one crossing, one alarm");
+    assert_eq!(h.alerts("soft").len(), 1, "one gilde://budget/alert");
+    assert_eq!(h.toasts("toast.budget.soft").len(), 1, "one toast");
+    assert!(h.alerts("hard").is_empty(), "nothing else fired");
+    let alert = &h.alerts("soft")[0];
+    assert_eq!(alert["sessionId"], json!("sess-1"));
+    assert!(alert["undoToken"].is_null(), "a soft alert is a warning");
+    assert_eq!(alert["rssBytes"].as_u64(), Some(soft * 2 * MIB), "the alert carries the shared scan's RSS");
+    assert_eq!(h.events("gilde://proc/scan").len(), 12, "one scan event per tick");
+    let samples = h
+        .db
+        .read(|conn| dao::proc_sample::range(conn, "session", Some("sess-1"), 0, i64::MAX))
+        .await
+        .expect("read proc_sample");
+    assert_eq!(samples.len(), 12, "one row per tick");
+    assert!(samples.iter().all(|s| s.rss_bytes == (soft * 2 * MIB) as i64));
 }
 
 // ===========================================================================
@@ -503,64 +636,9 @@ rusty_fork_test! {
     }
 }
 
-// ===========================================================================
-// 3. the bulk gate  (acceptance 7)
-// ===========================================================================
-
-rusty_fork_test! {
-    #[test]
-    fn a_bulk_action_refuses_young_processes_and_then_ends_them_when_told() {
-        block_on(async {
-            let h = harness(json!({ "killGraceMs": 700 })).await;
-            let cwd = h.dir.path().to_path_buf();
-            let argv = argv_of(&[&fake_agent().to_string_lossy(), "hang"]);
-            let (first, a) = register(&h.sup, &argv, &cwd, None).await;
-            let (second, b) = register(&h.sup, &argv, &cwd, None).await;
-
-            let targets = vec![KillTarget::spawn(&first), KillTarget::spawn(&second)];
-            let opts = KillOpts::default().grace(Duration::from_millis(700));
-            let groups = HashMap::new();
-
-            // Both processes are seconds old; the bulk floor is two minutes.
-            let refused = monitor::kill_targets(&h.sup, &targets, opts, &groups, 120).await;
-            assert_eq!(refused.len(), 2, "one outcome per requested row, in order");
-            for (outcome, spawn_id) in refused.iter().zip([&first, &second]) {
-                assert_eq!(outcome.report.refused_reason.as_deref(), Some("tooYoung"));
-                assert_eq!(outcome.report.spawn_id.as_deref(), Some(spawn_id.as_str()));
-                assert!(outcome.report.requested.is_empty(), "no pid was signalled");
-            }
-            assert!(is_alive(a.pid()) && is_alive(b.pid()), "nothing was signalled");
-
-            // acceptance 8: a dry run computes the sets and sends nothing.
-            let dry = monitor::kill_targets(&h.sup, &targets, opts.dry_run(true), &groups, 0).await;
-            assert_eq!(dry.len(), 2);
-            for outcome in &dry {
-                assert!(outcome.report.dry_run);
-                assert!(!outcome.report.is_refused(), "{:?}", outcome.report);
-                assert!(
-                    !outcome.report.requested.is_empty(),
-                    "a dry run still reports its target set"
-                );
-                assert!(outcome.report.survivors.is_empty());
-            }
-            assert!(
-                is_alive(a.pid()) && is_alive(b.pid()),
-                "a dry run sends no signal"
-            );
-
-            // With the floor lowered, the same request goes through — proving the
-            // refusal above was the gate and nothing else.
-            let done = monitor::kill_targets(&h.sup, &targets, opts, &groups, 0).await;
-            assert_eq!(done.len(), 2);
-            for outcome in &done {
-                assert!(!outcome.report.is_refused(), "{:?}", outcome.report);
-                assert!(outcome.report.survivors.is_empty());
-            }
-            wait_until_gone(a.pid());
-            wait_until_gone(b.pid());
-        });
-    }
-}
+// (3. "the bulk gate" was a Process Monitor policy of `procmon_kill`,
+// retired with `commands::monitor` — contract §2.2.1; the Clean-up sheet's
+// `health_stop` replaces it.)
 
 // ===========================================================================
 // 4. the fence is re-run per row, immediately before the signal  (acceptance 7)
@@ -585,12 +663,10 @@ rusty_fork_test! {
             wait_until_gone(dead_pid);
 
             let targets = vec![KillTarget::spawn(&gone_id), KillTarget::spawn(&live_id)];
-            let outcomes = monitor::kill_targets(
+            let outcomes = gilde_code_lib::supervise::kill::kill_pids(
                 &h.sup,
                 &targets,
                 KillOpts::default().grace(Duration::from_millis(700)),
-                &HashMap::new(),
-                0,
             )
             .await;
 

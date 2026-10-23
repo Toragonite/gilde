@@ -1,0 +1,274 @@
+/*
+ * The conversation (ux-ia §3.4): user turns on --n2, assistant text plain,
+ * one-line tool rows, muted system lines. Tokens only.
+ */
+
+.g-convo {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+}
+
+.g-convo-list {
+  flex: 1;
+  min-height: 0;
+  padding: 12px 24px;
+}
+
+.g-convo-list:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.g-convo-note,
+.g-convo-status {
+  margin: 0;
+  padding: 6px 24px;
+  font-size: var(--fs-sub);
+  color: var(--n8);
+}
+
+.g-convo-older {
+  display: flex;
+  justify-content: center;
+  padding: 4px 0;
+}
+
+.g-convo-pill {
+  position: absolute;
+  right: 24px;
+  bottom: 12px;
+  height: 24px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--n2);
+  color: var(--n11);
+  font: inherit;
+  font-size: var(--fs-sub);
+  box-shadow: var(--shadow-popover);
+}
+
+.g-convo-pill:focus-visible {
+  outline: 1px solid var(--accent);
+}
+
+.g-msg {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  padding: 6px 0;
+}
+
+.g-msg-who {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--fs-sub);
+  color: var(--n8);
+}
+
+.g-msg-who b {
+  color: var(--n10);
+  font-weight: 600;
+}
+
+.g-msg-who time {
+  font-size: var(--fs-label);
+}
+
+.g-msg-chip {
+  height: 18px;
+  padding: 0 6px;
+  border-radius: var(--r-sm);
+  background: var(--n3);
+  color: var(--n10);
+  font-size: var(--fs-label);
+  display: inline-flex;
+  align-items: center;
+}
+
+.g-msg-chip[data-delivery='cancelled'] {
+  color: var(--warn);
+}
+
+.g-msg-body {
+  color: var(--n11);
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+.g-msg-user .g-msg-body {
+  background: var(--n2);
+  border-radius: var(--r-md);
+  padding: 8px 12px;
+}
+
+.g-msg-usertext {
+  white-space: pre-wrap;
+}
+
+.g-toolwrap {
+  min-width: 0;
+}
+
+.g-tool {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  min-height: 24px;
+  padding: 2px 6px;
+  margin: 0 0 0 -6px;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--n9);
+  font: inherit;
+  font-size: var(--fs-sub);
+  text-align: left;
+  min-width: 0;
+}
+
+button.g-tool:hover {
+  background: var(--n2);
+  color: var(--n11);
+}
+
+.g-tool:focus-visible {
+  outline: 1px solid var(--accent);
+}
+
+.g-tool .g-glyph {
+  flex: none;
+  color: var(--warn);
+}
+
+.g-tool-muted {
+  color: var(--n8);
+}
+
+.g-tool-muted .g-glyph {
+  color: var(--n7);
+}
+
+.g-chev {
+  width: 10px;
+  flex: none;
+  color: var(--n8);
+}
+
+.g-tool-verb {
+  flex: none;
+}
+
+.g-tool-obj {
+  color: var(--n11);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.g-tool-res {
+  color: var(--n8);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.g-tool-warn {
+  color: var(--warn);
+}
+
+.g-tool time {
+  margin-left: auto;
+  font-size: var(--fs-label);
+  color: var(--n8);
+  flex: none;
+  padding-left: 8px;
+}
+
+.g-tool-items {
+  margin: 2px 0 4px 10px;
+  padding-left: 8px;
+  border-left: 1px solid var(--border);
+  font-size: var(--fs-sub);
+  color: var(--n9);
+  overflow-wrap: anywhere;
+}
+
+.g-tool-items pre {
+  margin: 2px 0;
+  white-space: pre-wrap;
+  font-size: var(--fs-sub);
+  color: var(--n10);
+}
+
+.g-thinking {
+  white-space: pre-wrap;
+}
+
+.g-edit-files {
+  margin: 2px 0 4px 16px;
+  display: flex;
+  flex-direction: column;
+}
+
+.g-edit-file {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 24px;
+  font-size: var(--fs-sub);
+  min-width: 0;
+}
+
+.g-edit-path {
+  color: var(--n11);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.g-edit-stat {
+  color: var(--n9);
+  flex: none;
+  font-variant-numeric: tabular-nums;
+}
+
+.g-edit-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 2px;
+  flex: none;
+}
+
+.g-edit-actions .g-cbtn {
+  height: 22px;
+}
+
+.g-sysline {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 24px;
+  font-size: var(--fs-sub);
+  color: var(--n8);
+  flex-wrap: wrap;
+}
+
+.g-sysline .g-glyph {
+  color: var(--error);
+}
+
+.g-sysline-text {
+  color: var(--n9);
+  overflow-wrap: anywhere;
+}

@@ -1,0 +1,223 @@
+/* Settings (ux-ia §6.1, §8). Tokens only; label column, then the control. */
+
+.se {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.se-head {
+  height: var(--hdr-h);
+  flex: none;
+  display: flex;
+  align-items: center;
+  padding: 0 var(--sp-16);
+  border-bottom: 1px solid var(--border);
+}
+
+.se-head h1 {
+  margin: 0;
+  font-size: var(--fs-body);
+  font-weight: 600;
+  color: var(--n12);
+}
+
+.se-main {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 160px minmax(0, 1fr);
+}
+
+.se-nav {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-12) var(--sp-8);
+  border-right: 1px solid var(--border);
+}
+
+.se-nav-item {
+  height: var(--row-h);
+  padding: 0 var(--sp-8);
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--n9);
+  font-size: var(--fs-sub);
+  text-align: left;
+  cursor: default;
+}
+
+.se-nav-item:hover {
+  background: var(--n3);
+  color: var(--n11);
+}
+
+.se-content {
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--sp-12) var(--sp-24) var(--sp-32);
+}
+
+.se-sec {
+  max-width: 760px;
+  padding-bottom: var(--sp-16);
+}
+
+.se-sec + .se-sec {
+  border-top: 1px solid var(--border);
+  padding-top: var(--sp-12);
+}
+
+.se-sec h2 {
+  margin: 0 0 var(--sp-8);
+  font-size: var(--fs-sub);
+  font-weight: 600;
+  color: var(--n10);
+}
+
+.se-row {
+  display: grid;
+  grid-template-columns: minmax(0, 280px) minmax(0, 1fr);
+  gap: var(--sp-16);
+  align-items: start;
+  padding: var(--sp-6) 0;
+}
+
+.se-k {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+
+.se-label {
+  color: var(--n11);
+}
+
+.se-desc {
+  color: var(--n8);
+  font-size: var(--fs-sub);
+}
+
+.se-pad {
+  margin: 0 0 var(--sp-8);
+}
+
+.se-hint {
+  margin: 0;
+  padding-left: var(--sp-8);
+}
+
+.se-v {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-8);
+  min-width: 0;
+}
+
+.se-value {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--n10);
+}
+
+.se-value[data-auto='true'] {
+  color: var(--n8);
+  font-family: var(--sans);
+}
+
+.se-select {
+  height: 22px;
+  padding: 0 var(--sp-4);
+}
+
+.se-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-8);
+}
+
+.se-agent {
+  padding: var(--sp-4) 0;
+}
+
+.se-agent + .se-agent {
+  border-top: 1px solid var(--border);
+}
+
+.se-agent-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-8);
+  min-height: var(--row-h);
+}
+
+.se-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-8);
+  margin: var(--sp-4) 0;
+  color: var(--n9);
+  font-size: var(--fs-sub);
+}
+
+.se-line[data-tone='warn'] {
+  color: var(--warn);
+}
+
+.se-line[data-tone='error'] {
+  color: var(--error);
+}
+
+.se-detail {
+  flex-basis: 100%;
+  color: var(--n8);
+  font-size: var(--fs-label);
+  white-space: pre-wrap;
+}
+
+.se-exec {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-6);
+}
+
+.se-exec-label {
+  color: var(--n9);
+  font-size: var(--fs-sub);
+}
+
+.se-exec-input {
+  width: 100%;
+}
+
+.se-exec-input[aria-invalid='true'] {
+  border-color: var(--warn);
+}
+
+@media (max-width: 1000px) {
+  .se-main {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .se-nav {
+    flex-direction: row;
+    flex-wrap: wrap;
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+    padding: var(--sp-4) var(--sp-16);
+  }
+
+  .se-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--sp-4);
+  }
+}

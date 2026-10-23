@@ -1,0 +1,41 @@
+{
+  "$comment": "F-03 fixture (contract §9.7, §14.2 T-priv-argv, T-priv-3 env-value canary). Synthetic values only. ${NAME} placeholders are replaced by the canary of that name (scripts/gates/lib/canary.mjs). Every canary must never appear in state.db, config.json, logs, Details, health_process_detail, diagnostics exports, crash reports or probe records.",
+  "canaries": {
+    "ENV_VALUE": "gildecanaryenv7f3a9c41d2",
+    "AWS_SECRET": "gildecanaryawsSECRETb0e1f2a3c4d5e6f708192a3b",
+    "AWS_KEY_ID": "AKIAGILDECANARY7Q2W",
+    "BASE_URL_TOKEN": "gildecanaryurl93be0",
+    "API_KEY_HELPER": "gildecanaryhelper5d1c",
+    "SK_ANT": "sk-ant-api03-gildecanarysk00000000000000000000000000000000",
+    "BEARER": "gildecanarybearer6a7b8c9d0e1f2a3b4c5d6e7f8091a2b3",
+    "PROMPT": "gildecanaryprompt42 please summarise the payroll file",
+    "SETTINGS_PATH": "/tmp/gildecanary-settings-88aa.json"
+  },
+  "argv": [
+    {
+      "name": "hosted teammate pane command (sh -c with forwarded env)",
+      "argv": ["/bin/sh", "-c", "cd /tmp/gilde-fixture/proj && env CLAUDECODE=1 CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 AWS_ACCESS_KEY_ID=${AWS_KEY_ID} AWS_SECRET_ACCESS_KEY=${AWS_SECRET} ANTHROPIC_BASE_URL=https://proxy.invalid/${BASE_URL_TOKEN} GILDE_CANARY_SECRET=${ENV_VALUE} /usr/local/bin/claude --agent-id alpha@session-0000aaaa --agent-name alpha --team-name session-0000aaaa --settings '{\"apiKeyHelper\":\"echo ${API_KEY_HELPER}\"}' --model haiku"]
+    },
+    {
+      "name": "claude with inline settings, a token and a prompt",
+      "argv": ["/usr/local/bin/claude", "--settings", "{\"apiKeyHelper\":\"echo ${API_KEY_HELPER}\"}", "--append-system-prompt", "${PROMPT}", "-p", "${PROMPT}", "--model", "haiku"]
+    },
+    {
+      "name": "settings by path, assignment flags, bearer header",
+      "argv": ["/usr/local/bin/claude", "--settings=${SETTINGS_PATH}", "--mcp-config", "${SETTINGS_PATH}", "--resume", "0192f0aa-0000-4000-8000-000000000001", "--", "${PROMPT}"]
+    },
+    {
+      "name": "env prefix outside sh -c",
+      "argv": ["/usr/bin/env", "ANTHROPIC_API_KEY=${SK_ANT}", "OPENAI_API_KEY=${SK_ANT}", "/usr/local/bin/codex", "exec", "--json", "${PROMPT}"]
+    },
+    {
+      "name": "bearer token and a long base64 run",
+      "argv": ["/usr/bin/curl", "-H", "Authorization: Bearer ${BEARER}", "--data", "${BEARER}"]
+    }
+  ],
+  "env": {
+    "GILDE_CANARY_SECRET": "${ENV_VALUE}",
+    "AWS_SECRET_ACCESS_KEY": "${AWS_SECRET}",
+    "ANTHROPIC_BASE_URL": "https://proxy.invalid/${BASE_URL_TOKEN}"
+  }
+}

@@ -1,0 +1,257 @@
+/*
+ * The Session screen (ux-ia §3.4): a two-line header, 32 px tabs, the body,
+ * and the dock (cards, then the composer or a bar). Tokens only.
+ */
+
+.g-session {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  width: 100%;
+  min-height: 0;
+  min-width: 0;
+  height: 100%;
+  background: var(--n1);
+}
+
+.g-session-gone {
+  margin: 0;
+  padding: 24px;
+  color: var(--n9);
+}
+
+.g-session-head {
+  flex: none;
+  padding: 8px 16px 0 24px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.g-session-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.g-session-title {
+  margin: 0;
+  font-size: var(--fs-body);
+  font-weight: 600;
+  color: var(--n12);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.g-session-where {
+  margin-left: auto;
+  font-size: var(--fs-sub);
+  color: var(--n8);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.g-session-meta {
+  font-size: var(--fs-sub);
+  color: var(--n8);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1;
+}
+
+.g-session-actions {
+  display: flex;
+  gap: 4px;
+  flex: none;
+}
+
+.g-session-evidence {
+  margin: 0;
+  font-size: var(--fs-sub);
+  color: var(--n9);
+}
+
+.g-session-tabs {
+  display: flex;
+  gap: 2px;
+  height: 32px;
+  align-items: stretch;
+}
+
+.g-session-tab {
+  border: 0;
+  background: transparent;
+  color: var(--n9);
+  font: inherit;
+  font-size: var(--fs-sub);
+  padding: 0 10px;
+  border-radius: var(--r-sm) var(--r-sm) 0 0;
+}
+
+.g-session-tab[aria-selected='true'] {
+  color: var(--n12);
+  background: var(--n0);
+}
+
+.g-session-tab:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.g-session-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.g-session-dock {
+  flex: none;
+  padding: 0 24px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: 1040px;
+  width: 100%;
+  margin: 0 auto;
+  box-sizing: border-box;
+}
+
+.g-sbtn {
+  height: 24px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--n2);
+  color: var(--n11);
+  font: inherit;
+  font-size: var(--fs-sub);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.g-sbtn:hover:not(:disabled) {
+  background: var(--n3);
+}
+
+.g-sbtn:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.g-sbtn:disabled {
+  opacity: 0.45;
+}
+
+.g-sbtn-primary {
+  background: var(--primary);
+  color: var(--on-primary);
+  border-color: transparent;
+  font-weight: 600;
+}
+
+.g-sbtn-danger {
+  color: var(--error);
+}
+
+.g-sbtn-icon {
+  width: 24px;
+  padding: 0;
+  justify-content: center;
+}
+
+.g-bar {
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--n0);
+  padding: 8px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.g-bar-text,
+.g-bar-line,
+.g-bar-why {
+  margin: 0;
+  font-size: var(--fs-body);
+  color: var(--n11);
+}
+
+.g-bar-line {
+  font-size: var(--fs-sub);
+  color: var(--n9);
+}
+
+.g-bar-why {
+  max-width: 360px;
+  padding: 8px;
+  font-size: var(--fs-sub);
+}
+
+.g-bar-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.g-bar-spacer {
+  flex: 1;
+}
+
+.g-details {
+  min-width: 320px;
+  max-width: 480px;
+  padding: 8px 12px;
+}
+
+.g-details-list {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.g-details-row {
+  display: flex;
+  gap: 12px;
+  align-items: baseline;
+  min-height: 22px;
+  font-size: var(--fs-sub);
+}
+
+.g-details-row dt,
+.g-details-row > span {
+  color: var(--n8);
+  width: 120px;
+  flex: none;
+}
+
+.g-details-row dd {
+  margin: 0;
+  color: var(--n11);
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+.g-details-line {
+  margin: 4px 0 0;
+  font-size: var(--fs-sub);
+  color: var(--n9);
+}
+
+.g-details-tech {
+  margin-top: 6px;
+  border-top: 1px solid var(--border);
+  padding-top: 6px;
+}

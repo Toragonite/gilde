@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-account-set-label"
+description = "Enables the account_set_label command without any pre-configured scope."
+commands.allow = ["account_set_label"]
+
+[[permission]]
+identifier = "deny-account-set-label"
+description = "Denies the account_set_label command without any pre-configured scope."
+commands.deny = ["account_set_label"]

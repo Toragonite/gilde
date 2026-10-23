@@ -7,6 +7,11 @@
 //! and expose a *presentational* symlink where each provider — and the user's
 //! muscle memory — expects to find it.
 //!
+//! **Gilde 2:** symlink creation is off by default — `GitApi::create_worktree`
+//! never asks for an alias; only an explicit `alias_providers` request on the
+//! kept v1 manager does. What stays is detect/adopt of provider worktrees
+//! (to map `claude -w` sessions to their location, §2.2.1).
+//!
 //! Nothing on a hot path may depend on an alias existing. If a provider changes
 //! its convention the failure mode is "no symlink, plus a hint in the UI", never
 //! "broken session".
@@ -1105,23 +1110,6 @@ pub async fn remove_owned_aliases(worktree_id: &str) -> Result<Vec<AliasRemoval>
 /// DESIGN §7-6 rule 6. See [`AliasLayer::scan_adoptable`].
 pub async fn scan_adoptable(repo: &Path) -> Result<Vec<AdoptionCandidate>> {
     require_layer()?.scan_adoptable(repo).await
-}
-
-// ---------------------------------------------------------------------------
-// command
-// ---------------------------------------------------------------------------
-
-/// `worktree_alias_ensure` (DESIGN §3). Registration in `invoke_handler` is
-/// T29's wiring step, together with [`install`].
-#[tauri::command]
-pub async fn worktree_alias_ensure(
-    id: String,
-    provider: AliasProvider,
-    worktrees: tauri::State<'_, crate::commands::worktree::WorktreeState>,
-) -> crate::error::CmdResult<AliasOutcome> {
-    let wt = worktrees.get(&id).await?;
-    let repo = git::repo_root(Path::new(&wt.path)).await?;
-    Ok(alias_ensure(&wt, &repo, provider).await?)
 }
 
 // ---------------------------------------------------------------------------

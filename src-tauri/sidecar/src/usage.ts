@@ -153,13 +153,21 @@ async function probe(
     let buffered = '';
     let stderrSeen = false;
 
-    // Single settle path: clears every timer and kills the group exactly once.
+    // Single settle path: clears every timer and ends the group exactly once —
+    // with SIGTERM: the probe child is a vendor CLI, and a vendor CLI is never
+    // sent SIGKILL (contract §9.8, C5). Closing its stdin first lets a CLI that
+    // already answered leave on its own.
     const done = (result: LiveUsage): void => {
       if (settled) return;
       settled = true;
       clearTimeout(deadline);
       clearTimeout(sendFallback);
-      handle.kill('SIGKILL');
+      try {
+        handle.stdin.end();
+      } catch {
+        /* already closed */
+      }
+      handle.kill('SIGTERM');
       resolve(result);
     };
 

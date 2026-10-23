@@ -50,10 +50,16 @@ pub struct ConfigWarning {
     pub detail: String,
 }
 
+/// Called after every applied change with the new settings (the composition
+/// root forwards attention/notification settings to World and notifications).
+/// Runs on the caller's thread with no store lock held; must not block.
+pub type ConfigListener = Arc<dyn Fn(&AppConfig) + Send + Sync>;
+
 /// Shared, mutable application settings.
 pub struct ConfigStore {
     inner: Arc<Inner>,
     writer: Mutex<Option<JoinHandle<()>>>,
+    listeners: Mutex<Vec<ConfigListener>>,
 }
 
 struct Inner {
@@ -99,6 +105,7 @@ impl ConfigStore {
         let store = Self {
             inner: inner.clone(),
             writer: Mutex::new(None),
+            listeners: Mutex::new(Vec::new()),
         };
 
         let handle = std::thread::Builder::new()
@@ -150,7 +157,20 @@ impl ConfigStore {
         };
 
         self.mark_dirty();
+        self.changed(&updated);
         Ok(updated)
+    }
+
+    /// Register `listener` for every later change ([`ConfigListener`]).
+    pub fn on_change(&self, listener: ConfigListener) {
+        self.listeners.lock().push(listener);
+    }
+
+    fn changed(&self, config: &AppConfig) {
+        let listeners = self.listeners.lock().clone();
+        for listener in listeners {
+            listener(config);
+        }
     }
 
     /// Replace the whole config (used by the importer, which computes a new
@@ -161,6 +181,7 @@ impl ConfigStore {
             *guard = config.clone();
         }
         self.mark_dirty();
+        self.changed(&config);
         config
     }
 

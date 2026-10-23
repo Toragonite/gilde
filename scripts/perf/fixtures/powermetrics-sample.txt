@@ -1,0 +1,12 @@
+Machine model: Mac15,6
+OS version: 25A100
+
+*** Sampled system activity (Thu Oct 22 09:00:00 2026 +0000) (60000.12ms elapsed) ***
+
+*** Running tasks ***
+
+Name                               ID     CPU ms/s  User%  Deadlines (<2 ms, 2-5 ms)  Wakeups (Intr, Pkg idle)  GPU ms/s
+Gilde Code                         4242   3.10      60.00  0.00     0.00              0.50     0.20              0.00
+com.apple.WebKit.WebContent        4300   1.20      70.00  0.00     0.00              0.17     0.05              0.10
+gilde-node                         4310   0.10      50.00  0.00     0.00              0.02     0.00              0.00
+ALL_TASKS                          -2     40.00     55.00  1.00     0.20              120.00   30.00             5.00

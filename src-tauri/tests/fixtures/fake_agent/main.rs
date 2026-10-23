@@ -22,6 +22,19 @@
 //! | `print-env <VAR>`        | print `$VAR` verbatim (used to prove `GILDE_SPAWN_ID` lands)    |
 //! | `emit-jsonl <file>`      | replay a captured vendor stream line by line                 |
 //! | `alloc <mib> <s>`        | touch `<mib>` MiB of RSS and hold it for `<s>` seconds       |
+//! | `claude-tui <scenario>`  | a Claude-like TUI: idle screen, permission / choice / worker |
+//! |                          | prompts, trust / theme / browser-extension setup dialogs     |
+//! | `tui-idle-ready <ms> <style>` | drops input for `<ms>`, then a claude/codex/cursor/agy  |
+//! |                          | ready screen that echoes submitted lines                    |
+//! | `term-query`             | DA1 / DSR / XTVERSION queries, prints the replies            |
+//! | `teammate --agent-id …`  | a pane teammate: transcript head, argv echo, claude TUI      |
+//! | `teammate-lead [...]`    | a hosted lead: the tmux external-mode sequence + team files |
+//!
+//! The screen modes live in `tui.rs` (screens are a binding interface for
+//! Gilde's grid emulator, prompt grammar and ready signatures), the team
+//! modes in `team.rs`, the terminal plumbing (raw mode, input log, key
+//! decoding, frame rendering) in `term.rs`. `$FAKE_AGENT_INPUT_LOG`, when set,
+//! receives every raw byte any of them reads from stdin.
 //!
 //! Two private modes (`__escaped`, `__sleep`) exist only as re-exec targets for
 //! `escape-group` and `spawn-grandchild`.
@@ -34,6 +47,9 @@
 //!     the thing the test is waiting for, so tests never race the setup.
 
 mod flood;
+mod team;
+mod term;
+mod tui;
 
 use std::env;
 use std::fs::File;
@@ -71,6 +87,11 @@ fn main() {
         "print-env" => mode_print_env(rest),
         "emit-jsonl" => mode_emit_jsonl(rest),
         "alloc" => mode_alloc(rest),
+        "claude-tui" => tui::mode_claude_tui(rest),
+        "tui-idle-ready" => tui::mode_tui_idle_ready(rest),
+        "term-query" => tui::mode_term_query(),
+        "teammate" => team::mode_teammate(rest),
+        "teammate-lead" => team::mode_teammate_lead(rest),
         "__escaped" => mode_escaped_child(),
         "__sleep" => mode_sleep(rest),
         other => {
@@ -464,6 +485,12 @@ fn usage(bad_mode: &str) {
          \x20 slow-exit <secs>         exit <secs> after SIGTERM\n\
          \x20 print-env <VAR>          print $VAR verbatim\n\
          \x20 emit-jsonl <file>        replay a captured stream line by line\n\
-         \x20 alloc <mib> <secs>       hold <mib> MiB of RSS for <secs>"
+         \x20 alloc <mib> <secs>       hold <mib> MiB of RSS for <secs>\n\
+         \x20 claude-tui <scenario> [--work-ms N] [--trust-default no|yes] [--trust-flaky]\n\
+         \x20                          idle|permission|choice|worker|trust|theme|chrome|onboarding\n\
+         \x20 tui-idle-ready <ms> <style>  claude|codex|cursor|agy ready screen after <ms>\n\
+         \x20 term-query               send DA1/DSR/XTVERSION, print the replies, hang\n\
+         \x20 teammate --agent-id <n>@<t> --agent-name <n> --team-name <t> [...]\n\
+         \x20 teammate-lead [--teammates N] [--team NAME] [--torn-ms MS] [--hold]"
     );
 }

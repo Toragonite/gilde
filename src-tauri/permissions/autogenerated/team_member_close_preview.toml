@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-team-member-close-preview"
+description = "Enables the team_member_close_preview command without any pre-configured scope."
+commands.allow = ["team_member_close_preview"]
+
+[[permission]]
+identifier = "deny-team-member-close-preview"
+description = "Denies the team_member_close_preview command without any pre-configured scope."
+commands.deny = ["team_member_close_preview"]

@@ -1,107 +1,127 @@
-//! Settings and account commands (DESIGN §3 `app` / `accounts`).
+//! The account commands of contract §4.2.7: `account_add`, `account_confirm`,
+//! `account_remove`, `account_set_default`, `account_set_label`,
+//! `account_sign_in`, `quota_refresh`.
 //!
-//! `app_settings_*` live here rather than in `app.rs` because they are the
-//! command surface of [`crate::config::ConfigStore`], which this task owns;
-//! `app.rs` is T01's file. Wiring (`app.manage(...)` + `generate_handler!`) is
-//! T29's — see the state aliases below for the exact types to register.
+//! Thin, like every command module: the request has already passed the `Req`
+//! checks (envelope, size, shape, value rules, §4.1 rule 3); each command calls
+//! one method of [`AccountsService`] and returns its typed error. The service is
+//! built on first use from the managed [`AppState`] (database, paths, the
+//! sidecar) with the dialog plugin's native folder picker, and managed from then
+//! on, so these commands need no extra boot wiring; the integration binds the
+//! sessions manager (`account_sign_in`) and World (publishing) through
+//! [`AccountsService::bind_sessions`] / [`AccountsService::bind_world`].
+//!
+//! The pre-Gilde-2 settings and account commands (`app_settings_*`,
+//! `accounts_list`, `accounts_import_cco`) are gone: settings moved to
+//! `commands/settings.rs` (T09), and nothing here takes a path, an argv or a
+//! secret from the WebView (§4.8).
 
 use std::sync::Arc;
 
-use tauri::State;
+use tauri::Manager as _;
 
-use crate::accounts::{self, AccountSlot, ImportReport};
-use crate::commands::app::PathsState;
-use crate::config::{AppConfig, ConfigStore};
-use crate::error::CmdResult;
+use crate::accounts::{AccountsService, DialogFolderPicker};
+use crate::config::ConfigStore;
+use crate::contract::ipc::{
+    AccountAddReq, AccountAddRes, AccountConfirmReq, AccountConfirmRes, AccountRemoveReq,
+    AccountRemoveRes, AccountSetDefaultReq, AccountSetDefaultRes, AccountSetLabelReq,
+    AccountSetLabelRes, AccountSignInReq, AccountSignInRes, QuotaRefreshReq, QuotaRefreshRes,
+};
+use crate::contract::{IpcError, Req};
+use crate::state::AppState;
 use crate::store::Db;
 
-/// Managed state: the loaded `config.json`.
+/// Managed state: the loaded `config.json` (the boot registers it under this alias).
 pub type ConfigState = Arc<ConfigStore>;
 
 /// Managed state: the `state.db` handle (cheap to clone, one shared connection).
 pub type DbState = Db;
 
-/// Current settings (DESIGN §10-3).
-#[tauri::command]
-pub async fn app_settings_get(config: State<'_, ConfigState>) -> CmdResult<AppConfig> {
-    Ok(config.get())
-}
-
-/// Deep-merge `patch` into the settings and return the result.
-///
-/// The frontend sends only the subtree it changed. A `null` value clears a key
-/// back to its default. The write is debounced 500 ms and lands atomically; a
-/// patch that would produce an unusable config is rejected and changes nothing.
-#[tauri::command]
-pub async fn app_settings_set(
-    patch: serde_json::Value,
-    config: State<'_, ConfigState>,
-) -> CmdResult<AppConfig> {
-    Ok(config.patch(patch)?)
-}
-
-/// Every account slot, with a freshly probed login badge.
-#[tauri::command]
-pub async fn accounts_list(
-    db: State<'_, DbState>,
-    paths: State<'_, PathsState>,
-) -> CmdResult<Vec<AccountSlot>> {
-    Ok(accounts::list(db.inner(), paths.inner()).await?)
-}
-
-/// Re-read `~/.claude-code-orchestrator/registry.json` (read-only) and refresh
-/// the account table from it.
-#[tauri::command]
-pub async fn accounts_import_cco(
-    db: State<'_, DbState>,
-    config: State<'_, ConfigState>,
-    paths: State<'_, PathsState>,
-) -> CmdResult<ImportReport> {
-    Ok(accounts::import_cco(db.inner(), config.inner(), paths.inner()).await?)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::paths::AppPaths;
-
-    /// The command bodies are one-liners over the services, which have their own
-    /// tests; what is worth pinning here is that the four functions keep the
-    /// signatures `src/lib/ipc.ts` declares.
-    #[tokio::test]
-    async fn the_services_behind_the_commands_answer_with_the_wire_shapes() {
-        let home = tempfile::tempdir().expect("tempdir");
-        let paths = AppPaths::for_home(home.path());
-        paths.ensure_all().expect("dirs");
-
-        let db = Db::open_in_memory().expect("db");
-        let config = Arc::new(ConfigStore::load(&paths).expect("config"));
-
-        let settings = serde_json::to_value(config.get()).expect("serialize");
-        assert_eq!(settings["locale"], "system");
-
-        let patched = config
-            .patch(serde_json::json!({ "locale": "en" }))
-            .expect("patch");
-        assert_eq!(serde_json::to_value(patched).expect("serialize")["locale"], "en");
-        // F1: "system" is a value `app_settings_set` accepts (back to following the OS).
-        let patched = config
-            .patch(serde_json::json!({ "locale": "system" }))
-            .expect("patch");
-        assert_eq!(serde_json::to_value(patched).expect("serialize")["locale"], "system");
-        let patched = config
-            .patch(serde_json::json!({ "locale": "en" }))
-            .expect("patch");
-        assert_eq!(serde_json::to_value(patched).expect("serialize")["locale"], "en");
-
-        let listed = accounts::list(&db, &paths).await.expect("list");
-        assert_eq!(serde_json::to_value(&listed).expect("serialize").as_array().map(Vec::len), Some(1));
-
-        let report = accounts::import_cco(&db, &config, &paths)
-            .await
-            .expect("import");
-        let value = serde_json::to_value(report).expect("serialize");
-        assert_eq!(value["imported"], 0);
-        assert!(value["accounts"].is_array());
+/// The managed [`AccountsService`], built from [`AppState`] on first use.
+pub fn accounts_service<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<Arc<AccountsService>, IpcError> {
+    if let Some(service) = app.try_state::<Arc<AccountsService>>() {
+        return Ok(service.inner().clone());
     }
+    let state = app.try_state::<AppState>().ok_or_else(IpcError::not_built)?;
+    let service = AccountsService::new(
+        state.db.clone(),
+        (*state.paths).clone(),
+        state.sidecar.clone(),
+        Some(state.sidecar.clone()),
+        Arc::new(DialogFolderPicker::new(app.clone())),
+    );
+    // The first registration wins; a racing second one is dropped.
+    app.manage(service);
+    app.try_state::<Arc<AccountsService>>()
+        .map(|s| s.inner().clone())
+        .ok_or_else(|| IpcError::internal("accounts-service"))
+}
+
+/// `account_add`: a native folder picker (Rust), validated by `stat`;
+/// `REFUSED{notAConfigDir|alreadyAdded}`; `null` = cancelled.
+#[tauri::command]
+pub async fn account_add<R: tauri::Runtime>(app: tauri::AppHandle<R>, req: Req<AccountAddReq>) -> Result<AccountAddRes, IpcError> {
+    let service = accounts_service(&app)?;
+    let account = service.add(req.into_inner().vendor).await?;
+    Ok(AccountAddRes { account })
+}
+
+/// `account_confirm`: a Discovered sibling becomes `User` and usable (C7);
+/// `REFUSED{notDiscovered}`.
+#[tauri::command]
+pub async fn account_confirm<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    req: Req<AccountConfirmReq>,
+) -> Result<AccountConfirmRes, IpcError> {
+    let account = accounts_service(&app)?.confirm(&req.account_id).await?;
+    Ok(AccountConfirmRes { account })
+}
+
+/// `account_remove`: user-added accounts only, never deletes the folder;
+/// `REFUSED{inUse|notUserAdded}`.
+#[tauri::command]
+pub async fn account_remove<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    req: Req<AccountRemoveReq>,
+) -> Result<AccountRemoveRes, IpcError> {
+    accounts_service(&app)?.remove(&req.account_id).await?;
+    Ok(AccountRemoveRes {})
+}
+
+/// `account_set_default`: one default per vendor; `REFUSED{notUsable}`.
+#[tauri::command]
+pub async fn account_set_default<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    req: Req<AccountSetDefaultReq>,
+) -> Result<AccountSetDefaultRes, IpcError> {
+    accounts_service(&app)?.set_default(&req.account_id).await?;
+    Ok(AccountSetDefaultRes {})
+}
+
+/// `account_set_label`: 1..=64 chars, sanitized.
+#[tauri::command]
+pub async fn account_set_label<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    req: Req<AccountSetLabelReq>,
+) -> Result<AccountSetLabelRes, IpcError> {
+    accounts_service(&app)?.set_label(&req.account_id, &req.label).await?;
+    Ok(AccountSetLabelRes {})
+}
+
+/// `account_sign_in`: the CLI's own sign-in in a Terminal-mode session with that
+/// account's env; Gilde handles no credentials. Idempotent by `clientRequestId`.
+#[tauri::command]
+pub async fn account_sign_in<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    req: Req<AccountSignInReq>,
+) -> Result<AccountSignInRes, IpcError> {
+    accounts_service(&app)?.sign_in(&req).await
+}
+
+/// `quota_refresh`: ≤ 1 per account per 60 s (agy 5 min), else the cached value
+/// with `stale: true`; `SIDECAR_DOWN`, `NOT_READY{sidecarStarting}`.
+#[tauri::command]
+pub async fn quota_refresh<R: tauri::Runtime>(app: tauri::AppHandle<R>, req: Req<QuotaRefreshReq>) -> Result<QuotaRefreshRes, IpcError> {
+    let quota = accounts_service(&app)?.refresh_quota(&req.account_id).await?;
+    Ok(QuotaRefreshRes { quota })
 }

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-team-messages-page"
+description = "Enables the team_messages_page command without any pre-configured scope."
+commands.allow = ["team_messages_page"]
+
+[[permission]]
+identifier = "deny-team-messages-page"
+description = "Denies the team_messages_page command without any pre-configured scope."
+commands.deny = ["team_messages_page"]

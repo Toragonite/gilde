@@ -18,8 +18,6 @@
 
 import type { ITerminalOptions, ITheme } from '@xterm/xterm';
 
-import type { TerminalConfig } from '../lib/ipc';
-
 /** Matches `--mono` in `styles/tokens.css`; used when config names no family. */
 const FALLBACK_MONO = "'SF Mono', 'JetBrains Mono', Menlo, monospace";
 
@@ -111,23 +109,25 @@ export function readTerminalTheme(): ITheme {
   };
 }
 
-export function terminalFontFamily(config: TerminalConfig): string {
-  const configured = config.fontFamily?.trim();
-  if (configured) return withCjkFallback(configured, false);
+/** The terminal's font stack: `--mono` with the CJK monospaces first. */
+export function terminalFontFamily(): string {
   return withCjkFallback(cssVar('--mono', FALLBACK_MONO) || FALLBACK_MONO);
 }
 
+/** Terminal text size, px (UI-GUIDELINES §2-1 secondary size). */
+export const TERMINAL_FONT_SIZE = 12;
+
 /**
- * `scrollback` is xterm's own viewport history and is independent of the Rust
- * ring (DESIGN §6-7): the ring is the durable truth, this is just how far back
- * the user can scroll without a snapshot.
+ * `scrollback` is xterm's own viewport history and is independent of the core's
+ * ring: the ring is the durable truth, this is just how far back the user can
+ * scroll without a snapshot.
  */
 export const XTERM_SCROLLBACK_LINES = 5000;
 
-export function terminalOptions(config: TerminalConfig): ITerminalOptions {
+export function terminalOptions(): ITerminalOptions {
   return {
-    fontFamily: terminalFontFamily(config),
-    fontSize: config.fontSize > 0 ? config.fontSize : 12,
+    fontFamily: terminalFontFamily(),
+    fontSize: TERMINAL_FONT_SIZE,
     lineHeight: 1.2,
     // BACKLOG 17 asked for a `letterSpacing` correction as the fallback for a
     // machine with no CJK monospace installed. It is pinned at 0 instead, on

@@ -1,0 +1,27 @@
+Processes: 612 total, 3 running, 609 sleeping, 3105 threads
+2026/10/22 09:00:00
+Load Avg: 2.10, 2.30, 2.40
+CPU usage: 3.20% user, 2.10% sys, 94.70% idle
+
+PID    %CPU
+4242   7.4
+4300   3.1
+4310   0.0
+Processes: 612 total, 3 running, 609 sleeping, 3105 threads
+2026/10/22 09:00:01
+Load Avg: 2.10, 2.30, 2.40
+CPU usage: 3.10% user, 2.00% sys, 94.90% idle
+
+PID    %CPU
+4242   0.4
+4300   0.3
+4310   0.0
+Processes: 612 total, 3 running, 609 sleeping, 3105 threads
+2026/10/22 09:00:02
+Load Avg: 2.10, 2.30, 2.40
+CPU usage: 3.00% user, 2.00% sys, 95.00% idle
+
+PID    %CPU
+4242   0.2
+4300   0.5
+4310   0.1

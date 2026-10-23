@@ -1,0 +1,17 @@
+{"timestamp": "2026-10-22T04:00:00.000Z", "type": "session_meta", "payload": {"id": "5c7c0b9e-2a7d-4f0e-8a51-9d3c2b1a0f22", "cwd": "/w/demo", "source": "cli", "originator": "codex_cli_rs", "cli_version": "0.50.0"}}
+{"timestamp": "2026-10-22T04:00:01.000Z", "type": "turn_context", "payload": {"cwd": "/w/demo", "model": "test-model"}}
+{"timestamp": "2026-10-22T04:00:02.000Z", "type": "event_msg", "payload": {"type": "task_started"}}
+{"timestamp": "2026-10-22T04:00:03.000Z", "type": "event_msg", "payload": {"type": "item_completed", "item": {"type": "UserMessage", "id": "i1", "content": [{"type": "text", "text": "List the files."}]}}}
+{"timestamp": "2026-10-22T04:00:03.000Z", "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "List the files."}]}}
+{"timestamp": "2026-10-22T04:00:04.000Z", "type": "event_msg", "payload": {"type": "item_completed", "item": {"type": "Reasoning", "id": "i2", "summary": ["Listing files"]}}}
+{"timestamp": "2026-10-22T04:00:05.000Z", "type": "event_msg", "payload": {"type": "item_completed", "item": {"type": "CommandExecution", "id": "i3", "command": ["bash", "-lc", "ls"], "aggregated_output": "Cargo.toml\nsrc\n", "exit_code": 0, "status": "completed"}}}
+{"timestamp": "2026-10-22T04:00:06.000Z", "type": "event_msg", "payload": {"type": "item_completed", "item": {"type": "FileChange", "id": "i4", "changes": [{"path": "/w/demo/NOTES.md", "kind": {"type": "add"}, "diff": "+hello\n+world\n"}], "status": "completed"}}}
+{"timestamp": "2026-10-22T04:00:07.000Z", "type": "event_msg", "payload": {"type": "item_completed", "item": {"type": "McpToolCall", "id": "i5", "server": "docs", "tool": "search", "arguments": {"q": "layout"}, "result": {"content": [{"type": "text", "text": "found 3"}]}, "status": "completed"}}}
+{"timestamp": "2026-10-22T04:00:08.000Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 100, "output_tokens": 20}}}}
+{"timestamp": "2026-10-22T04:00:09.000Z", "type": "event_msg", "payload": {"type": "item_completed", "item": {"type": "AgentMessage", "id": "i6", "text": "There are two entries."}}}
+{"timestamp": "2026-10-22T04:00:10.000Z", "type": "event_msg", "payload": {"type": "task_complete"}}
+{"timestamp": "2026-10-22T04:01:00.000Z", "type": "event_msg", "payload": {"type": "task_started"}}
+{"timestamp": "2026-10-22T04:01:01.000Z", "type": "event_msg", "payload": {"type": "item_completed", "item": {"type": "CommandExecution", "id": "i7", "command": "false", "aggregated_output": "", "exit_code": 1, "status": "failed"}}}
+{"timestamp": "2026-10-22T04:01:02.000Z", "type": "event_msg", "payload": {"type": "turn_aborted", "reason": "interrupted"}}
+{"timestamp": "2026-10-22T04:01:03.000Z", "type": "world_state", "payload": {"x": 1}}
+{"timestamp": "2026-10-22T04:01:04.000Z", "type": "brand_new_type", "payload": {"x": 1}}

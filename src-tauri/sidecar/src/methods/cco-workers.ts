@@ -50,6 +50,7 @@ import type { WorkersSnapshot } from '../vendored/cco/host-protocol';
 import type {
   LoginState,
   UiAccount,
+  UiLoginCheck,
   UiTokenStats,
   UiUnsupportedAccount,
   UiUsageWindow,
@@ -64,7 +65,8 @@ import type {
  * CcoWorkersResult. `roots`/`panePids` are the same scope `cco.team.list` takes (and, when
  * given, restate it); `refresh: true` is the user's explicit refresh.
  */
-export const CCO_WORKERS_METHOD = 'cco.workers';
+/** Contract §4.5: the orchestrator methods are `orch.*` (renamed from `cco.*`). */
+export const CCO_WORKERS_METHOD = 'orch.workers';
 
 /** The user's refresh (and a gone host's replacement) is asked at most this often. */
 export const WORKERS_REFRESH_MIN_MS = 5_000;
@@ -186,6 +188,20 @@ function time(value: unknown): number | null {
   return Math.min(Math.trunc(value), Number.MAX_SAFE_INTEGER);
 }
 
+/** The login check states the vendored `UiLoginCheck` knows (orchestrator v2.0.0). */
+const LOGIN_CHECK_STATES: readonly UiLoginCheck['state'][] = ['ok', 'unconfirmed', 'checking', 'loggedOut', 'probeFailed'];
+
+/**
+ * `UiAccount.loginCheck` by value, or `null`. A state this build does not know is
+ * dropped (null), never guessed into another; `reason` is one display line.
+ */
+function loginCheckOf(raw: unknown): UiLoginCheck | null {
+  if (!isRecord(raw)) return null;
+  const state = LOGIN_CHECK_STATES.find((s) => s === raw.state);
+  if (state === undefined) return null;
+  return { state, since: time(raw.since), checkedAt: time(raw.checkedAt), reason: text(raw.reason, 200) ?? '' };
+}
+
 function count(value: unknown): number {
   if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return 0;
   return Math.min(Math.trunc(value), Number.MAX_SAFE_INTEGER);
@@ -302,6 +318,7 @@ export function accountOf(raw: unknown): UiAccount | undefined {
     modelRanAs: textOrNull(raw.modelRanAs, MODEL_CHARS),
     login,
     loginDetail,
+    loginCheck: loginCheckOf(raw.loginCheck),
     plan: textOrNull(raw.plan, PLAN_CHARS),
     planLabel: textOrNull(raw.planLabel, PLAN_LABEL_CHARS),
     sameAccountAs,

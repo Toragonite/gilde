@@ -22,6 +22,9 @@
  *   C. the host dies hard (SIGKILL)    → exit ≤ 2 s, no CPU spin   ← the regression
  *   D. the parent dies with every       → exit ≤ 6 s (2 s watchdog poll + budget)
  *      stream still open                 ← nothing but the watchdog can notice
+ *   E. `mesh.hello` from another build  → answered with -32005, then exit code 78
+ *      (contract §4.5: the host reports VERSION_MISMATCH; a protocol-1 peer gets
+ *      -32002 and stays up for the host to stop)
  *
  * Case D is the one that needs care: its sidecar reads a FIFO the *test* process
  * holds open and writes to files, so no stream ever ends. The only evidence the
@@ -40,27 +43,27 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { resolveBuildId } from '../esbuild.mjs';
+
 const sidecarDir = join(dirname(fileURLToPath(import.meta.url)), '..');
 const bundle = join(sidecarDir, 'sidecar.cjs');
+const BUILD_ID = resolveBuildId(
+  process.env.GILDE_BUILD_ID,
+  JSON.parse(readFileSync(join(sidecarDir, 'package.json'), 'utf8')).version,
+);
 
 /** The vendored runtime when the tree has one — the binary that actually ships. */
 const vendored = join(sidecarDir, '..', 'binaries', 'gilde-node-aarch64-apple-darwin');
 const NODE = existsSync(vendored) ? vendored : process.execPath;
 
-const HELLO =
-  JSON.stringify({
-    jsonrpc: '2.0',
-    id: 1,
-    method: 'mesh.hello',
-    params: {
-      protocol: 1,
-      hostVersion: '0.0.0-lifecycle-test',
-      appInstanceId: 'lifecycle-test',
-      bootId: 'lifecycle',
-      binaries: {},
-      defaults: { timeoutMs: 60_000 },
-    },
-  }) + '\n';
+const helloLine = (params) =>
+  JSON.stringify({ jsonrpc: '2.0', id: '1', method: 'mesh.hello', params }) + '\n';
+const HELLO = helloLine({
+  protocol: 2,
+  buildId: BUILD_ID,
+  appInstanceId: 'lifecycle-test',
+  providers: { orchestrator: false },
+});
 
 /** Anything started here, so the `finally` can be exhaustive. */
 const started = new Set();
@@ -162,7 +165,7 @@ async function caseStdinClose() {
 
   child.stdin.write(HELLO);
   for (let i = 0; i < 40 && !out.includes('\n'); i += 1) await sleep(100);
-  check('A stdin close: the handshake answered before the test', out.includes('"protocol":1'), out.slice(0, 120));
+  check('A stdin close: the handshake answered before the test', out.includes('"protocol":2'), out.slice(0, 120));
 
   child.stdin.end();
   const r = await awaitExit(child.pid, 2_000);
@@ -276,7 +279,7 @@ async function caseParentDeathOnly(dir) {
     await sleep(800);
     check(
       'D parent death: the sidecar answered the handshake over the FIFO',
-      readFileSync(outFile, 'utf8').includes('"protocol":1'),
+      readFileSync(outFile, 'utf8').includes('"protocol":2'),
       readFileSync(errFile, 'utf8').slice(0, 200),
     );
 
@@ -298,6 +301,38 @@ async function caseParentDeathOnly(dir) {
   }
 }
 
+// ── E. a build mismatch exits 78; a protocol-1 peer is answered, not exited ──
+async function caseBuildMismatch() {
+  const child = spawn(NODE, [bundle], { cwd: sidecarDir, stdio: ['pipe', 'pipe', 'pipe'] });
+  started.add(child.pid);
+  child.stderr.resume();
+  let out = '';
+  child.stdout.setEncoding('utf8');
+  child.stdout.on('data', (d) => {
+    out += d;
+  });
+  const exited = new Promise((resolve) => child.on('exit', (code, signal) => resolve({ code, signal })));
+
+  // A protocol-1 peer first: -32002, and the process stays up (the HOST stops it).
+  child.stdin.write(
+    JSON.stringify({ jsonrpc: '2.0', id: 'p1', method: 'mesh.hello', params: { protocol: 1, hostVersion: 'old' } }) + '\n',
+  );
+  for (let i = 0; i < 40 && !out.includes('"p1"'); i += 1) await sleep(100);
+  check('E protocol 1: answered with -32002', out.includes('"id":"p1"') && out.includes('-32002'), out.slice(0, 200));
+  await sleep(200);
+  check('E protocol 1: the sidecar does not exit by itself', alive(child.pid));
+
+  const other = BUILD_ID === '9.9.9' ? '9.9.8' : '9.9.9';
+  const t0 = Date.now();
+  child.stdin.write(
+    helloLine({ protocol: 2, buildId: other, appInstanceId: 'lifecycle-test', providers: { orchestrator: false } }),
+  );
+  const result = await Promise.race([exited, sleep(4_000).then(() => null)]);
+  check('E build mismatch: the hello was answered with -32005 before the exit', out.includes('-32005') && out.includes(other), out.slice(-300));
+  check(`E build mismatch: exit code 78 (${JSON.stringify(result)})`, result !== null && result.code === 78);
+  check(`E build mismatch: within 2 s (${Date.now() - t0}ms)`, Date.now() - t0 < 2_000);
+}
+
 // ── run ──────────────────────────────────────────────────────────────────────
 const dir = mkdtempSync(join(tmpdir(), 'gilde-code-sidecar-lifecycle-'));
 process.stdout.write(`gilde-code-sidecar lifecycle (INT-C) — runtime ${NODE}\n`);
@@ -307,6 +342,7 @@ try {
   await caseSigterm();
   await caseHostSigkilled(dir);
   await caseParentDeathOnly(dir);
+  await caseBuildMismatch();
 } catch (err) {
   failures += 1;
   process.stdout.write(`  FAIL harness threw — ${err && err.stack ? err.stack : err}\n`);

@@ -1,85 +1,130 @@
-//! Application state assembly (T29).
+//! Application state assembly (T29; reworked for Gilde 2 by T09).
 //!
-//! Three things live here, and they are the three things that only exist once
+//! Four things live here, and they are the four things that only exist once
 //! per process:
 //!
-//!   * [`AppState`] — every service `boot()` built, in one place. The command
-//!     layer keeps asking for its services one by one (`State<'_, PtyState>`
-//!     and friends, which is what each command module declares); this is the
-//!     handle for the code that needs *all* of them at once, which in M1 means
-//!     the shutdown path and the diagnostics of the boot itself.
+//!   * [`AppState`] — every service the boot built, in one place, for the code
+//!     that needs *all* of them at once (the shutdown path, diagnostics).
+//!   * [`Services`] — the late-bound service traits of the other build tasks
+//!     (World, the sessions manager, compat, notifications). Each is bound
+//!     once by `lib.rs` when its owner's implementation exists; a command that
+//!     needs an unbound one answers `UNSUPPORTED{cap:"notBuilt"}`.
 //!   * [`InstanceLock`] — the `instance.lock` `flock` guard of DESIGN §10-1.
-//!     A second copy of the app must not open the same `state.db`, the same
-//!     PTY registry and the same worktrees; it focuses the window that is
-//!     already there and exits.
-//!   * [`shutdown`] — the counterpart of `boot()`. Every child this instance
-//!     started goes down through `kill_tree`, the sidecar goes down through its
-//!     own escalation, and `app_instance.ended_at` is filled, so the next boot
-//!     sees a clean exit rather than a crash with orphans.
-//!
-//! T25 owns the one submodule: the graph projection.
-
-// T25
-pub mod graph;
+//!   * [`shutdown`] — the counterpart of the boot: the quit sweep of contract
+//!     §10.2 (never SIGKILL a vendor CLI), the sidecar, then
+//!     `app_instance.ended_at`.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::os::unix::io::AsRawFd as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use tauri::Manager as _;
 
-use crate::accounts::AccountSlot;
-use crate::agents::AgentRegistry;
 use crate::config::ConfigStore;
-use crate::dispatch::DispatchEngine;
-use crate::events::bus::EventBus;
-use crate::model::graph::GraphHandle;
+use crate::contract::services::{CompatApi, NotifyApi, SessionActorApi, WorldApi};
+use crate::lifecycle::boot::Lifecycle;
+use crate::lifecycle::wiring::Wired;
 use crate::paths::AppPaths;
-use crate::pty::PtyManager;
 use crate::sidecar::SidecarManager;
-use crate::status::StatusEngine;
 use crate::store::Db;
-use crate::supervise::reaper;
 use crate::supervise::registry::Supervisor;
-use crate::supervise::watchdog::Watchdog;
-use crate::worktree::WorktreeManager;
+
+// ---------------------------------------------------------------------------
+// Services (late-bound traits of other tasks)
+// ---------------------------------------------------------------------------
+
+/// The service traits other tasks provide (contract §15.2), bound once each.
+#[derive(Default)]
+pub struct Services {
+    world: OnceLock<Arc<dyn WorldApi>>,
+    sessions: OnceLock<Arc<dyn SessionActorApi>>,
+    compat: OnceLock<Arc<dyn CompatApi>>,
+    notify: OnceLock<Arc<dyn NotifyApi>>,
+}
+
+impl std::fmt::Debug for Services {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Services")
+            .field("world", &self.world.get().is_some())
+            .field("sessions", &self.sessions.get().is_some())
+            .field("compat", &self.compat.get().is_some())
+            .field("notify", &self.notify.get().is_some())
+            .finish()
+    }
+}
+
+impl Services {
+    pub fn new() -> Arc<Services> {
+        Arc::new(Services::default())
+    }
+
+    /// Bind World (T02). `false` if one was bound already.
+    pub fn bind_world(&self, world: Arc<dyn WorldApi>) -> bool {
+        self.world.set(world).is_ok()
+    }
+
+    /// Bind the sessions manager (T10).
+    pub fn bind_sessions(&self, sessions: Arc<dyn SessionActorApi>) -> bool {
+        self.sessions.set(sessions).is_ok()
+    }
+
+    /// Bind compat (T21).
+    pub fn bind_compat(&self, compat: Arc<dyn CompatApi>) -> bool {
+        self.compat.set(compat).is_ok()
+    }
+
+    /// Bind notifications (T12).
+    pub fn bind_notify(&self, notify: Arc<dyn NotifyApi>) -> bool {
+        self.notify.set(notify).is_ok()
+    }
+
+    pub fn world(&self) -> Option<Arc<dyn WorldApi>> {
+        self.world.get().cloned()
+    }
+
+    pub fn sessions(&self) -> Option<Arc<dyn SessionActorApi>> {
+        self.sessions.get().cloned()
+    }
+
+    pub fn compat(&self) -> Option<Arc<dyn CompatApi>> {
+        self.compat.get().cloned()
+    }
+
+    pub fn notify(&self) -> Option<Arc<dyn NotifyApi>> {
+        self.notify.get().cloned()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // AppState
 // ---------------------------------------------------------------------------
 
-/// Everything `boot()` assembled, kept together.
+/// Everything the boot assembled, kept together.
 ///
-/// Cloning is cheap on purpose — every field is an `Arc`, a handle or a
-/// `Db` (itself a handle), so the struct is a bundle of references to the one
-/// set of services, never a second copy of them.
+/// Cloning is cheap on purpose — every field is an `Arc` or a `Db` (itself a
+/// handle), so the struct is a bundle of references to the one set of
+/// services, never a second copy of them. The services of the other tasks
+/// live in [`Wired`] (`lifecycle::wiring`, T09b).
 #[derive(Clone)]
 pub struct AppState {
     pub paths: Arc<AppPaths>,
     pub db: Db,
     pub config: Arc<ConfigStore>,
-    pub graph: GraphHandle,
-    pub bus: EventBus,
     pub supervisor: Arc<Supervisor>,
-    pub worktrees: Arc<WorktreeManager>,
-    pub agents: Arc<AgentRegistry>,
-    pub accounts: Arc<Vec<AccountSlot>>,
+    pub lifecycle: Arc<Lifecycle>,
+    pub services: Arc<Services>,
+    pub wired: Arc<Wired>,
+    /// The sidecar (also in `wired`; kept by name for the accounts command's
+    /// fallback construction).
     pub sidecar: Arc<SidecarManager>,
-    pub pty: Arc<PtyManager>,
-    pub dispatch: Arc<DispatchEngine>,
-    pub status: Arc<StatusEngine>,
-    pub watchdog: Arc<Watchdog>,
-    pub projector: Arc<graph::GraphProjector>,
-    /// Unix millis at which `boot()` finished. `app_diagnostics` and the boot
-    /// log line both read it; a boot that took two seconds is a bug report.
+    /// Unix millis at which the boot's service phase finished.
     pub booted_at: i64,
     /// Set by the first [`shutdown`] so a second one (the signal handler's exit
-    /// arriving after `RunEvent::Exit`, or the reverse) is a cheap no-op rather
-    /// than a second `ps` sweep while the app is already draining.
+    /// arriving after `RunEvent::Exit`, or the reverse) is a cheap no-op.
     shutting_down: Arc<AtomicBool>,
 }
 
@@ -93,46 +138,30 @@ impl AppState {
     pub fn is_shutting_down(&self) -> bool {
         self.shutting_down.load(Ordering::SeqCst)
     }
-}
 
-/// Constructor, kept explicit rather than deriving `Default`: forgetting a
-/// service here would give the shutdown path a hole to leak processes through.
-#[allow(clippy::too_many_arguments)]
-impl AppState {
+    /// Constructor, kept explicit rather than deriving `Default`: forgetting a
+    /// service here would give the shutdown path a hole to leak processes
+    /// through.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         paths: Arc<AppPaths>,
         db: Db,
         config: Arc<ConfigStore>,
-        graph: GraphHandle,
-        bus: EventBus,
         supervisor: Arc<Supervisor>,
-        worktrees: Arc<WorktreeManager>,
-        agents: Arc<AgentRegistry>,
-        accounts: Arc<Vec<AccountSlot>>,
-        sidecar: Arc<SidecarManager>,
-        pty: Arc<PtyManager>,
-        dispatch: Arc<DispatchEngine>,
-        status: Arc<StatusEngine>,
-        watchdog: Arc<Watchdog>,
-        projector: Arc<graph::GraphProjector>,
+        lifecycle: Arc<Lifecycle>,
+        services: Arc<Services>,
+        wired: Arc<Wired>,
         booted_at: i64,
     ) -> AppState {
         AppState {
+            sidecar: wired.sidecar.clone(),
             paths,
             db,
             config,
-            graph,
-            bus,
             supervisor,
-            worktrees,
-            agents,
-            accounts,
-            sidecar,
-            pty,
-            dispatch,
-            status,
-            watchdog,
-            projector,
+            lifecycle,
+            services,
+            wired,
             booted_at,
             shutting_down: Arc::new(AtomicBool::new(false)),
         }
@@ -143,74 +172,80 @@ impl AppState {
 // shutdown
 // ---------------------------------------------------------------------------
 
-/// How long the whole shutdown may take before the app stops waiting. Longer
-/// than the sweep budget plus the sidecar's own escalation, because both run in
-/// sequence; a quit must never turn into a beachball, and whatever is left
-/// belongs to the next boot's sweep.
+static EARLY_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// How long the whole shutdown may take before the app stops waiting: the
+/// 6 s quit bound (§10.2), the sidecar's own escalation and the final sweep.
+/// A quit must never turn into a beachball; whatever is left belongs to the
+/// next boot's sweep.
 pub const SHUTDOWN_BUDGET: Duration = Duration::from_secs(12);
+
+/// The part of [`SHUTDOWN_BUDGET`] kept back for closing the instance row
+/// (A40.2): whatever the steps before it took, the row is closed, so a clean
+/// quit is never read as a crash on the next boot.
+pub const CLOSE_RESERVE: Duration = Duration::from_millis(1_500);
 
 /// What one [`shutdown`] did. Logged, and asserted on by `tests/boot.rs`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ShutdownReport {
-    /// Registry rows this instance still owned when the quit began.
+    /// Session items the quit sweep handled.
     pub killed: usize,
-    /// Pids still alive after the escalation. Non-zero is a leak, and is the
-    /// number `scripts/smoke.mjs` re-checks with `pgrep`.
+    /// Vendor pids still alive after the bound — recorded for the next boot
+    /// sweep, never SIGKILLed (contract §10.2, C5).
     pub survivors: usize,
     pub sidecar_stopped: bool,
     pub instance_closed: bool,
 }
 
-/// Take this instance down: children first, then the sidecar, then the row.
+/// Take this instance down (contract §10.2 steps 3–5).
 ///
-/// Order matters. The children are killed while the sidecar is still up,
-/// because a headless run's process is *its* child and `kill_tree` walks the
-/// descendants of a registry row — doing it the other way round would race the
-/// sidecar's own teardown. `app_instance.ended_at` is written last, so a crash
-/// halfway through still leaves the row open and the next boot still sweeps.
+/// When `app_quit` already ran the quit sweep (the record is written and the
+/// sessions are stopped), this only stops the sidecar, sweeps what is left of
+/// the registry and closes the instance. An exit without `app_quit` (no
+/// In-Gilde session, a signal, the last window with nothing running) runs the
+/// same sweep with the registry's own view of the sessions.
 ///
 /// Nothing here may panic or return an error: every step reports and moves on.
 pub async fn shutdown(state: &AppState) -> ShutdownReport {
     let mut report = ShutdownReport::default();
+    // A40.2: one deadline for steps 1–3; step 4 always runs after it.
+    let deadline = tokio::time::Instant::now() + SHUTDOWN_BUDGET.saturating_sub(CLOSE_RESERVE);
+    let left = || deadline.saturating_duration_since(tokio::time::Instant::now());
 
-    // 1. Every PTY session and every headless child of this instance, through
-    //    `kill_tree` (fence → SIGTERM → SIGKILL → descendants). `keep_alive`
-    //    rows and the sidecar itself are spared by the sweep, on purpose.
-    match tokio::time::timeout(
-        reaper::SHUTDOWN_SWEEP_BUDGET,
-        reaper::shutdown_sweep(&state.supervisor),
-    )
-    .await
-    {
-        Ok(reports) => {
-            report.killed = reports.len();
-            report.survivors = reports.iter().map(|r| r.survivors.len()).sum();
-            tracing::info!(
-                target: "supervise",
-                killed = report.killed,
-                survivors = report.survivors,
-                "shutdown sweep complete"
-            );
+    // 1. Sessions (unless `app_quit` did it): record first, then the bounded
+    //    stop sweep. Never SIGKILL a vendor process.
+    if let Some(quit) = state.lifecycle.quit() {
+        if !quit.is_done() && !quit.in_progress() {
+            let preview = crate::lifecycle::boot::current_quit_preview(state).await;
+            let sessions = state.services.sessions();
+            let r = quit.run(preview, sessions).await;
+            report.killed = r.total as usize;
+            report.survivors = r.survivor_pids.len();
         }
-        Err(_) => tracing::warn!(
-            target: "supervise",
-            "shutdown sweep did not finish in time; the next boot's reaper owns the rest"
-        ),
     }
 
-    // 2. The sidecar. It is a child in its own process group and nothing in
-    //    Tauri or in Rust's destructors ends it (`kill_on_drop` is banned), so
-    //    without this every quit leaves an `gilde-node` behind until the next
-    //    boot's sweep — observed, then fixed.
-    match state.sidecar.shutdown().await {
-        Ok(()) => {
+    // 2. The sidecar (`mesh.shutdown`, then its own escalation for node).
+    match tokio::time::timeout(left(), state.wired.sidecar.shutdown()).await {
+        Ok(Ok(())) => {
             report.sidecar_stopped = true;
             tracing::info!(target: "sidecar", "sidecar shut down");
         }
-        Err(err) => tracing::warn!(target: "sidecar", error = %err, "sidecar shutdown failed"),
+        Ok(Err(err)) => tracing::warn!(target: "sidecar", error = %err, "sidecar shutdown failed"),
+        Err(_) => tracing::warn!(target: "sidecar", "the sidecar did not stop within the shutdown budget"),
     }
 
-    // 3. The row. An `ended_at` that is set is the difference between "quit"
+    // The services of the other tasks: discovery, the follower, PaneHost,
+    // World's publisher, the IDE diff copies (all after the sessions).
+    state.wired.shutdown();
+
+    // 3. Whatever the registry still holds of this instance (helpers): fenced
+    //    TERM, KILL only for non-vendor helpers.
+    //    Quit survivors are left for the next boot (A40.1); the rest is
+    //    signalled concurrently inside what is left of the budget (A40.2).
+    let leftovers = crate::supervise::reaper::shutdown_sweep_within(&state.supervisor, left()).await;
+    report.survivors += leftovers.iter().map(|r| r.held().len()).sum::<usize>();
+
+    // 4. The row. An `ended_at` that is set is the difference between "quit"
     //    and "crashed" for the next boot's sweep.
     match state.supervisor.close_instance().await {
         Ok(()) => report.instance_closed = true,
@@ -228,7 +263,28 @@ pub async fn shutdown(state: &AppState) -> ShutdownReport {
 /// both arrive, and the second one must not restart a `ps` sweep on the way
 /// out.
 pub fn shutdown_blocking(app: &tauri::AppHandle) -> Option<ShutdownReport> {
-    let state = app.try_state::<AppState>()?.inner().clone();
+    let Some(state) = app.try_state::<AppState>().map(|s| s.inner().clone()) else {
+        // The exit came before the background boot built the services: sweep
+        // what the registry holds and close the row.
+        let lifecycle = app.try_state::<Arc<Lifecycle>>()?.inner().clone();
+        let sup = lifecycle.supervisor()?;
+        if !EARLY_SHUTDOWN.swap(true, Ordering::SeqCst) {
+            tauri::async_runtime::block_on(async move {
+                let _ = tokio::time::timeout(SHUTDOWN_BUDGET.saturating_sub(CLOSE_RESERVE), async {
+                    if let Some(quit) = lifecycle.quit() {
+                        if !quit.is_done() && !quit.in_progress() {
+                            let preview = crate::lifecycle::boot::preview_for(&Services::default(), &sup).await;
+                            quit.run(preview, None).await;
+                        }
+                    }
+                })
+                .await;
+                // A40.2: the row is closed whatever the quit took.
+                let _ = tokio::time::timeout(CLOSE_RESERVE, sup.close_instance()).await;
+            });
+        }
+        return None;
+    };
     if !state.begin_shutdown() {
         tracing::debug!(target: "supervise", "shutdown already in progress");
         return None;
@@ -242,6 +298,9 @@ pub fn shutdown_blocking(app: &tauri::AppHandle) -> Option<ShutdownReport> {
                     budget_secs = SHUTDOWN_BUDGET.as_secs(),
                     "shutdown exceeded its budget; the next boot's reaper owns the rest"
                 );
+                // A40.2: never leave the instance open (a clean quit must not
+                // read as a crash); closing twice is harmless.
+                let _ = tokio::time::timeout(CLOSE_RESERVE, state.supervisor.close_instance()).await;
                 None
             }
         }

@@ -1,0 +1,5 @@
+{"type":"user","message":{"role":"user","content":"CANARY-7f3a-CONTENT start"},"uuid":"u1","timestamp":"2026-10-21T07:00:00.000Z","sessionId":"{{SID}}","cwd":"{{CWD}}","entrypoint":"sdk-cli","version":"2.1.306"}
+{"type":"future-row-kind","payload":{"x":"CANARY-7f3a-CONTENT"},"timestamp":"2026-10-21T07:00:01.000Z"}
+this line is not json CANARY-7f3a-CONTENT
+{"type":"assistant","message":"CANARY-7f3a-CONTENT wrong shape","timestamp":"2026-10-21T07:00:02.000Z"}
+{"type":"frame-link","timestamp":"2026-10-21T07:00:03.000Z"}

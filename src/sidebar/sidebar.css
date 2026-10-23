@@ -1,447 +1,304 @@
 /*
- * Sidebar styles (T21).
- *
- * Every colour is a var(--token) from styles/tokens.css — this file adds no
- * literal (scripts/lint-ui.sh fails on one). Structure, density and spacing come
- * from docs/ui-mockups/Main.dc.html and Components.dc.html: 32 px header, 26 px
- * tree rows, 12 px indent per level, two-line session rows, flat surfaces and
- * 1 px borders.
- *
- * It lives next to the module instead of in styles/global.css because that file
- * is owned by T05; nothing outside src/sidebar/ and src/dialogs/ imports it.
+ * The sidebar (ux-ia §2.4, §2.5): nav rows, Needs you, the project tree, the
+ * footer. Rows 26–28 px, tree indent 14 px, labels 11 px in --n8 (UI-GUIDELINES
+ * §2-2). Selected rows use --n3, never --n4 (ux-ia §10 contrast).
  */
 
-.sb {
+.sidebar {
+  flex: none;
+  height: 100%;
+  min-height: 0;
   display: flex;
   flex-direction: column;
-  min-height: 0;
-  flex: 1 1 auto;
+  background: var(--n1);
+  border-right: 1px solid var(--border);
+  font-size: var(--fs-body);
 }
 
-.sb-filter {
+.sb-head {
+  flex: none;
+  height: var(--topbar-h);
   display: flex;
   align-items: center;
-  gap: var(--sp-6);
-  padding: var(--sp-6) var(--sp-8);
+  padding: 0 var(--sp-16);
   border-bottom: 1px solid var(--border);
 }
 
-.sb-filter input {
-  flex: 1 1 auto;
-  min-width: 0;
-  height: 24px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-sm);
-  background: var(--n0);
-  color: var(--n11);
-  padding: 0 var(--sp-8);
-  font-size: var(--fs-sub);
+.sb-brand {
+  font-weight: 600;
+  color: var(--n12);
 }
 
-/* -- inline refusal line --------------------------------------------------- */
-
-.sb-error {
-  display: flex;
-  align-items: flex-start;
-  gap: var(--sp-8);
-  padding: var(--sp-8) var(--sp-12);
-  border-bottom: 1px solid var(--border);
-  color: var(--error);
-  font-size: var(--fs-sub);
-  line-height: 1.45;
-}
-
-.sb-error .sb-error-text {
-  flex: 1 1 auto;
-  min-width: 0;
-}
-
-/* -- the tree -------------------------------------------------------------- */
-
-.sb-tree {
+.sb-scroll {
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
-  padding: var(--sp-6) 0;
+  padding: var(--sp-8) var(--sp-6) var(--sp-16);
 }
 
-.sb-viewport {
-  position: relative;
+/* -- nav rows ------------------------------------------------------------- */
+.sb-nav {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.sb-nav-row {
   width: 100%;
-}
-
-.sb-slot {
-  position: absolute;
-  left: 0;
-  right: 0;
-}
-
-.sb-indent {
-  flex: none;
-}
-
-/* Project / worktree / orphan rows reuse the shell's 26 px `.tree-row`. */
-
-.sb-caret {
+  height: 28px;
   display: flex;
   align-items: center;
-  justify-content: center;
-  width: 16px;
-  height: 16px;
-  flex: none;
+  gap: var(--sp-8);
+  padding: 0 var(--sp-8);
   border: 0;
+  border-radius: var(--r-sm);
   background: transparent;
-  color: var(--n7);
-  padding: 0;
-  cursor: default;
+  color: var(--n10);
+  font-size: var(--fs-body);
+  text-align: left;
 }
 
-.sb-caret:hover {
-  color: var(--n11);
+.sb-nav-row:hover {
+  background: var(--n2);
 }
 
-.sb-project {
-  color: var(--n9);
+.sb-nav-row[aria-current='page'] {
+  background: var(--n3);
+  color: var(--n12);
+}
+
+/* -- section headers ------------------------------------------------------ */
+.sb-sec {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-6);
+  height: 28px;
+  margin-top: var(--sp-12);
+  padding: 0 var(--sp-4) 0 var(--sp-8);
+}
+
+.sb-sec-title {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-6);
+  font-size: var(--fs-label);
+  font-weight: 400;
+  color: var(--n8);
+}
+
+.sb-needs-n {
+  font-weight: 600;
+  color: var(--warn);
+}
+
+.sb-next {
+  margin-left: auto;
+  height: 20px;
+  font-size: var(--fs-label);
+}
+
+.sb-empty {
+  margin: 0;
+  padding: var(--sp-4) var(--sp-8);
+  color: var(--n8);
   font-size: var(--fs-sub);
 }
 
-.sb-project .sb-name {
-  color: var(--n11);
-  font-weight: 500;
+/* -- Needs-you rows ------------------------------------------------------- */
+.sb-qlist,
+.sb-tree {
+  list-style: none;
+  margin: 0;
+  padding: 0;
 }
 
-.sb-actions {
+.sb-q-item[data-sep='true'] {
+  margin-top: var(--sp-4);
+  padding-top: var(--sp-4);
+  border-top: 1px solid var(--border);
+}
+
+.sb-q {
+  width: 100%;
+  height: 28px;
   display: flex;
   align-items: center;
-  gap: var(--sp-2);
-  /* Never shrink: the row's flexible element is the name, nothing else. */
+  gap: var(--sp-6);
+  padding: 0 var(--sp-8);
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--n11);
+  font-size: var(--fs-body);
+  text-align: left;
+}
+
+.sb-q:hover {
+  background: var(--n2);
+}
+
+.sb-q[aria-current='true'] {
+  background: var(--n3);
+}
+
+.sb-q-ghost {
+  color: var(--n8);
+  font-size: var(--fs-sub);
+}
+
+.sb-meta {
   flex: none;
-  opacity: 0;
+  max-width: 46%;
+  color: var(--n8);
+  font-size: var(--fs-sub);
 }
 
-.tree-row:hover .sb-actions,
-.tree-row:focus-within .sb-actions {
-  opacity: 1;
+.sb-age {
+  flex: none;
+  min-width: 28px;
+  text-align: right;
+  color: var(--n8);
+  font-size: var(--fs-label);
 }
 
-.sb-iconbtn {
+/* -- tree ----------------------------------------------------------------- */
+.sb-row {
+  height: 26px;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-6);
+  padding: 0 var(--sp-6) 0 calc(var(--sp-6) + var(--lvl, 0) * 14px);
+  border-radius: var(--r-sm);
+  color: var(--n11);
+  white-space: nowrap;
+  min-width: 0;
+  cursor: default;
+  outline: none;
+}
+
+.sb-row:hover {
+  background: var(--n2);
+}
+
+.sb-row:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.sb-row[aria-selected='true'] {
+  background: var(--n3);
+}
+
+.sb-row-project {
+  margin-top: var(--sp-6);
+}
+
+.sb-row-project .sb-title,
+.sb-row-earlier .sb-title {
+  font-weight: 600;
+  color: var(--n10);
+  font-size: var(--fs-sub);
+}
+
+.sb-title {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.sb-row[data-ended='true'] .sb-title,
+.sb-dim {
+  color: var(--n8);
+}
+
+.sb-count {
+  flex: none;
+  color: var(--n8);
+  font-size: var(--fs-label);
+}
+
+.sb-chev {
+  width: 14px;
+  height: 14px;
+  color: var(--n8);
+  transition: transform var(--motion-fast) var(--easing);
+}
+
+.sb-chev[data-open='true'] {
+  transform: rotate(90deg);
+}
+
+.sb-chev-sp {
+  width: 14px;
+  flex: none;
+}
+
+.sb-add {
+  display: none;
   width: 20px;
   height: 20px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border: 0;
-  border-radius: var(--r-sm);
-  background: transparent;
-  color: var(--n8);
-  padding: 0;
-  cursor: default;
 }
 
-.sb-iconbtn:hover:not(:disabled) {
-  background: var(--n4);
-  color: var(--n11);
+.sb-row-project:hover .sb-add,
+.sb-row-project:focus-visible .sb-add {
+  display: inline-flex;
 }
 
-.sb-iconbtn:disabled {
-  opacity: 0.45;
-}
-
-.sb-sec-btn {
-  width: 100%;
-  border: 0;
-  background: transparent;
-  text-align: left;
-  cursor: default;
-}
-
-.sb-sec-btn:hover {
-  color: var(--n11);
-}
-
-/* -- worktree row: the name owns the line (BACKLOG 7) ---------------------- */
-
-/*
- * The numbers must never push the name out of view: the name takes every pixel
- * the row has left and ellipsises, everything after it is `flex: none`. The
- * facts that no longer fit (branch, dirty count, ahead, sessions, lock,
- * unmerged) are the row's `title`, exactly as the mockup's 26 px row does.
- */
-.sb-wt-icon {
+/* M12: the identity swatch is the only place a teammate's colour appears. */
+.swatch {
+  width: 8px;
+  height: 8px;
   flex: none;
-  color: var(--n8);
+  background: var(--n7);
 }
 
-.sb-wt-name {
-  flex: 1 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--n11);
-}
+.swatch[data-colour='red'] { background: var(--id-red); }
+.swatch[data-colour='blue'] { background: var(--id-blue); }
+.swatch[data-colour='green'] { background: var(--id-green); }
+.swatch[data-colour='yellow'] { background: var(--id-yellow); }
+.swatch[data-colour='purple'] { background: var(--id-purple); }
+.swatch[data-colour='orange'] { background: var(--id-orange); }
+.swatch[data-colour='pink'] { background: var(--id-pink); }
+.swatch[data-colour='cyan'] { background: var(--id-cyan); }
 
-.tree-row[aria-selected='true'] .sb-wt-name {
-  color: var(--n12);
-}
-
-/* -- session row: two lines, 42 px ---------------------------------------- */
-
-.sb-session {
-  height: 42px;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  gap: 1px;
-  padding: var(--sp-4) var(--sp-8);
-  border-radius: var(--r-sm);
-  cursor: default;
-}
-
-.sb-session:hover {
-  background: var(--n3);
-}
-
-.sb-session[aria-selected='true'] {
-  background: var(--n4);
-}
-
-.sb-session[aria-selected='true'] .sb-session-title {
-  color: var(--n12);
-}
-
-.sb-session-line {
-  display: flex;
-  align-items: center;
-  gap: var(--sp-8);
-  min-width: 0;
-  height: 18px;
-}
-
-.sb-session-meta {
-  display: flex;
-  align-items: center;
-  gap: var(--sp-6);
-  min-width: 0;
-  height: 16px;
-  color: var(--n8);
-  font-size: var(--fs-sub);
-}
-
-.sb-session-title {
-  flex: 1 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--n11);
-}
-
-/* BACKLOG 6: `종료됨 · 호스트 비정상 종료` is longer than any other status
-   word, so it truncates instead of pushing the elapsed time and the RSS off
-   the row — the same rule the worktree name gets (BACKLOG 7). */
-.sb-session-meta .sb-state {
-  flex: 0 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.sb-session-meta .sb-state[data-tone='warn'] {
-  color: var(--warn);
-}
-
-.sb-session-meta .sb-state[data-tone='error'] {
-  color: var(--error);
-}
-
-.sb-session-meta .sb-state[data-tone='ok'] {
-  color: var(--ok);
-}
-
-/* -- worktree numbers ------------------------------------------------------ */
-
-.sb-stat {
-  color: var(--n8);
+/* -- footer --------------------------------------------------------------- */
+.sb-foot {
   flex: none;
-}
-
-.sb-stat[data-tone='warn'] {
-  color: var(--warn);
-}
-
-.sb-stat[data-tone='error'] {
-  color: var(--error);
-}
-
-.sb-stat[data-tone='ok'] {
-  color: var(--ok);
-}
-
-/* -- dialogs --------------------------------------------------------------- */
-
-.sb-form {
+  height: 32px;
   display: flex;
-  flex-direction: column;
-  gap: var(--sp-12);
-}
-
-.sb-field {
-  display: flex;
-  flex-direction: column;
+  align-items: center;
   gap: var(--sp-4);
-}
-
-.sb-field > .sb-label {
+  padding: 0 var(--sp-6);
+  border-top: 1px solid var(--border);
+  font-size: var(--fs-sub);
   color: var(--n8);
-  font-size: var(--fs-label);
 }
 
-.sb-preview {
-  display: flex;
-  flex-direction: column;
-  gap: var(--sp-2);
-  padding: var(--sp-8);
-  border: 1px solid var(--border);
-  border-radius: var(--r-sm);
-  background: var(--n0);
-}
-
-.sb-preview .sb-preview-row {
-  display: flex;
-  align-items: baseline;
-  gap: var(--sp-8);
+.sb-foot .btn {
+  color: var(--n8);
   min-width: 0;
-}
-
-.sb-preview .sb-preview-key {
-  flex: none;
-  width: 72px;
-  color: var(--n8);
-  font-size: var(--fs-label);
-}
-
-.sb-preview .sb-preview-val {
-  flex: 1 1 auto;
-  min-width: 0;
-  overflow-wrap: anywhere;
-  color: var(--n11);
-}
-
-.sb-check {
-  display: flex;
-  align-items: center;
-  gap: var(--sp-6);
-  font-size: var(--fs-sub);
-  color: var(--n11);
-}
-
-.sb-check input {
-  accent-color: var(--n9);
-  margin: 0;
-}
-
-.sb-issue {
-  color: var(--error);
-  font-size: var(--fs-sub);
-}
-
-.sb-hint {
-  color: var(--n8);
-  font-size: var(--fs-label);
-}
-
-/* -- removal card ---------------------------------------------------------- */
-
-.sb-card {
-  display: flex;
-  flex-direction: column;
-  gap: var(--sp-8);
-  border: 1px solid var(--border);
-  border-radius: var(--r-md);
-  background: var(--n0);
-  padding: var(--sp-12);
-}
-
-.sb-facts {
-  display: grid;
-  grid-template-columns: 112px 1fr;
-  gap: var(--sp-4) var(--sp-8);
-  font-size: var(--fs-sub);
-}
-
-.sb-facts .contents {
-  display: contents;
-}
-
-.sb-facts .sb-fact-k {
-  color: var(--n8);
-}
-
-.sb-facts .sb-fact-v {
-  color: var(--n11);
-  font-family: var(--mono);
   font-variant-numeric: tabular-nums;
-  overflow-wrap: anywhere;
 }
 
-.sb-facts .sb-fact-v[data-tone='warn'] {
+.sb-foot-run {
+  flex: 0 1 auto;
+}
+
+.sb-bell {
+  flex: none;
+}
+
+.sb-foot .btn:hover:not(:disabled) {
+  color: var(--n11);
+}
+
+.sb-bell[data-paused='true'] {
   color: var(--warn);
 }
 
-.sb-facts .sb-fact-v[data-tone='error'] {
-  color: var(--error);
-}
-
-.sb-modes {
-  display: flex;
-  flex-direction: column;
-  gap: var(--sp-6);
-}
-
-.sb-mode {
-  display: flex;
-  align-items: flex-start;
-  gap: var(--sp-8);
-  padding: var(--sp-8);
-  border: 1px solid var(--border);
-  border-radius: var(--r-sm);
-  background: var(--n0);
-  color: var(--n11);
-  text-align: left;
-  font-size: var(--fs-sub);
-  cursor: default;
-}
-
-.sb-mode:hover:not(:disabled) {
-  background: var(--n3);
-}
-
-.sb-mode[aria-pressed='true'] {
-  background: var(--n4);
-  border-color: var(--n6);
-}
-
-.sb-mode:disabled {
-  opacity: 0.45;
-}
-
-.sb-mode .sb-mode-body {
-  display: flex;
-  flex-direction: column;
-  gap: var(--sp-2);
-  min-width: 0;
-}
-
-.sb-mode .sb-mode-name {
-  color: var(--n12);
-  font-weight: 500;
-}
-
-.sb-mode .sb-mode-why {
-  color: var(--n8);
-  font-size: var(--fs-label);
-  line-height: 1.45;
+@media (prefers-reduced-motion: reduce) {
+  .sb-chev {
+    transition: none;
+  }
 }

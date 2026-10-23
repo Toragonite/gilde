@@ -1,4 +1,5 @@
-//! NDJSON JSON-RPC 2.0 framing for the sidecar channel (DESIGN §5-1).
+//! NDJSON JSON-RPC 2.0 framing for the sidecar channel, protocol 2 (contract
+//! §4.5; DESIGN §5-1).
 //!
 //! One JSON object per line, UTF-8, `\n` terminated, over the sidecar's
 //! stdin/stdout. **stderr is not part of the protocol** — it carries plain log
@@ -28,9 +29,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-/// Wire protocol revision this build speaks. A mismatch is a hard error: the
-/// host kills the sidecar rather than guessing (DESIGN §5-3).
-pub const PROTOCOL_VERSION: i64 = 1;
+/// Wire protocol revision this build speaks (contract §4.5: protocol 2). A
+/// mismatch is a hard error: the host stops the sidecar rather than guessing.
+pub const PROTOCOL_VERSION: i64 = crate::contract::sidecar::PROTOCOL as i64;
 
 /// Maximum accepted inbound line, host side (M1-PLAN T19 acceptance 5).
 ///
@@ -57,17 +58,41 @@ pub mod code {
     pub const UNSUPPORTED: i64 = -32004;
     /// The channel died under an in-flight request (host-originated).
     pub const CHANNEL_CLOSED: i64 = -32000;
+    /// `mesh.hello` from another build: the sidecar answers this, then exits 78.
+    pub const BUILD_MISMATCH: i64 = -32005;
+    /// A method that needs `mesh.hello` / `mesh.configure` first.
+    pub const NOT_READY: i64 = -32006;
+    /// The host refused a `host.*` request by policy (the `registerSpawn` allowlist).
+    pub const REFUSED: i64 = -32010;
 }
 
 // ---------------------------------------------------------------------------
 // method names
 // ---------------------------------------------------------------------------
 
-/// host → sidecar (DESIGN §5-4).
+/// host → sidecar (contract §4.5). The protocol-2 names come from the contract;
+/// the rest are the protocol-1 names, kept only so the dropped dispatch lane
+/// still compiles until its owner deletes it (a protocol-2 sidecar answers them
+/// `-32601`).
 pub mod method {
-    pub const HELLO: &str = "mesh.hello";
-    pub const CONFIGURE: &str = "mesh.configure";
-    pub const PING: &str = "mesh.ping";
+    use crate::contract::sidecar::methods as m;
+
+    pub const HELLO: &str = m::MESH_HELLO;
+    pub const CONFIGURE: &str = m::MESH_CONFIGURE;
+    pub const PING: &str = m::MESH_PING;
+    pub const SHUTDOWN: &str = m::MESH_SHUTDOWN;
+    pub const PROBE_AUTH_STATUS: &str = m::PROBE_AUTH_STATUS;
+    pub const PROBE_MODELS: &str = m::PROBE_MODELS;
+    pub const PROBE_QUOTA: &str = m::PROBE_QUOTA;
+    pub const TURN_START: &str = m::TURN_START;
+    pub const TURN_CANCEL: &str = m::TURN_CANCEL;
+    /// Orchestrator observer (registered only while the orchestrator is present).
+    pub const ORCH_TEAM_LIST: &str = m::ORCH_TEAM_LIST;
+    pub const ORCH_TEAM_GET: &str = m::ORCH_TEAM_GET;
+    pub const ORCH_TEAM_SUBSCRIBE: &str = m::ORCH_TEAM_SUBSCRIBE;
+    pub const ORCH_WORKERS: &str = m::ORCH_WORKERS;
+
+    // -- protocol 1 (legacy; not on a protocol-2 channel) ---------------------
     pub const ADAPTERS: &str = "mesh.adapters";
     pub const AUTH_STATUS: &str = "mesh.authStatus";
     pub const AVAILABLE_MODELS: &str = "mesh.availableModels";
@@ -77,29 +102,30 @@ pub mod method {
     pub const RESUME: &str = "mesh.resume";
     pub const CANCEL: &str = "mesh.cancel";
     pub const ROUTE: &str = "fleet.route";
-    pub const SHUTDOWN: &str = "mesh.shutdown";
     /// Team mode, read-only (`sidecar/src/methods/cco.ts`): `{roots, panePids,
-    /// allWorkspaces}` → `CcoTeamListResult`. Also hands the sidecar what to watch.
-    pub const TEAM_LIST: &str = "cco.team.list";
-    /// `{teamId}` → `CcoTeamView | null`.
-    pub const TEAM_GET: &str = "cco.team.get";
-    /// Worker accounts, read-only (`sidecar/src/methods/cco-workers.ts`):
-    /// `{refresh, roots, panePids, allWorkspaces}` → `CcoWorkersResult` (the engine's
-    /// `list_workers` snapshot, `cco.workers/1`, plus its poll-floor state).
-    pub const WORKERS: &str = "cco.workers";
+    /// allWorkspaces}` → `CcoTeamListResult`. Renamed `orch.team.list` (§4.5).
+    pub const TEAM_LIST: &str = m::ORCH_TEAM_LIST;
+    /// `{teamId}` → `CcoTeamView | null`. Renamed `orch.team.get`.
+    pub const TEAM_GET: &str = m::ORCH_TEAM_GET;
+    /// Worker accounts, read-only (`cco-workers.ts`). Renamed `orch.workers`.
+    pub const WORKERS: &str = m::ORCH_WORKERS;
 }
 
-/// sidecar → host (DESIGN §5-5).
+/// sidecar → host (contract §4.5).
 pub mod host_method {
-    pub const REGISTER_SPAWN: &str = "host.registerSpawn";
-    pub const SPAWNED: &str = "host.spawned";
-    pub const EXITED: &str = "host.exited";
-    pub const LOG: &str = "host.log";
-    /// A notification, and lossy by contract.
+    use crate::contract::sidecar::methods as m;
+
+    pub const REGISTER_SPAWN: &str = m::HOST_REGISTER_SPAWN;
+    pub const SPAWNED: &str = m::HOST_SPAWNED;
+    pub const EXITED: &str = m::HOST_EXITED;
+    pub const LOG: &str = m::HOST_LOG;
+    /// A notification: one turn's events, `seq` strictly increasing, never dropped.
+    pub const TURN_EVENT: &str = m::TURN_EVENT;
+    /// A notification: one orchestrator team's whole view, `(generation, rev)`
+    /// latest wins, lossy (a snapshot, never an event).
+    pub const TEAM_SNAPSHOT: &str = m::ORCH_SNAPSHOT;
+    /// Protocol 1's run event (legacy; a protocol-2 sidecar never sends it).
     pub const EVENT: &str = "mesh.event";
-    /// A notification: one team's whole view, latest wins, lossy at `mesh.event`'s
-    /// rank (team contract v2 §8.2 — a snapshot, never an event).
-    pub const TEAM_SNAPSHOT: &str = "cco.team.snapshot";
 }
 
 /// Whether an inbound method is one the host handles.

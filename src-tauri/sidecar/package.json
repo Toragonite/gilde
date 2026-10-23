@@ -1,7 +1,7 @@
 {
   "name": "gilde-code-sidecar",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Headless lane sidecar: @toragonite/agent-mesh behind an NDJSON JSON-RPC 2.0 stdio channel",
   "license": "Apache-2.0",
   "scripts": {
@@ -9,7 +9,7 @@
     "dev": "node esbuild.mjs --watch",
     "typecheck": "tsc --noEmit",
     "check:seam": "node scripts/check-seam.mjs",
-    "test": "node test/stub-host.mjs && node test/mesh-methods.mjs && node test/lifecycle.mjs && node test/cco-team.mjs && node test/cco-vendor.mjs",
+    "test": "node test/stub-host.mjs && node test/mesh-methods.mjs && node test/turns.mjs && node test/probes.mjs && node test/lifecycle.mjs && node test/cco-team.mjs && node test/cco-vendor.mjs",
     "test:live": "node test/live-check.mjs"
   },
   "dependencies": {

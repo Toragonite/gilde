@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-turn-retry"
+description = "Enables the turn_retry command without any pre-configured scope."
+commands.allow = ["turn_retry"]
+
+[[permission]]
+identifier = "deny-turn-retry"
+description = "Denies the turn_retry command without any pre-configured scope."
+commands.deny = ["turn_retry"]

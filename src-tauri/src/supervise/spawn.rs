@@ -89,6 +89,77 @@ pub fn is_alive(pid: i32) -> bool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// the launch allowlist (contract §9.3)
+// ---------------------------------------------------------------------------
+
+/// The kind an allowlist entry is keyed on: the `proc_registry.kind` set,
+/// so that resolved `git` (`git` rows, §9.3) has a kind of its own. The
+/// contract kinds convert into it.
+pub type AllowKind = crate::store::models::ProcKind;
+
+/// What an allowlisted executable may be spawned as.
+pub type KindSet = std::collections::HashSet<AllowKind>;
+
+/// Executables that are always allowed, by kind (§9.3): `/bin/sh -c` for
+/// PaneHost panes only; `ps`/`lsof` single-pid fallbacks as probes;
+/// `/usr/bin/open -b` for the IDE opener.
+const FIXED: [(&str, AllowKind); 4] = [
+    ("/bin/sh", AllowKind::Pane),
+    ("/bin/ps", AllowKind::Probe),
+    ("/usr/sbin/lsof", AllowKind::Probe),
+    ("/usr/bin/open", AllowKind::Ide),
+];
+
+/// A legacy kind checked as the Gilde 2 kind it became: `headless` rows are
+/// the sidecar's turn runs (contract §3.8, "`turn` replaces `headless`").
+fn allow_kind_of(kind: AllowKind) -> AllowKind {
+    match kind {
+        AllowKind::Headless => AllowKind::Turn,
+        other => other,
+    }
+}
+
+fn allowlist() -> &'static parking_lot::RwLock<std::collections::HashMap<String, KindSet>> {
+    static LIST: std::sync::OnceLock<parking_lot::RwLock<std::collections::HashMap<String, KindSet>>> =
+        std::sync::OnceLock::new();
+    LIST.get_or_init(Default::default)
+}
+
+/// Add `path` (canonicalised) to the live allowlist for `kinds` — the
+/// resolved vendor binaries (detection, `agents::resolve_binary`,
+/// `settings_set_executable`), resolved `git`, the sidecar's node, the IDE
+/// CLIs, the login shell (§9.3).
+pub fn allow_executable<K: Copy + Into<AllowKind>>(path: &Path, kinds: &[K]) {
+    let key = canonical(path);
+    let mut list = allowlist().write();
+    let entry = list.entry(key).or_default();
+    entry.extend(kinds.iter().map(|k| allow_kind_of((*k).into())));
+}
+
+/// Remove `path` from the allowlist (a binary setting was changed away).
+pub fn disallow_executable(path: &Path) {
+    allowlist().write().remove(&canonical(path));
+}
+
+/// Whether `argv0` may be spawned as `kind` (§9.3 enforcement 1). Both
+/// spawn paths of the supervisor ask this one function (A12.8).
+pub fn is_allowed<K: Into<AllowKind>>(argv0: &Path, kind: K) -> bool {
+    let kind = allow_kind_of(kind.into());
+    let key = canonical(argv0);
+    if FIXED.iter().any(|(p, k)| *p == key && *k == kind) {
+        return true;
+    }
+    allowlist().read().get(&key).is_some_and(|kinds| kinds.contains(&kind))
+}
+
+fn canonical(path: &Path) -> String {
+    std::fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,6 +169,23 @@ mod tests {
         let me = std::process::id() as i32;
         assert!(is_alive(me));
         assert!(pgid_of(me).is_some());
+    }
+
+    #[test]
+    fn the_allowlist_is_per_kind() {
+        use crate::contract::process::ProcKind as K;
+        assert!(is_allowed(Path::new("/bin/sh"), K::Pane));
+        assert!(!is_allowed(Path::new("/bin/sh"), K::Convo));
+        assert!(is_allowed(Path::new("/bin/ps"), K::Probe));
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("claude");
+        std::fs::write(&bin, b"x").unwrap();
+        assert!(!is_allowed(&bin, K::Convo));
+        allow_executable(&bin, &[K::Convo, K::Pty]);
+        assert!(is_allowed(&bin, K::Convo));
+        assert!(!is_allowed(&bin, K::Pane));
+        disallow_executable(&bin);
+        assert!(!is_allowed(&bin, K::Convo));
     }
 
     #[test]

@@ -4,18 +4,38 @@
 //! **no operation that can lose the user's work happens without an explicit
 //! choice.** Concretely:
 //!
-//! * `git worktree remove --force` appears nowhere in this crate, and
-//!   `tests/worktree_safety.rs` greps the source to keep it that way.
+//! * `git worktree remove --force` exists exactly once, in
+//!   [`git::remove_worktree_acknowledged`], called only when every loss was
+//!   listed and acknowledged (A36.4); `tests/worktree_safety.rs` greps the
+//!   source to keep it that way. Gilde never deletes a worktree directory
+//!   itself and never runs a repo-wide `git worktree prune` (A36.5).
+//! * If Gilde cannot list a loss precisely it refuses with a reason and
+//!   deletes nothing: commits on no branch are a listed loss; an operation
+//!   in progress, nested git content, a worktree Gilde did not create and a
+//!   lock Gilde did not set are refusals (A36, A37.3).
 //! * `git branch -d` / `-D` appear nowhere either. An unmerged `gilde/*` branch is
 //!   cheap and recoverable; a deleted one is not.
 //! * A dirty tree can only be removed through `CommitThenRemove` or
 //!   `ArchiveThenRemove`, never through `KeepBranch`.
 //! * A worktree with a live registry process is refused in **every** mode.
-//! * `prune` reports before it acts, and never deletes a directory git forgot.
+//! * `prune` reports, and never deletes a directory or an admin entry.
 //!
 //! We also never run `git checkout` in the user's own checkout (DESIGN §7-4):
 //! "switching worktree" is a UI concept. N live agents must not have the ground
 //! moved under them.
+//!
+//! # Gilde 2 (contract §4.2.2, §4.2.5, A6; owner T11)
+//!
+//! [`GitService`] is the `GitApi`: the Changes view (status, numstat, hunk
+//! names, made-by), commit, merge and discard behind single-use confirm
+//! tokens, and `create_worktree` for `session_start{NewWorktree}`. A
+//! session's place comes from World ([`PlaceSource`]) and is re-identified
+//! from disk (§5.6); nothing is persisted. New worktrees go to
+//! `<repo>/../<repo>-wt/<slug>` — or, only with the LP-40 app flag
+//! [`LP40_FLAG`], to `<repo>/.gilde/worktrees/<slug>` with `/.gilde/` in
+//! `.git/info/exclude` (A6). [`WorktreeManager`] is the kept v1 lifecycle
+//! (`lib.rs`, the v1 gates and their tests); its post-create command is
+//! planned through `SupervisorApi` and fails closed (A12.8, A14.2).
 
 pub mod alias; // T14  provider path alias layer
 pub mod git;
@@ -23,7 +43,6 @@ pub mod naming;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -32,7 +51,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::{GildeError, Result};
-use crate::events::{ToastEvent, ToastLevel, WorktreeChangedEvent, WORKTREE_CHANGED};
+use crate::events::{ToastEvent, ToastLevel, WorktreeChangedEvent};
 use crate::paths::AppPaths;
 use crate::store::models::{
     ProcState, WorktreeOrigin, WorktreeRow, WorktreeStatsCache,
@@ -188,7 +207,7 @@ pub struct RemoveOutcome {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PruneReport {
-    /// git knows the worktree, the directory is gone → `git worktree prune`.
+    /// git knows the worktree, the directory is gone → reported only (A36.5).
     pub git_only: Vec<String>,
     /// The directory exists but git forgot it → reported, **never** deleted.
     pub disk_only: Vec<String>,
@@ -431,9 +450,13 @@ fn probe_foreign_pids(path: &Path) -> Vec<i32> {
 // WorktreeManager
 // ---------------------------------------------------------------------------
 
-/// Optional sink for `gilde://worktree/changed`. Held as an option so the manager
-/// is fully usable in tests without a `tauri::AppHandle`.
-pub type EventSink = crate::events::bus::EventBus;
+/// Where the manager reports `gilde://worktree/changed` and its toasts. Held
+/// as an option so the manager is fully usable in tests without a
+/// `tauri::AppHandle`.
+pub trait WorktreeEvents: Send + Sync {
+    fn changed(&self, event: WorktreeChangedEvent);
+    fn toast(&self, toast: ToastEvent);
+}
 
 struct WatchHandle {
     _debouncer: notify_debouncer_full::Debouncer<
@@ -446,7 +469,7 @@ pub struct WorktreeManager {
     me: Weak<WorktreeManager>,
     db: Db,
     paths: Arc<AppPaths>,
-    bus: Option<EventSink>,
+    events: Option<Arc<dyn WorktreeEvents>>,
     watchers: Mutex<HashMap<String, WatchHandle>>,
     last_stats: Mutex<HashMap<String, Instant>>,
 }
@@ -460,12 +483,23 @@ impl std::fmt::Debug for WorktreeManager {
 }
 
 impl WorktreeManager {
-    pub fn new(db: Db, paths: Arc<AppPaths>, bus: Option<EventSink>) -> Arc<Self> {
+    /// `events`: where `gilde://worktree/changed` and toasts go (the boot
+    /// passes T09's `events::Events`; the legacy graph bus is gone, A22.3).
+    pub fn new(db: Db, paths: Arc<AppPaths>, events: Option<Arc<dyn WorktreeEvents>>) -> Arc<Self> {
+        Self::build(db, paths, events)
+    }
+
+    /// The manager with an explicit event sink (tests record what it emits).
+    pub fn with_events(db: Db, paths: Arc<AppPaths>, events: Arc<dyn WorktreeEvents>) -> Arc<Self> {
+        Self::build(db, paths, Some(events))
+    }
+
+    fn build(db: Db, paths: Arc<AppPaths>, events: Option<Arc<dyn WorktreeEvents>>) -> Arc<Self> {
         Arc::new_cyclic(|me| WorktreeManager {
             me: me.clone(),
             db,
             paths,
-            bus,
+            events,
             watchers: Mutex::new(HashMap::new()),
             last_stats: Mutex::new(HashMap::new()),
         })
@@ -668,16 +702,16 @@ impl WorktreeManager {
         let (ahead, behind) = if base.is_empty() {
             (0, 0)
         } else {
-            git::rev_list_lr(&path, &base).await.unwrap_or((0, 0))
+            tolerate(git::rev_list_lr(&path, &base).await)?
         };
         let committed = if base.is_empty() {
             NumStat::default()
         } else {
-            git::numstat(&path, &base).await.unwrap_or_default()
+            tolerate(git::numstat(&path, &base).await)?
         };
-        let uncommitted = git::numstat_worktree(&path).await.unwrap_or_default();
+        let uncommitted = tolerate(git::numstat_worktree(&path).await)?;
         let diff = committed.merge(uncommitted);
-        let last = git::last_commit(&path).await.unwrap_or(None);
+        let last = tolerate(git::last_commit(&path).await)?;
 
         let stats = WorktreeStats {
             dirty_files: status.dirty_files,
@@ -722,9 +756,8 @@ impl WorktreeManager {
         }
         match self.stats(id).await {
             Ok(stats) => {
-                if let Some(bus) = &self.bus {
-                    bus.emit(
-                        WORKTREE_CHANGED,
+                if let Some(events) = &self.events {
+                    events.changed(
                         WorktreeChangedEvent {
                             worktree_id: id.to_string(),
                             dirty: stats.dirty_files,
@@ -751,7 +784,7 @@ impl WorktreeManager {
         let path = PathBuf::from(&row.path);
 
         let status = if path.exists() {
-            git::status_v2(&path).await.unwrap_or_default()
+            tolerate(git::status_v2(&path).await)?
         } else {
             StatusV2::default()
         };
@@ -893,7 +926,7 @@ impl WorktreeManager {
 
         // guard 3 — a dirty tree cannot be dropped with KeepBranch.
         let status = if path.exists() {
-            git::status_v2(&path).await.unwrap_or_default()
+            tolerate(git::status_v2(&path).await)?
         } else {
             StatusV2::default()
         };
@@ -911,6 +944,30 @@ impl WorktreeManager {
                 allowed: vec![RemoveMode::KeepBranch, RemoveMode::ArchiveThenRemove],
             }
             .into());
+        }
+
+        // The Gilde 2 rules hold here too (A36, A37.3, A38.7), before anything
+        // is committed, copied or removed: never through a lock Gilde did not
+        // set, never with an operation in progress or nested git content, and
+        // never while HEAD holds commits no other ref keeps (this path has no
+        // way to list them).
+        let mut lock = LockState::Unlocked;
+        let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if path.exists() {
+            let entries = git::worktree_list(&repo).await?;
+            let entry = entries.iter().skip(1).find(|e| canonical_lexical(&e.path) == canonical);
+            match entry.and_then(|e| e.locked.as_deref()) {
+                None => {}
+                Some(reason) if reason == git::LOCK_REASON => lock = LockState::Gilde,
+                Some(_) => return Err(WorktreeError::Locked.into()),
+            }
+            let gate = |e: git::GitError| WorktreeFailure::Other(e.into_gilde("worktree", &repo));
+            if let Some(reason) = removal_blocker(&repo, &canonical, &entries).await.map_err(gate)? {
+                return Err(WorktreeFailure::Other(GildeError::refused(reason)));
+            }
+            if unreachable_commits(&canonical, &entries).await.map_err(gate)? > 0 {
+                return Err(WorktreeFailure::Other(GildeError::refused("unmergedCommits")));
+            }
         }
 
         let mut commit_sha = None;
@@ -940,43 +997,35 @@ impl WorktreeManager {
 
         let removed;
         if path.exists() {
-            // Unlock first: `git worktree remove` refuses a locked worktree and
-            // the alternative is `--force`, which this codebase does not have.
-            if let Err(err) = git::worktree_lock(&path, false, "").await {
-                warnings.push(format!("unlock failed: {err}"));
+            // Gilde's own lock is released for the removal and restored when
+            // it fails (A36.6); any other lock refused above.
+            if lock == LockState::Gilde {
+                git::worktree_lock(&path, false, "").await?;
             }
-            match git::worktree_remove(&repo, &path).await {
-                Ok(()) => removed = true,
-                // `git worktree remove` refuses a tree with modified or
-                // untracked files. In `ArchiveThenRemove` that is exactly the
-                // expected state, and the user's work is already copied out —
-                // so we delete the directory ourselves and let `prune` clean
-                // up git's bookkeeping. This is the *only* path that removes a
-                // dirty directory, it happens only after a verified archive,
-                // and it is reported in `warnings`.
-                Err(err) if mode == RemoveMode::ArchiveThenRemove => {
-                    let archived = archive_path
-                        .as_deref()
-                        .map(|p| Path::new(p).exists())
-                        .unwrap_or(false);
-                    if !archived {
-                        return Err(WorktreeFailure::Other(err));
-                    }
-                    warnings.push(format!(
-                        "git declined to remove the dirty worktree ({err}); the archive is complete, so the directory was deleted directly"
-                    ));
-                    std::fs::remove_dir_all(&path)?;
-                    removed = true;
-                }
-                Err(err) => return Err(WorktreeFailure::Other(err)),
+            // A dirty tree reaches here only as `ArchiveThenRemove` after a
+            // verified archive — the one acknowledged loss of this path — and
+            // only then is the removal forced (A36.4). git deletes it; there is
+            // no fallback that deletes a directory itself.
+            let archived = archive_path.as_deref().is_some_and(|p| Path::new(p).exists());
+            let result = if dirty && mode == RemoveMode::ArchiveThenRemove && archived {
+                git::remove_worktree_acknowledged(&repo, &path).await
+            } else {
+                git::remove_worktree(&repo, &path).await
+            };
+            if let Err(err) = result {
+                restore_after_failed_remove(&repo, &canonical, lock).await;
+                return Err(WorktreeFailure::Other(err.into_gilde("worktree remove", &repo)));
             }
+            removed = true;
         } else {
+            // Only this worktree's own admin entry, and only while its
+            // directory is gone (A36.5) — never a repo-wide prune.
+            match git::prune_target_admin(&repo, &path) {
+                Ok(_) => {}
+                Err(err) => warnings.push(format!("could not clean the admin entry: {}", err.kind())),
+            }
             warnings.push("worktree directory was already gone".to_string());
             removed = true;
-        }
-
-        if let Err(err) = git::worktree_prune(&repo).await {
-            warnings.push(format!("prune failed: {err}"));
         }
 
         let id_owned = id.to_string();
@@ -1007,8 +1056,8 @@ impl WorktreeManager {
     // -- prune --------------------------------------------------------------
 
     /// Compare git, disk and the database, then act only where DESIGN §7-8 says
-    /// it is safe: prune git's bookkeeping, drop empty rows, and **report**
-    /// disk-only directories without deleting them.
+    /// it is safe: drop empty rows, and **report** git-only entries and
+    /// disk-only directories without touching them (A36.5).
     pub async fn prune(&self, project_id: &str) -> Result<PruneReport> {
         let project = self.project_row(project_id).await?;
         let repo = PathBuf::from(&project.canonical_path);
@@ -1072,12 +1121,10 @@ impl WorktreeManager {
             }
         }
 
-        if !report.git_only.is_empty() {
-            // Bookkeeping only: `git worktree prune` never touches a directory.
-            if let Err(err) = git::worktree_prune(&repo).await {
-                tracing::warn!(target: "worktree", error = %err, "git worktree prune failed");
-            }
-        }
+        // `git_only` is reported, never pruned (A36.5): a worktree whose
+        // directory is missing may be on a volume that is not mounted right
+        // now, and pruning it would lose its HEAD, index and the commits only
+        // it references.
 
         if !db_only_ids.is_empty() {
             let at = now_ms();
@@ -1210,6 +1257,13 @@ impl WorktreeManager {
     /// shell. Spawning a shell with a `-c` string is forbidden in this tree
     /// (`scripts/lint-forbidden.sh` enforces it); an argv array is the only
     /// form that cannot be turned into an injection.
+    ///
+    /// The program is planned through the bound `SupervisorApi` before it
+    /// exists (A12.8). A refusal — `REFUSED{notAllowlisted}` for any program
+    /// the §9.3 allowlist does not name, the boot gate, memory-only mode — is
+    /// returned and **nothing runs**; with no supervisor bound it is refused
+    /// the same way (A14.2: fail closed). Gilde 2 offers no post-create
+    /// command over IPC (§4.8), so in the app this path only ever refuses.
     pub async fn run_post_create(&self, cwd: &Path, cmd: &str) -> Result<PostCreateResult> {
         let argv = shell_words::split(cmd)
             .map_err(|e| GildeError::config(format!("post-create command is not parseable: {e}")))?;
@@ -1224,66 +1278,20 @@ impl WorktreeManager {
                 .map_err(|e| GildeError::spawn(format!("post-create command {program}: {e}")))?
         };
 
-        let full: Vec<String> = std::iter::once(resolved.to_string_lossy().into_owned())
-            .chain(args.iter().cloned())
-            .collect();
-        let ticket = git::plan_spawn("probe", &full, cwd).await;
-
-        let mut command = tokio::process::Command::new(&resolved);
-        command.args(args);
-        command.current_dir(cwd);
-        command.stdin(Stdio::null());
-        command.stdout(Stdio::piped());
-        command.stderr(Stdio::piped());
-        command.process_group(0);
-        command.kill_on_drop(true);
-        if let Some(t) = ticket.as_deref() {
-            command.env("GILDE_SPAWN_ID", t.env_marker());
-        }
-
-        let child = command
-            .spawn()
-            .map_err(|e| GildeError::spawn(format!("post-create command: {e}")))?;
-        let pid = child.id().map(|p| p as i32);
-        if let (Some(t), Some(pid)) = (ticket.as_deref(), pid) {
-            t.mark_running(pid, pid);
-        }
-
-        let output = match tokio::time::timeout(POST_CREATE_TIMEOUT, child.wait_with_output()).await
-        {
-            Ok(res) => res.map_err(|e| GildeError::spawn(format!("post-create command: {e}")))?,
-            Err(_) => {
-                if let Some(pid) = pid {
-                    #[cfg(unix)]
-                    {
-                        use nix::sys::signal::{killpg, Signal};
-                        use nix::unistd::Pid;
-                        let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
-                    }
-                }
-                if let Some(t) = ticket.as_deref() {
-                    t.mark_exited(None, Some(libc::SIGKILL));
-                }
-                return Ok(PostCreateResult {
-                    cmd: cmd.to_string(),
-                    exit_code: None,
-                    tail: format!(
-                        "timed out after {}s",
-                        POST_CREATE_TIMEOUT.as_secs()
-                    ),
-                });
-            }
-        };
-        if let Some(t) = ticket.as_deref() {
-            t.mark_exited(output.status.code(), None);
-        }
-
-        let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
-        combined.push_str(&String::from_utf8_lossy(&output.stderr));
+        let outcome = git::run_program(
+            crate::contract::process::ProcKind::Probe,
+            &resolved,
+            args,
+            cwd,
+            POST_CREATE_TIMEOUT,
+            POST_CREATE_TAIL,
+        )
+        .await
+        .map_err(|e| ipc_to_gilde(&e))?;
         Ok(PostCreateResult {
             cmd: cmd.to_string(),
-            exit_code: output.status.code(),
-            tail: tail_of(&combined, POST_CREATE_TAIL),
+            exit_code: outcome.exit_code,
+            tail: outcome.tail,
         })
     }
 
@@ -1316,12 +1324,1505 @@ impl WorktreeManager {
     }
 
     fn toast(&self, level: ToastLevel, key: &str, params: &[(&str, Value)]) {
-        let Some(bus) = &self.bus else { return };
+        let Some(events) = &self.events else { return };
         let mut toast = ToastEvent::new(level, key);
         for (k, v) in params {
             toast.params.insert((*k).to_string(), v.clone());
         }
-        bus.emit(crate::events::TOAST, toast);
+        events.toast(toast);
+    }
+}
+
+// ===========================================================================
+// Gilde 2 — Changes, commit, merge, discard, new worktrees (contract §4.2.5,
+// §4.2.2 `NewWorktree`, §9.4 diff base) through the existing gates
+// ===========================================================================
+//
+// Nothing here keeps state on disk: a session's location comes from World,
+// git answers every question, and a destructive step happens only behind a
+// single-use confirm token whose digest is re-computed at execution
+// (§4.1 rule 4). The v1 gates hold: no `--force`, no branch deletion, no
+// `checkout` in the user's checkout, a live session blocks a discard.
+
+/// The i18n reason of an action the owner of a watched session blocks (#108).
+pub const REASON_OWNER_WRITING: &str = "changes.ownerWriting";
+/// The i18n reason of a Discard that waits for the live session to stop.
+pub const REASON_STOP_TO_DISCARD: &str = "changes.stopToDiscard";
+/// The app flag that turns the LP-40 worktree root on (A6, §1.3 P41).
+pub const LP40_FLAG: &str = "worktreesInRepo";
+/// `ChangesView.files` and `commits` caps (§4.2.5).
+pub const MAX_FILE_ROWS: usize = 2000;
+pub const MAX_COMMIT_ROWS: usize = 200;
+/// Hunk-header names per file (`FileRow.parts`, ≤ 8).
+pub const MAX_PARTS: usize = 8;
+/// Bytes of an untracked file read to count its lines; past the budget the
+/// count is 0 (the row still shows).
+const UNTRACKED_READ_CAP: u64 = 1024 * 1024;
+const UNTRACKED_READ_BUDGET: u64 = 32 * 1024 * 1024;
+/// The single-use confirm token lifetime (§4.1 rule 4).
+const TOKEN_TTL: Duration = Duration::from_secs(60);
+/// Other sessions of a location whose edits are attributed (`OtherSession`).
+const MADE_BY_PEERS: usize = 16;
+
+use crate::contract::common::{AbsPath, Vendor};
+use crate::contract::content::ChangeKind;
+use crate::contract::error::IpcError;
+use crate::contract::ids::{ConfirmToken, LocationId, ProjectId, SessionUid};
+use crate::contract::ipc::changes::{
+    ActionState, ChangesActions, ChangesBase, ChangesGetReq, ChangesView, CommitRow, FileRow,
+    GitAuthor, GitCommitPreviewReq, GitCommitPreviewRes, GitCommitReq, GitCommitRes,
+    GitMergePreviewReq, GitMergePreviewRes, GitMergeReq, GitMergeRes, Loss, LossKind, MadeBy,
+    MergeEffect, MergeKind, SharedFolder, WorktreeDiscardPreviewReq, WorktreeDiscardPreviewRes,
+    WorktreeDiscardReq,
+};
+use crate::contract::project::{Location, Project, ProjectKind};
+use crate::contract::services::{CompatApi, GitApi, LocationFacts, WorldApi};
+use crate::contract::session::{ChangesCap, Control, Session};
+
+/// An `IpcError` from a kept-v1 helper back into the internal error.
+fn ipc_to_gilde(e: &IpcError) -> GildeError {
+    match e.code {
+        crate::contract::ErrorCode::Refused => GildeError::refused(
+            e.params.get("reason").and_then(|v| v.as_str()).unwrap_or("refused"),
+        ),
+        crate::contract::ErrorCode::DiskFull => GildeError::Io(std::io::Error::from_raw_os_error(libc::ENOSPC)),
+        _ => GildeError::spawn(e.key.clone()),
+    }
+}
+
+fn git_err(e: git::GitError) -> IpcError {
+    e.to_ipc()
+}
+
+/// The v1 reads treat a failed git call as an empty answer, except a read
+/// that A46.1 skipped. Gilde could not read that tree without running the
+/// repository's program, so the read never counts as "nothing changed"
+/// (a clean tree for a removal, zero lines in the stats).
+fn tolerate<T: Default>(answer: Result<T>) -> Result<T> {
+    match answer {
+        Err(e) if git::is_repo_program_error(&e) => Err(e),
+        other => Ok(other.unwrap_or_default()),
+    }
+}
+
+/// A git failure while creating a worktree (A17.4): git refusing or failing
+/// is `REFUSED{worktreeGate}` with git's sanitized stderr as the detail; a
+/// timeout stays `TIMEOUT` and a spawn refusal keeps its own code
+/// (`NOT_READY{bootSweep}`, `DISK_FULL`, `SPAWN_FAILED`).
+fn gate_err(e: git::GitError) -> IpcError {
+    // A lock that a timed-out git left (A37.2) is a git failure too.
+    let gated = matches!(e, git::GitError::Failed { .. } | git::GitError::TooLarge) || git::is_lock_left(&e);
+    if !gated {
+        return e.to_ipc();
+    }
+    let gate = IpcError::refused("worktreeGate");
+    match e.to_ipc().detail {
+        Some(d) => gate.with_detail(d),
+        None => gate,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Places: where a session works (World is the source)
+// ---------------------------------------------------------------------------
+
+/// What World knows, in one read.
+#[derive(Debug, Clone, Default)]
+pub struct PlaceView {
+    pub sessions: Vec<Session>,
+    pub locations: Vec<Location>,
+    pub projects: Vec<Project>,
+}
+
+/// The slice of World this module reads (a narrow seam so tests can supply
+/// sessions and locations without a World).
+pub trait PlaceSource: Send + Sync {
+    fn session(&self, uid: &SessionUid) -> Option<Session>;
+    fn view(&self) -> PlaceView;
+    fn transcript(&self, uid: &SessionUid) -> Option<(AbsPath, Vendor)>;
+    /// Tell World about a location Gilde created or the user picked (§5.6).
+    fn location_seen(&self, facts: LocationFacts);
+}
+
+/// [`PlaceSource`] over the real World (T02).
+pub struct WorldPlaces(pub Arc<dyn WorldApi>);
+
+impl PlaceSource for WorldPlaces {
+    fn session(&self, uid: &SessionUid) -> Option<Session> {
+        self.0.session(uid)
+    }
+
+    fn view(&self) -> PlaceView {
+        let snap = self.0.snapshot();
+        PlaceView {
+            sessions: snap.sessions,
+            locations: snap.locations,
+            projects: snap.projects,
+        }
+    }
+
+    fn transcript(&self, uid: &SessionUid) -> Option<(AbsPath, Vendor)> {
+        self.0.transcript(uid)
+    }
+
+    fn location_seen(&self, facts: LocationFacts) {
+        self.0.sink().location(facts);
+    }
+}
+
+/// One session's place (all paths canonical).
+#[derive(Debug, Clone)]
+pub struct Place {
+    pub uid: SessionUid,
+    pub vendor: Vendor,
+    /// A watched session whose owner may still be writing (§4.2.5,
+    /// `REFUSED{ownerAlive}`; ux-ia #108).
+    pub owner_alive: bool,
+    pub in_gilde: bool,
+    pub location_id: LocationId,
+    /// The worktree root, main checkout or folder.
+    pub location: PathBuf,
+    pub project_id: ProjectId,
+    pub project_root: PathBuf,
+    pub git: bool,
+    /// A linked worktree (not the main checkout).
+    pub worktree: bool,
+    /// The other existing locations of the project.
+    pub other_roots: Vec<PathBuf>,
+}
+
+/// Whether a session counts as running (In Gilde or Watching).
+pub fn is_live(s: &Session) -> bool {
+    matches!(s.control, Control::InGilde { .. } | Control::Watching { .. })
+}
+
+fn owner_alive(s: &Session) -> bool {
+    matches!(s.control, Control::Watching { .. }) || s.caps.changes == ChangesCap::ReadOnly
+}
+
+/// Resolve `uid`'s place: World's location for the session, else its cwd,
+/// re-identified from disk with the §5.6 rules (no git spawn).
+pub fn place_of(src: &dyn PlaceSource, home: &Path, uid: &SessionUid) -> std::result::Result<(Place, PlaceView), IpcError> {
+    let session = src.session(uid).ok_or_else(|| IpcError::not_found("session"))?;
+    let view = src.view();
+    let dir = session
+        .location_id
+        .as_ref()
+        .and_then(|id| view.locations.iter().find(|l| &l.id == id))
+        .map(|l| PathBuf::from(l.path.as_str()))
+        .or_else(|| session.cwd.as_ref().map(|c| PathBuf::from(c.as_str())))
+        .ok_or_else(|| IpcError::not_found("location"))?;
+    let id = crate::discovery::location::identify(&dir, home).ok_or_else(|| IpcError::not_found("location"))?;
+    let other_roots = view
+        .locations
+        .iter()
+        .filter(|l| l.project_id == id.project_id && l.exists)
+        .filter_map(|l| std::fs::canonicalize(l.path.as_str()).ok())
+        .filter(|p| p != &id.location_path)
+        .collect();
+    let place = Place {
+        uid: session.uid.clone(),
+        vendor: session.vendor,
+        owner_alive: owner_alive(&session),
+        in_gilde: matches!(session.control, Control::InGilde { .. }),
+        location_id: id.location_id.clone(),
+        location: id.location_path.clone(),
+        project_id: id.project_id.clone(),
+        project_root: id.project_root.clone(),
+        git: id.git,
+        worktree: id.worktree,
+        other_roots,
+    };
+    Ok((place, view))
+}
+
+/// The sessions whose place is `place`'s location: by World's location id;
+/// a session without one by the §5.6 identity of its cwd (never by a path
+/// prefix — an LP-40 worktree lives *inside* its main checkout).
+fn sessions_here<'a>(view: &'a PlaceView, place: &'a Place, home: &'a Path) -> impl Iterator<Item = &'a Session> + 'a {
+    view.sessions.iter().filter(move |s| {
+        if s.merged_into.is_some() {
+            return false;
+        }
+        match (&s.location_id, &s.cwd) {
+            (Some(id), _) => id == &place.location_id,
+            (None, Some(c)) => crate::discovery::location::identify(Path::new(c.as_str()), home)
+                .is_some_and(|i| i.location_id == place.location_id),
+            (None, None) => false,
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Made by: the session's own edit/write tool calls (§4.2.5, ux-ia §3.13)
+// ---------------------------------------------------------------------------
+
+/// Claude tools whose input names the file they change.
+const CLAUDE_EDIT_TOOLS: &[&str] = &["Edit", "MultiEdit", "Write", "NotebookEdit"];
+/// Bytes of one transcript read per call (the rest continues next call).
+const MADE_BY_READ_PER_CALL: u64 = 64 * 1024 * 1024;
+const MADE_BY_CHUNK: usize = 1024 * 1024;
+/// A transcript line longer than this is skipped (its tail is never parsed).
+const MADE_BY_MAX_LINE: usize = 16 * 1024 * 1024;
+/// Transcripts indexed at once.
+const MADE_BY_MAX_TRANSCRIPTS: usize = 256;
+
+#[derive(Default)]
+struct Scan {
+    id: Option<crate::discovery::safe_read::FileId>,
+    offset: u64,
+    carry: Vec<u8>,
+    skipping: bool,
+    paths: HashSet<String>,
+}
+
+/// Incremental, memory-only index of the files each transcript's edit and
+/// write tool calls named (content: never persisted or logged).
+#[derive(Default)]
+pub struct MadeByIndex {
+    scans: Mutex<HashMap<PathBuf, Scan>>,
+}
+
+impl MadeByIndex {
+    pub fn new() -> MadeByIndex {
+        MadeByIndex::default()
+    }
+
+    /// The absolute paths `transcript`'s edit/write tool calls named
+    /// (canonical where they exist; relative codex paths joined to `cwd`).
+    /// `None` = unknown (unreadable, or a vendor with no tool events).
+    /// Blocking: call from the blocking pool.
+    pub fn edited(&self, transcript: &Path, vendor: Vendor, cwd: &Path) -> Option<HashSet<String>> {
+        if !matches!(vendor, Vendor::Claude | Vendor::Codex) {
+            return None;
+        }
+        let parent = transcript.parent()?;
+        let root = crate::discovery::safe_read::Root::new(parent).ok()?;
+        let file = crate::discovery::safe_read::open_in(&root, transcript).ok()?;
+        let mut scans = self.scans.lock();
+        if scans.len() >= MADE_BY_MAX_TRANSCRIPTS && !scans.contains_key(transcript) {
+            // Memory only and cheap to rebuild: start over rather than grow.
+            scans.clear();
+        }
+        let scan = scans.entry(transcript.to_path_buf()).or_default();
+        let same = scan
+            .id
+            .is_some_and(|id| id.inode == file.id.inode && id.dev == file.id.dev && file.id.size >= scan.offset);
+        if !same {
+            *scan = Scan::default();
+        }
+        scan.id = Some(file.id);
+        let end = file.id.size.min(scan.offset.saturating_add(MADE_BY_READ_PER_CALL));
+        while scan.offset < end {
+            let want = ((end - scan.offset) as usize).min(MADE_BY_CHUNK);
+            let Ok(bytes) = file.read_range(scan.offset, want) else { break };
+            if bytes.is_empty() {
+                break;
+            }
+            scan.offset += bytes.len() as u64;
+            let mut start = 0usize;
+            for nl in memchr::memchr_iter(b'\n', &bytes) {
+                if !scan.skipping {
+                    scan.carry.extend_from_slice(&bytes[start..nl]);
+                    let line = std::mem::take(&mut scan.carry);
+                    collect_edited(&line, vendor, cwd, &mut scan.paths);
+                }
+                scan.carry.clear();
+                scan.skipping = false;
+                start = nl + 1;
+            }
+            if !scan.skipping {
+                scan.carry.extend_from_slice(&bytes[start..]);
+                if scan.carry.len() > MADE_BY_MAX_LINE {
+                    scan.carry.clear();
+                    scan.skipping = true;
+                }
+            }
+        }
+        Some(scan.paths.clone())
+    }
+}
+
+/// Add the files one transcript line's edit/write calls name.
+fn collect_edited(line: &[u8], vendor: Vendor, cwd: &Path, out: &mut HashSet<String>) {
+    let hint: &[&[u8]] = match vendor {
+        Vendor::Claude => &[b"\"tool_use\""],
+        _ => &[b"apply_patch", b"FileChange", b"fileChange", b"file_change", b"*** "],
+    };
+    if !hint.iter().any(|h| memchr::memmem::find(line, h).is_some()) {
+        return;
+    }
+    let Ok(v) = serde_json::from_slice::<Value>(line) else { return };
+    let mut add = |p: &str| {
+        let path = Path::new(p);
+        let abs = if path.is_absolute() { path.to_path_buf() } else { cwd.join(path) };
+        out.insert(canonical_lexical(&abs).to_string_lossy().into_owned());
+    };
+    match vendor {
+        Vendor::Claude => {
+            let blocks = v.pointer("/message/content").and_then(Value::as_array);
+            for b in blocks.into_iter().flatten() {
+                if b.get("type").and_then(Value::as_str) != Some("tool_use") {
+                    continue;
+                }
+                let name = b.get("name").and_then(Value::as_str).unwrap_or("");
+                if !CLAUDE_EDIT_TOOLS.contains(&name) {
+                    continue;
+                }
+                let input = b.get("input");
+                for key in ["file_path", "notebook_path"] {
+                    if let Some(p) = input.and_then(|i| i.get(key)).and_then(Value::as_str) {
+                        add(p);
+                    }
+                }
+            }
+        }
+        _ => codex_paths(&v, &mut add, 0),
+    }
+}
+
+/// codex rollouts: `FileChange` items (`changes` as a map of paths or a list
+/// of `{path}`) and `apply_patch` texts (`*** Add/Update/Delete File:`,
+/// `*** Move to:`), wherever they sit in the row.
+fn codex_paths(v: &Value, add: &mut dyn FnMut(&str), depth: usize) {
+    if depth > 8 {
+        return;
+    }
+    match v {
+        Value::Object(map) => {
+            if let Some(changes) = map.get("changes") {
+                match changes {
+                    Value::Object(m) => m.keys().for_each(|k| add(k.as_str())),
+                    Value::Array(list) => list
+                        .iter()
+                        .filter_map(|c| c.get("path").and_then(Value::as_str))
+                        .for_each(&mut *add),
+                    _ => {}
+                }
+            }
+            for (_, child) in map {
+                codex_paths(child, add, depth + 1);
+            }
+        }
+        Value::Array(list) => list.iter().for_each(|c| codex_paths(c, add, depth + 1)),
+        Value::String(s) if s.contains("*** ") => {
+            // A function-call `arguments` string may itself be JSON.
+            if s.trim_start().starts_with('{') {
+                if let Ok(inner) = serde_json::from_str::<Value>(s) {
+                    codex_paths(&inner, add, depth + 1);
+                    return;
+                }
+            }
+            for l in s.lines() {
+                for prefix in ["*** Add File: ", "*** Update File: ", "*** Delete File: ", "*** Move to: "] {
+                    if let Some(p) = l.strip_prefix(prefix) {
+                        let p = p.trim();
+                        if !p.is_empty() {
+                            add(p);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `p` without `.`/`..` components, with its longest existing ancestor
+/// canonicalized (so `/tmp` vs `/private/tmp` and symlinked homes agree).
+pub fn canonical_lexical(p: &Path) -> PathBuf {
+    let mut clean = PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                clean.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => clean.push(other.as_os_str()),
+        }
+    }
+    let mut tail = Vec::new();
+    let mut probe = clean.clone();
+    loop {
+        if let Ok(real) = std::fs::canonicalize(&probe) {
+            let mut out = real;
+            for t in tail.iter().rev() {
+                out.push(t);
+            }
+            return out;
+        }
+        match (probe.file_name().map(|n| n.to_os_string()), probe.parent()) {
+            (Some(name), Some(parent)) => {
+                tail.push(name);
+                probe = parent.to_path_buf();
+            }
+            _ => return clean,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// confirm tokens (§4.1 rule 4)
+// ---------------------------------------------------------------------------
+
+struct Pending<T> {
+    uid: SessionUid,
+    data: T,
+    at: Instant,
+}
+
+/// Single-use 60 s tokens bound to a session and a digest of the previewed
+/// state. Every failure to redeem is `CONFLICT{changed}` (the documented value).
+struct Tokens<T> {
+    map: Mutex<HashMap<String, Pending<T>>>,
+}
+
+impl<T: Clone> Tokens<T> {
+    fn new() -> Tokens<T> {
+        Tokens { map: Mutex::new(HashMap::new()) }
+    }
+
+    fn issue(&self, uid: &SessionUid, data: T) -> ConfirmToken {
+        let token = ConfirmToken::mint();
+        let mut map = self.map.lock();
+        map.retain(|_, p| p.at.elapsed() < TOKEN_TTL);
+        map.insert(token.as_str().to_string(), Pending { uid: uid.clone(), data, at: Instant::now() });
+        token
+    }
+
+    /// Take a live token of `uid` (A37.4: atomically single use — the caller
+    /// takes it before its first `await`, so a second concurrent execution is
+    /// `CONFLICT{changed}`). `check` sees the previewed data first, under the
+    /// same lock; when it refuses (a request that does not match the preview,
+    /// decided without touching anything) the token stays for a corrected call.
+    fn take_if(
+        &self,
+        token: &ConfirmToken,
+        uid: &SessionUid,
+        check: impl FnOnce(&T) -> std::result::Result<(), IpcError>,
+    ) -> std::result::Result<T, IpcError> {
+        let mut map = self.map.lock();
+        match map.get(token.as_str()) {
+            Some(p) if p.at.elapsed() < TOKEN_TTL && &p.uid == uid => check(&p.data)?,
+            _ => return Err(IpcError::conflict("changed")),
+        }
+        map.remove(token.as_str()).map(|p| p.data).ok_or_else(|| IpcError::conflict("changed"))
+    }
+}
+
+fn digest(parts: &[String]) -> String {
+    use sha2::{Digest as _, Sha256};
+    let mut h = Sha256::new();
+    for p in parts {
+        h.update(p.as_bytes());
+        h.update([0u8]);
+    }
+    hex::encode(h.finalize())
+}
+
+// ---------------------------------------------------------------------------
+// GitService
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct CommitPending {
+    /// The real paths of the previewed rows.
+    paths: Vec<String>,
+    /// Their wire paths (`pathRel`), for the check made before the token is taken.
+    rels: Vec<String>,
+    digest: String,
+}
+
+#[derive(Clone)]
+struct MergePending {
+    digest: String,
+}
+
+#[derive(Clone)]
+struct DiscardPending {
+    digest: String,
+    /// The previewed losses, each of which must be acknowledged.
+    loss_ids: Vec<String>,
+}
+
+/// Gilde's own lock on a worktree it is about to discard (A36.6, A37.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockState {
+    Unlocked,
+    /// Locked with [`git::LOCK_REASON`]: released only for the removal and
+    /// restored when it fails.
+    Gilde,
+}
+
+/// Everything a discard decides on (preview and execution compute it alike).
+struct DiscardState {
+    losses: Vec<Loss>,
+    digest: String,
+    lock: LockState,
+}
+
+/// One row before it is sent: the real path git knows and its wire row.
+#[derive(Debug, Clone)]
+struct Row {
+    real: String,
+    row: FileRow,
+    /// Staged, unstaged or untracked in the working tree — the rows a commit
+    /// can take (A37.1). A change already committed on the branch is not.
+    uncommitted: bool,
+}
+
+/// The diff base of a location (§9.4: merge-base with the branch's base for
+/// worktrees, `HEAD` otherwise).
+#[derive(Debug, Clone)]
+struct Base {
+    /// The commit the working tree is compared with (or the empty tree).
+    rev: String,
+    /// For a worktree whose main checkout is on a branch.
+    branch: Option<BaseBranch>,
+}
+
+#[derive(Debug, Clone)]
+struct BaseBranch {
+    name: String,
+    merge_base: String,
+}
+
+/// The `GitApi` (T11): Changes, commit, merge, discard, new worktrees.
+pub struct GitService {
+    src: Arc<dyn PlaceSource>,
+    home: PathBuf,
+    compat: Option<Arc<dyn CompatApi>>,
+    made_by: Arc<MadeByIndex>,
+    commits: Tokens<CommitPending>,
+    merges: Tokens<MergePending>,
+    discards: Tokens<DiscardPending>,
+}
+
+impl GitService {
+    /// Over the real World (`home` = the user's home, the §5.6 walk boundary).
+    pub fn new(world: Arc<dyn WorldApi>, home: PathBuf) -> GitService {
+        GitService::with_source(Arc::new(WorldPlaces(world)), home)
+    }
+
+    pub fn with_source(src: Arc<dyn PlaceSource>, home: PathBuf) -> GitService {
+        GitService {
+            src,
+            home,
+            compat: None,
+            made_by: Arc::new(MadeByIndex::new()),
+            commits: Tokens::new(),
+            merges: Tokens::new(),
+            discards: Tokens::new(),
+        }
+    }
+
+    /// The compat service whose app flag [`LP40_FLAG`] switches the worktree
+    /// root (A6; absent = the fallback root).
+    pub fn with_compat(mut self, compat: Arc<dyn CompatApi>) -> GitService {
+        self.compat = Some(compat);
+        self
+    }
+
+    pub fn place(&self, uid: &SessionUid) -> std::result::Result<(Place, PlaceView), IpcError> {
+        place_of(self.src.as_ref(), &self.home, uid)
+    }
+
+    /// The worktree layout new worktrees get (A6).
+    pub fn layout(&self) -> naming::WorktreeLayout {
+        match &self.compat {
+            Some(c) if c.app_feature(LP40_FLAG) => naming::WorktreeLayout::InRepo,
+            _ => naming::WorktreeLayout::Sibling,
+        }
+    }
+
+    async fn base_of(&self, place: &Place) -> std::result::Result<Base, IpcError> {
+        let loc = &place.location;
+        let head = git::resolve_commit(loc, "HEAD").await.map_err(git_err)?;
+        let Some(head) = head else {
+            return Ok(Base { rev: git::EMPTY_TREE.to_string(), branch: None });
+        };
+        if place.worktree {
+            if let Some(name) = git::head_branch(&place.project_root).await.map_err(git_err)? {
+                if let Some(mb) = git::merge_base(loc, "HEAD", &format!("refs/heads/{name}")).await.map_err(git_err)? {
+                    return Ok(Base { rev: mb.clone(), branch: Some(BaseBranch { name, merge_base: mb }) });
+                }
+            }
+        }
+        Ok(Base { rev: head, branch: None })
+    }
+
+    /// The file rows of `place` against `base` (≤ 2000, sorted by path).
+    async fn rows(&self, place: &Place, view: &PlaceView, base: &Base) -> std::result::Result<Vec<Row>, IpcError> {
+        let loc = &place.location;
+        let entries = git::diff_entries(loc, &base.rev).await.map_err(git_err)?;
+        let untracked = git::untracked_files(loc).await.map_err(git_err)?;
+        let parts = git::hunk_names(loc, &base.rev, MAX_PARTS).await.map_err(git_err)?;
+        let open = git::uncommitted_paths(loc).await.map_err(git_err)?;
+        let made_by = self.made_by_fn(place, view).await;
+
+        let mut rows: Vec<Row> = Vec::with_capacity(entries.len() + untracked.len());
+        for e in entries {
+            let change = match e.status {
+                'A' => ChangeKind::Added,
+                'D' => ChangeKind::Deleted,
+                _ => ChangeKind::Modified,
+            };
+            rows.push(Row {
+                row: FileRow {
+                    path_rel: display_rel(&e.path),
+                    change,
+                    added: e.added.unwrap_or(0),
+                    removed: e.removed.unwrap_or(0),
+                    parts: parts.get(&e.path).map(|p| sanitize_parts(p)).unwrap_or_default(),
+                    made_by: made_by(&e.path),
+                },
+                uncommitted: open.contains(&e.path),
+                real: e.path,
+            });
+        }
+        let loc_owned = loc.clone();
+        let names = untracked.clone();
+        let counts = tokio::task::spawn_blocking(move || {
+            let mut budget = UNTRACKED_READ_BUDGET;
+            names.iter().map(|p| line_count(&loc_owned.join(p), &mut budget)).collect::<Vec<u32>>()
+        })
+        .await
+        .unwrap_or_default();
+        for (i, p) in untracked.into_iter().enumerate() {
+            rows.push(Row {
+                row: FileRow {
+                    path_rel: display_rel(&p),
+                    change: ChangeKind::Added,
+                    added: counts.get(i).copied().unwrap_or(0),
+                    removed: 0,
+                    parts: Vec::new(),
+                    made_by: made_by(&p),
+                },
+                uncommitted: true,
+                real: p,
+            });
+        }
+        rows.sort_by(|a, b| a.real.cmp(&b.real));
+        // A path both in the diff and untracked keeps the uncommitted mark.
+        rows.dedup_by(|later, kept| {
+            let same = later.real == kept.real;
+            if same {
+                kept.uncommitted |= later.uncommitted;
+            }
+            same
+        });
+        rows.truncate(MAX_FILE_ROWS);
+        Ok(rows)
+    }
+
+    /// `path_rel → MadeBy` for `place` (cursor/agy → `Unknown`).
+    async fn made_by_fn(&self, place: &Place, view: &PlaceView) -> Box<dyn Fn(&str) -> MadeBy + Send + Sync> {
+        if !matches!(place.vendor, Vendor::Claude | Vendor::Codex) {
+            return Box::new(|_| MadeBy::Unknown);
+        }
+        let own = self.src.transcript(&place.uid);
+        let mut peers: Vec<&Session> = sessions_here(view, place, &self.home)
+            .filter(|s| s.uid != place.uid && matches!(s.vendor, Vendor::Claude | Vendor::Codex))
+            .collect();
+        peers.sort_by_key(|s| std::cmp::Reverse(s.last_activity_at.unwrap_or(0)));
+        peers.truncate(MADE_BY_PEERS);
+        let peer_transcripts: Vec<(SessionUid, (AbsPath, Vendor), PathBuf)> = peers
+            .iter()
+            .filter_map(|s| {
+                let t = self.src.transcript(&s.uid)?;
+                let cwd = s.cwd.as_ref().map(|c| PathBuf::from(c.as_str())).unwrap_or_else(|| place.location.clone());
+                Some((s.uid.clone(), t, cwd))
+            })
+            .collect();
+        let index = self.made_by.clone();
+        let loc = place.location.clone();
+        let (mine, others) = tokio::task::spawn_blocking(move || {
+            let mine = own.and_then(|(p, v)| index.edited(Path::new(p.as_str()), v, &loc));
+            let others: Vec<(SessionUid, HashSet<String>)> = peer_transcripts
+                .into_iter()
+                .filter_map(|(uid, (p, v), cwd)| Some((uid, index.edited(Path::new(p.as_str()), v, &cwd)?)))
+                .collect();
+            (mine, others)
+        })
+        .await
+        .unwrap_or((None, Vec::new()));
+        let fold = crate::ide::paths::case_insensitive(&place.location);
+        let key = move |s: &str| if fold { s.to_lowercase() } else { s.to_string() };
+        let mine: Option<HashSet<String>> = mine.map(|m| m.iter().map(|s| key(s)).collect());
+        let others: Vec<(SessionUid, HashSet<String>)> =
+            others.into_iter().map(|(u, set)| (u, set.iter().map(|s| key(s)).collect())).collect();
+        let loc = place.location.clone();
+        Box::new(move |rel: &str| {
+            let abs = key(&loc.join(rel).to_string_lossy());
+            if let Some(m) = &mine {
+                if m.contains(&abs) {
+                    return MadeBy::ThisSession;
+                }
+            }
+            if let Some((uid, _)) = others.iter().find(|(_, set)| set.contains(&abs)) {
+                return MadeBy::OtherSession { uid: uid.clone() };
+            }
+            if mine.is_some() {
+                MadeBy::NotFromKnownSession
+            } else {
+                MadeBy::Unknown
+            }
+        })
+    }
+
+    /// Whether a live session works at or under `place`'s location (this one
+    /// included): by World's location id, by that location's path, or by the
+    /// session's cwd — in any location, so a session in a worktree nested
+    /// inside this one counts too (A36.3).
+    fn live_at_or_under(&self, view: &PlaceView, place: &Place) -> bool {
+        let target = &place.location;
+        let fold = crate::ide::paths::case_insensitive(target);
+        let under = |p: &str| crate::ide::paths::within(&canonical_lexical(Path::new(p)), target, fold);
+        view.sessions.iter().filter(|s| s.merged_into.is_none() && is_live(s)).any(|s| {
+            let by_location = s.location_id.as_ref().is_some_and(|id| {
+                id == &place.location_id || view.locations.iter().any(|l| &l.id == id && under(l.path.as_str()))
+            });
+            by_location || s.cwd.as_ref().is_some_and(|c| under(c.as_str()))
+        })
+    }
+
+    fn require_worktree(place: &Place) -> std::result::Result<(), IpcError> {
+        if !place.git {
+            return Err(IpcError::unsupported("notGit"));
+        }
+        if !place.worktree {
+            return Err(IpcError::unsupported("notAWorktree"));
+        }
+        Ok(())
+    }
+
+    /// Per-path state for the commit digest: change, counts and the working
+    /// file's `(size, mtime, mode)`.
+    fn row_state(place: &Place, row: &Row) -> String {
+        let meta = std::fs::symlink_metadata(place.location.join(&row.real))
+            .map(|m| {
+                use std::os::unix::fs::MetadataExt as _;
+                format!("{}:{}.{}:{:o}", m.size(), m.mtime(), m.mtime_nsec(), m.mode())
+            })
+            .unwrap_or_else(|_| "absent".into());
+        format!("{}|{:?}|{}|{}|{meta}", row.real, row.row.change, row.row.added, row.row.removed)
+    }
+
+    /// The merge of the worktree's HEAD into the main checkout's branch:
+    /// `(effect, digest, base branch, worktree commit)`. A worktree whose
+    /// HEAD is unborn has nothing to merge: up to date, no commit.
+    async fn merge_state(&self, place: &Place) -> std::result::Result<(MergeEffect, String, String, Option<String>), IpcError> {
+        let main = &place.project_root;
+        let branch = git::head_branch(main).await.map_err(git_err)?.ok_or_else(|| IpcError::refused("noBaseBranch"))?;
+        let ours = git::resolve_commit(main, "HEAD").await.map_err(git_err)?.ok_or_else(|| IpcError::refused("noBaseBranch"))?;
+        let Some(theirs) = git::resolve_commit(&place.location, "HEAD").await.map_err(git_err)? else {
+            let effect = MergeEffect { kind: MergeKind::UpToDate, commits: 0, files_changed: 0 };
+            let d = digest(&[place.location.to_string_lossy().into_owned(), branch.clone(), ours, "unborn".into()]);
+            return Ok((effect, d, branch, None));
+        };
+        let kind = if git::is_ancestor(main, &theirs, &ours).await.map_err(git_err)? {
+            MergeKind::UpToDate
+        } else if git::is_ancestor(main, &ours, &theirs).await.map_err(git_err)? {
+            MergeKind::FastForward
+        } else {
+            MergeKind::MergeCommit
+        };
+        let commits = git::count(main, &format!("{ours}..{theirs}")).await.map_err(git_err)?;
+        let files = git::exec(
+            main,
+            &["diff", "--name-only", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", "--end-of-options", &format!("{ours}...{theirs}"), "--"],
+            git::ExecOpts::default(),
+        )
+        .await
+        .map_err(git_err)?
+        .nul_fields()
+        .len() as u32;
+        let effect = MergeEffect { kind, commits, files_changed: files };
+        let d = digest(&[place.location.to_string_lossy().into_owned(), branch.clone(), ours.clone(), theirs.clone(), format!("{kind:?}")]);
+        Ok((effect, d, branch, Some(theirs)))
+    }
+
+    /// The gates every merge passes (preview and execution): the main
+    /// checkout has no uncommitted tracked change, and the merge does not
+    /// conflict (checked without touching any working tree).
+    async fn merge_gates(place: &Place, effect: &MergeEffect, theirs: Option<&str>) -> std::result::Result<(), IpcError> {
+        if git::tracked_dirty(&place.project_root).await.map_err(git_err)? {
+            return Err(IpcError::refused("mainDirty"));
+        }
+        if let (MergeKind::MergeCommit, Some(theirs)) = (effect.kind, theirs) {
+            if git::merge_conflicts(&place.project_root, "HEAD", theirs).await.map_err(git_err)? {
+                return Err(IpcError::refused("conflicts"));
+            }
+        }
+        Ok(())
+    }
+
+    /// What a discard of `place` would lose — or why it cannot be listed
+    /// exactly, in which case it refuses and deletes nothing (A36, A37.3).
+    /// Preview and execution run exactly this.
+    async fn discard_state(&self, place: &Place, view: &PlaceView) -> std::result::Result<DiscardState, IpcError> {
+        Self::require_worktree(place)?;
+        if place.owner_alive {
+            return Err(IpcError::refused("ownerAlive"));
+        }
+        if self.live_at_or_under(view, place) {
+            return Err(IpcError::refused("sessionsLive").with_key(REASON_STOP_TO_DISCARD));
+        }
+        let (entry, entries) = self.check_linked_worktree(place).await?;
+        let loc = &place.location;
+
+        // A37.3: only a worktree Gilde made, and never through a lock Gilde
+        // did not set.
+        if !Self::gilde_created(place, &entry).await? {
+            return Err(keyed_refusal(REFUSED_NOT_GILDE_CREATED));
+        }
+        let lock = match entry.locked.as_deref() {
+            None => LockState::Unlocked,
+            Some(reason) if reason == git::LOCK_REASON => LockState::Gilde,
+            Some(_) => return Err(keyed_refusal(REFUSED_LOCKED_BY_USER)),
+        };
+
+        // A36.2, A36.3: what a list of losses cannot describe.
+        if let Some(reason) = removal_blocker(&place.project_root, loc, &entries).await.map_err(git_err)? {
+            return Err(keyed_refusal(reason));
+        }
+
+        let status = git::status_for_discard(loc).await.map_err(git_err)?;
+        let tracked = status.dirty_files;
+        let untracked = status.untracked + status.ignored;
+        let unreachable = unreachable_commits(loc, &entries).await.map_err(git_err)?;
+        let mut losses = Vec::new();
+        if tracked > 0 {
+            losses.push(Loss { id: "uncommittedChanges".into(), kind: LossKind::UncommittedChanges, count: tracked });
+        }
+        if untracked > 0 {
+            losses.push(Loss { id: "untrackedFiles".into(), kind: LossKind::UntrackedFiles, count: untracked });
+        }
+        if unreachable > 0 {
+            losses.push(Loss { id: "unmergedCommits".into(), kind: LossKind::UnmergedCommits, count: unreachable });
+        }
+
+        // A37.5: the digest covers HEAD (sha and branch vs detached), the lock,
+        // every loss and the state on disk of each dirty, untracked or ignored
+        // entry, so editing an already-dirty file after the preview is a change.
+        let head = git::resolve_commit(loc, "HEAD").await.map_err(git_err)?.unwrap_or_default();
+        let mut parts = vec![
+            loc.to_string_lossy().into_owned(),
+            head,
+            entry.branch.clone().unwrap_or_else(|| "detached".into()),
+            format!("{lock:?}"),
+            format!("{tracked}:{untracked}:{unreachable}"),
+        ];
+        let loc_owned = loc.clone();
+        let records: Vec<(String, String)> =
+            status.entries.iter().map(|e| (format!("{}{}", e.x, e.y), e.path.clone())).collect();
+        let mut stated = tokio::task::spawn_blocking(move || {
+            records
+                .into_iter()
+                .map(|(xy, path)| format!("{xy}{path}|{}", stat_state(&loc_owned.join(&path))))
+                .collect::<Vec<String>>()
+        })
+        .await
+        .map_err(|_| IpcError::internal("discard-state"))?;
+        stated.sort();
+        parts.extend(stated);
+        Ok(DiscardState { losses, digest: digest(&parts), lock })
+    }
+
+    /// The worktree is a linked worktree git knows for this repository —
+    /// never the main checkout, `$HOME` or `/` (the last line before a
+    /// directory is deleted). Returns its entry and the whole list.
+    async fn check_linked_worktree(
+        &self,
+        place: &Place,
+    ) -> std::result::Result<(git::GitWorktreeEntry, Vec<git::GitWorktreeEntry>), IpcError> {
+        let loc = &place.location;
+        let home = std::fs::canonicalize(&self.home).unwrap_or_else(|_| self.home.clone());
+        if loc == &place.project_root
+            || place.project_root.starts_with(loc)
+            || loc == &home
+            || loc.parent().is_none()
+            || !std::fs::symlink_metadata(loc.join(".git")).is_ok_and(|m| m.is_file())
+        {
+            return Err(IpcError::unsupported("notAWorktree"));
+        }
+        let entries = git::list_worktrees(&place.project_root).await.map_err(git_err)?;
+        let entry = entries
+            .iter()
+            .skip(1)
+            .find(|e| std::fs::canonicalize(&e.path).is_ok_and(|p| &p == loc))
+            .cloned()
+            .ok_or_else(|| IpcError::unsupported("notAWorktree"))?;
+        Ok((entry, entries))
+    }
+
+    /// A17.7's one rule, with the branch git reports for the worktree. A
+    /// detached HEAD (an agent checked out a commit, a rebase is running) is
+    /// judged by the branch Gilde created it with — `gilde/<directory name>`
+    /// — when that branch still exists.
+    async fn gilde_created(place: &Place, entry: &git::GitWorktreeEntry) -> std::result::Result<bool, IpcError> {
+        let branch = match entry.short_branch() {
+            Some(b) => Some(b.to_string()),
+            None => match place.location.file_name().and_then(|n| n.to_str()) {
+                Some(slug) => {
+                    let b = naming::branch_name(slug);
+                    git::branch_present(&place.project_root, &b).await.map_err(git_err)?.then_some(b)
+                }
+                None => None,
+            },
+        };
+        Ok(naming::is_gilde_created(&place.project_root, &place.location, branch.as_deref()))
+    }
+
+    /// HEAD's sha and branch (`detached` when it has none), for the commit
+    /// digest (A37.5): a commit or a checkout after the preview is a change.
+    async fn head_state(place: &Place) -> std::result::Result<String, IpcError> {
+        let loc = &place.location;
+        let head = git::resolve_commit(loc, "HEAD").await.map_err(git_err)?.unwrap_or_default();
+        let branch = git::head_branch(loc).await.map_err(git_err)?.unwrap_or_else(|| "detached".into());
+        Ok(format!("{head}|{branch}"))
+    }
+
+    /// The base side of `ide_open{Diff}` for `rel` (relative to the session's
+    /// location): `Ok(None)` when the file did not exist at the base.
+    pub async fn diff_base(&self, uid: &SessionUid, rel: &str, cap: usize) -> std::result::Result<Option<Vec<u8>>, IpcError> {
+        let (place, _) = self.place(uid)?;
+        if !place.git {
+            return Err(IpcError::unsupported("diffNotSupportedByEditor"));
+        }
+        let base = self.base_of(&place).await?;
+        if base.rev == git::EMPTY_TREE {
+            return Ok(None);
+        }
+        match git::blob_size(&place.location, &base.rev, rel).await.map_err(git_err)? {
+            None => Ok(None),
+            Some(size) if size as usize > cap => Err(IpcError::unsupported("diffNotSupportedByEditor")),
+            Some(_) => Ok(Some(git::blob(&place.location, &base.rev, rel, cap).await.map_err(git_err)?)),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// What a removal cannot list (A36, A37.3) — shared by discard and the v1 path
+// ---------------------------------------------------------------------------
+
+/// `REFUSED{operationInProgress}` (A36.2).
+pub const REFUSED_OPERATION_IN_PROGRESS: &str = "operationInProgress";
+/// `REFUSED{nestedRepository}` (A36.3).
+pub const REFUSED_NESTED_REPOSITORY: &str = "nestedRepository";
+/// `REFUSED{notGildeCreated}` (A37.3).
+pub const REFUSED_NOT_GILDE_CREATED: &str = "notGildeCreated";
+/// `REFUSED{lockedByUser}` (A37.3).
+pub const REFUSED_LOCKED_BY_USER: &str = "lockedByUser";
+/// Directory entries a nested-repository scan visits before it gives up and
+/// refuses (it cannot say there is none).
+const NESTED_SCAN_MAX: usize = 1_000_000;
+
+/// A refusal with its own sentence, `changes.refused.<reason>` (A38.7).
+fn keyed_refusal(reason: &str) -> IpcError {
+    IpcError::refused(reason).with_key(&format!("changes.refused.{reason}"))
+}
+
+fn commit_digest(head: &str, states: &[String]) -> String {
+    let mut parts = Vec::with_capacity(states.len() + 1);
+    parts.push(head.to_string());
+    parts.extend(states.iter().cloned());
+    digest(&parts)
+}
+
+/// `(size, mtime, mode)` of one path, never following a symlink.
+fn stat_state(path: &Path) -> String {
+    std::fs::symlink_metadata(path)
+        .map(|m| {
+            use std::os::unix::fs::MetadataExt as _;
+            format!("{}:{}.{}:{:o}", m.size(), m.mtime(), m.mtime_nsec(), m.mode())
+        })
+        .unwrap_or_else(|_| "absent".into())
+}
+
+/// Why removing the linked worktree `target` of `repo` could lose what no
+/// list describes (A36.2, A36.3), or `None`:
+/// * an operation in progress in its own git dir → `operationInProgress`;
+/// * another worktree registered under it, a `.git` file or directory (or a
+///   bare repository) anywhere below its root, a submodule in its index or
+///   a submodule store in its git dir → `nestedRepository`.
+async fn removal_blocker(
+    repo: &Path,
+    target: &Path,
+    entries: &[git::GitWorktreeEntry],
+) -> std::result::Result<Option<&'static str>, git::GitError> {
+    let Some((gitdir, _)) = git::git_dirs(target) else {
+        return Err(git::GitError::Failed { code: -1, stderr: "the worktree's git dir could not be read".into() });
+    };
+    if git::operation_in_progress(&gitdir).is_some() {
+        return Ok(Some(REFUSED_OPERATION_IN_PROGRESS));
+    }
+    let fold = crate::ide::paths::case_insensitive(target);
+    let nested_worktree = entries.iter().any(|e| {
+        let p = canonical_lexical(&e.path);
+        p != target && p != repo && crate::ide::paths::within(&p, target, fold)
+    });
+    if nested_worktree {
+        return Ok(Some(REFUSED_NESTED_REPOSITORY));
+    }
+    let root = target.to_path_buf();
+    let modules = gitdir.join("modules");
+    let found = tokio::task::spawn_blocking(move || {
+        std::fs::symlink_metadata(&modules).is_ok() || nested_git_below(&root, NESTED_SCAN_MAX)
+    })
+    .await
+    .unwrap_or(true);
+    if found || git::has_gitlinks(target).await? {
+        return Ok(Some(REFUSED_NESTED_REPOSITORY));
+    }
+    Ok(None)
+}
+
+/// Whether anything git-shaped lies below `root`: an entry named `.git`
+/// (file, directory or symlink) other than the root's own, or a directory
+/// that is a bare repository (`HEAD` + `objects/` + `refs/`). Symlinks are
+/// never followed. An unreadable directory or more than `max` entries is
+/// answered `true`: the scan cannot say there is nothing.
+pub fn nested_git_below(root: &Path, max: usize) -> bool {
+    let mut stack = vec![(root.to_path_buf(), true)];
+    let mut seen = 0usize;
+    while let Some((dir, is_root)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { return true };
+        let (mut head, mut objects, mut refs) = (false, false, false);
+        for entry in entries {
+            let Ok(entry) = entry else { return true };
+            seen += 1;
+            if seen > max {
+                return true;
+            }
+            let name = entry.file_name();
+            let Ok(kind) = entry.file_type() else { return true };
+            if name == ".git" {
+                if is_root {
+                    continue;
+                }
+                return true;
+            }
+            match name.to_str() {
+                Some("HEAD") if kind.is_file() => head = true,
+                Some("objects") if kind.is_dir() => objects = true,
+                Some("refs") if kind.is_dir() => refs = true,
+                _ => {}
+            }
+            if kind.is_dir() {
+                stack.push((entry.path(), false));
+            }
+        }
+        if head && objects && refs && !is_root {
+            return true;
+        }
+    }
+    false
+}
+
+/// Commits reachable from `target`'s HEAD and from no other ref: other
+/// branches, tags, remotes, the stash (every entry) and the other worktrees'
+/// HEADs (A36.1). The kept branch is a ref, so its own commits do not count.
+async fn unreachable_commits(target: &Path, entries: &[git::GitWorktreeEntry]) -> std::result::Result<u32, git::GitError> {
+    let Some(head) = git::resolve_commit(target, "HEAD").await? else { return Ok(0) };
+    let mut others = git::ref_tips(target).await?;
+    others.extend(git::stash_tips(target).await?);
+    for e in entries {
+        if canonical_lexical(&e.path) != target {
+            if let Some(h) = e.head.as_ref().filter(|h| !h.is_empty()) {
+                others.push(h.clone());
+            }
+        }
+    }
+    others.sort();
+    others.dedup();
+    git::count_only_from(target, &head, &others).await
+}
+
+/// After `git worktree remove` failed (A36.4–A36.6): when git removed the
+/// directory but not its admin entry, that one entry is cleaned (target
+/// only); otherwise Gilde's lock is put back exactly as it was.
+async fn restore_after_failed_remove(repo: &Path, target: &Path, lock: LockState) {
+    if std::fs::symlink_metadata(target).is_err() {
+        if let Err(err) = git::prune_target_admin(repo, target) {
+            tracing::warn!(target: "worktree", kind = ?err.kind(), "could not clean the removed worktree's admin entry");
+        }
+        return;
+    }
+    if lock == LockState::Gilde {
+        if let Err(err) = git::set_worktree_lock(target, true, git::LOCK_REASON).await {
+            tracing::warn!(target: "worktree", code = err.to_ipc().code.as_str(), "could not restore the worktree lock");
+        }
+    }
+}
+
+/// A git path as the wire shows it (sanitized; identical for ordinary names).
+fn display_rel(p: &str) -> String {
+    crate::render::sanitize::sanitize_display_text(p, crate::contract::display::TextCap::Bytes(4096)).text
+}
+
+fn sanitize_parts(parts: &[String]) -> Vec<String> {
+    parts
+        .iter()
+        .map(|p| crate::render::sanitize::sanitize_display_text(p, crate::contract::display::TextCap::Chars(120)).text)
+        .filter(|p| !p.is_empty())
+        .take(MAX_PARTS)
+        .collect()
+}
+
+/// Lines of an untracked file (binary or over the caps → 0). Never follows a
+/// symlink out of the worktree.
+fn line_count(path: &Path, budget: &mut u64) -> u32 {
+    use std::io::Read as _;
+    let Ok(meta) = std::fs::symlink_metadata(path) else { return 0 };
+    if !meta.is_file() || meta.len() > UNTRACKED_READ_CAP || meta.len() > *budget {
+        return 0;
+    }
+    *budget -= meta.len();
+    let mut buf = Vec::with_capacity(meta.len() as usize);
+    if std::fs::File::open(path).and_then(|f| f.take(UNTRACKED_READ_CAP).read_to_end(&mut buf)).is_err() {
+        return 0;
+    }
+    if buf[..buf.len().min(8000)].contains(&0) {
+        return 0;
+    }
+    let n = memchr::memchr_iter(b'\n', &buf).count();
+    let last = usize::from(!buf.is_empty() && !buf.ends_with(b"\n"));
+    u32::try_from(n + last).unwrap_or(u32::MAX)
+}
+
+#[async_trait::async_trait]
+impl GitApi for GitService {
+    async fn changes(&self, req: &ChangesGetReq) -> std::result::Result<ChangesView, IpcError> {
+        let (place, view) = self.place(&req.uid)?;
+        if !place.git {
+            return Err(IpcError::unsupported("notGit"));
+        }
+        let base = self.base_of(&place).await?;
+        let rows = self.rows(&place, &view, &base).await?;
+        let loc = &place.location;
+
+        let (changes_base, commits) = match &base.branch {
+            Some(b) => {
+                let newer = git::count(loc, &format!("{}..refs/heads/{}", b.merge_base, b.name)).await.map_err(git_err)?;
+                let short = git::short_sha(loc, &b.merge_base).await.map_err(git_err)?;
+                let log = git::log_range(loc, &format!("{}..HEAD", b.merge_base), MAX_COMMIT_ROWS).await.map_err(git_err)?;
+                let commits = log
+                    .into_iter()
+                    .map(|c| CommitRow {
+                        commit_short: c.short,
+                        subject: crate::render::sanitize::sanitize_display_text(&c.subject, crate::contract::display::TextCap::Chars(200)).text,
+                        at: c.at.saturating_mul(1000),
+                    })
+                    .collect();
+                (Some(ChangesBase { branch: crate::render::sanitize::sanitize_display_text(&b.name, crate::contract::display::TextCap::Chars(255)).text, commit_short: short, newer_on_main: newer }), commits)
+            }
+            None => (None, Vec::new()),
+        };
+
+        let others = sessions_here(&view, &place, &self.home).filter(|s| s.uid != place.uid && is_live(s)).count() as u32;
+        let shared_folder = (others > 0).then_some(SharedFolder { other_live_sessions: others });
+
+        let owner = place.owner_alive;
+        let disabled_owner = || ActionState::Disabled { reason: REASON_OWNER_WRITING.to_string() };
+        // A37.1: Commit only when something is uncommitted (the rows also show
+        // what the branch already committed against the merge base).
+        let commit = if owner {
+            disabled_owner()
+        } else if !rows.iter().any(|r| r.uncommitted) {
+            ActionState::Hidden
+        } else {
+            ActionState::Enabled
+        };
+        let merge = match &base.branch {
+            Some(b) if place.worktree => {
+                if owner {
+                    disabled_owner()
+                } else if git::count(loc, &format!("refs/heads/{}..HEAD", b.name)).await.map_err(git_err)? == 0 {
+                    ActionState::Hidden
+                } else {
+                    ActionState::Enabled
+                }
+            }
+            _ => ActionState::Hidden,
+        };
+        let discard = if !place.worktree {
+            ActionState::Hidden
+        } else if owner {
+            disabled_owner()
+        } else if self.live_at_or_under(&view, &place) {
+            ActionState::Disabled { reason: REASON_STOP_TO_DISCARD.to_string() }
+        } else {
+            ActionState::Enabled
+        };
+
+        Ok(ChangesView {
+            location: place.location_id.clone(),
+            base: changes_base,
+            files: rows.into_iter().map(|r| r.row).collect(),
+            commits,
+            shared_folder,
+            actions: ChangesActions { commit, merge, discard },
+        })
+    }
+
+    async fn commit_preview(&self, req: &GitCommitPreviewReq) -> std::result::Result<GitCommitPreviewRes, IpcError> {
+        let (place, view) = self.place(&req.uid)?;
+        if !place.git {
+            return Err(IpcError::unsupported("notGit"));
+        }
+        if place.owner_alive {
+            return Err(IpcError::refused("ownerAlive"));
+        }
+        let base = self.base_of(&place).await?;
+        let rows = self.rows(&place, &view, &base).await?;
+        let mut chosen: Vec<&Row> = Vec::with_capacity(req.paths.len());
+        for (i, p) in req.paths.iter().enumerate() {
+            match rows.iter().find(|r| &r.row.path_rel == p) {
+                // A37.1: a row the branch already committed (a committed
+                // deletion above all) is listed by the Changes view but is
+                // not offered: it is never passed to git as a pathspec.
+                Some(r) if r.uncommitted => chosen.push(r),
+                Some(_) => {}
+                None => return Err(IpcError::invalid_argument(&format!("paths[{i}]"), "path")),
+            }
+        }
+        chosen.sort_by(|a, b| a.real.cmp(&b.real));
+        let name = git::config_get(&place.location, "user.name").await.map_err(git_err)?.unwrap_or_default();
+        let email = git::config_get(&place.location, "user.email").await.map_err(git_err)?.unwrap_or_default();
+        let states: Vec<String> = chosen.iter().map(|r| Self::row_state(&place, r)).collect();
+        let pending = CommitPending {
+            paths: chosen.iter().map(|r| r.real.clone()).collect(),
+            rels: chosen.iter().map(|r| r.row.path_rel.clone()).collect(),
+            digest: commit_digest(&Self::head_state(&place).await?, &states),
+        };
+        let token = self.commits.issue(&place.uid, pending);
+        Ok(GitCommitPreviewRes {
+            files: chosen.iter().map(|r| r.row.clone()).collect(),
+            author: GitAuthor {
+                name: crate::render::sanitize::sanitize_display_text(&name, crate::contract::display::TextCap::Chars(255)).text,
+                email: crate::render::sanitize::sanitize_display_text(&email, crate::contract::display::TextCap::Chars(255)).text,
+            },
+            confirm_token: token,
+        })
+    }
+
+    async fn commit(&self, req: &GitCommitReq) -> std::result::Result<GitCommitRes, IpcError> {
+        let (place, view) = self.place(&req.uid)?;
+        if place.owner_alive {
+            return Err(IpcError::refused("ownerAlive"));
+        }
+        // A37.4: a path outside the preview is refused without an `await`
+        // (the token stays); otherwise the token is taken before any.
+        let pending = self.commits.take_if(&req.confirm_token, &place.uid, |p| {
+            match req.paths.iter().position(|path| !p.rels.contains(path)) {
+                Some(i) => Err(IpcError::invalid_argument(&format!("paths[{i}]"), "path")),
+                None => Ok(()),
+            }
+        })?;
+        let base = self.base_of(&place).await?;
+        let rows = self.rows(&place, &view, &base).await?;
+        let mut real = Vec::with_capacity(req.paths.len());
+        for p in &req.paths {
+            match rows.iter().find(|r| &r.row.path_rel == p).filter(|r| r.uncommitted && pending.paths.contains(&r.real)) {
+                Some(r) => real.push(r.real.clone()),
+                // Previewed, but no longer uncommitted (or gone): the state changed.
+                None => return Err(IpcError::conflict("changed")),
+            }
+        }
+        let states: Vec<String> = pending
+            .paths
+            .iter()
+            .map(|p| match rows.iter().find(|r| &r.real == p) {
+                Some(r) => Self::row_state(&place, r),
+                None => format!("{p}|gone"),
+            })
+            .collect();
+        if commit_digest(&Self::head_state(&place).await?, &states) != pending.digest {
+            return Err(IpcError::conflict("changed"));
+        }
+        git::add_paths(&place.location, &real).await.map_err(git_err)?;
+        let sha = git::commit_paths(&place.location, &real, &req.message).await.map_err(git_err)?;
+        tracing::info!(target: "worktree", files = real.len(), "commit made through the Changes view");
+        Ok(GitCommitRes { commit: sha })
+    }
+
+    async fn merge_preview(&self, req: &GitMergePreviewReq) -> std::result::Result<GitMergePreviewRes, IpcError> {
+        let (place, _) = self.place(&req.uid)?;
+        Self::require_worktree(&place)?;
+        if place.owner_alive {
+            return Err(IpcError::refused("ownerAlive"));
+        }
+        let (effect, d, _, theirs) = self.merge_state(&place).await?;
+        Self::merge_gates(&place, &effect, theirs.as_deref()).await?;
+        let token = self.merges.issue(&place.uid, MergePending { digest: d });
+        Ok(GitMergePreviewRes { effect, confirm_token: token })
+    }
+
+    async fn merge(&self, req: &GitMergeReq) -> std::result::Result<GitMergeRes, IpcError> {
+        let (place, _) = self.place(&req.uid)?;
+        Self::require_worktree(&place)?;
+        if place.owner_alive {
+            return Err(IpcError::refused("ownerAlive"));
+        }
+        let pending = self.merges.take_if(&req.confirm_token, &place.uid, |_| Ok(()))?;
+        let (effect, d, branch, theirs) = self.merge_state(&place).await?;
+        if d != pending.digest {
+            return Err(IpcError::conflict("changed"));
+        }
+        Self::merge_gates(&place, &effect, theirs.as_deref()).await?;
+        let main = &place.project_root;
+        match (effect.kind, theirs) {
+            (MergeKind::UpToDate, _) | (_, None) => {}
+            (MergeKind::FastForward, Some(theirs)) => git::merge_fast_forward(main, &theirs).await.map_err(git_err)?,
+            (MergeKind::MergeCommit, Some(theirs)) => {
+                let wt_branch = git::head_branch(&place.location).await.map_err(git_err)?;
+                let message = match wt_branch {
+                    Some(b) => format!("Merge branch '{b}' into {branch}"),
+                    None => format!("Merge commit '{}' into {branch}", &theirs[..theirs.len().min(12)]),
+                };
+                if let Err(e) = git::merge_commit(main, &theirs, &message).await {
+                    // Never leave the user's checkout half-merged.
+                    let _ = git::merge_abort(main).await;
+                    return Err(match &e {
+                        git::GitError::Failed { stderr, .. } if stderr.contains("CONFLICT") => IpcError::refused("conflicts"),
+                        _ => e.to_ipc(),
+                    });
+                }
+            }
+        }
+        let head = git::resolve_commit(main, "HEAD").await.map_err(git_err)?.unwrap_or_default();
+        tracing::info!(target: "worktree", kind = ?effect.kind, "merge made through the Changes view");
+        Ok(GitMergeRes { merge_commit: head })
+    }
+
+    async fn discard_preview(&self, req: &WorktreeDiscardPreviewReq) -> std::result::Result<WorktreeDiscardPreviewRes, IpcError> {
+        let (place, view) = self.place(&req.uid)?;
+        let state = self.discard_state(&place, &view).await?;
+        let pending = DiscardPending { digest: state.digest, loss_ids: state.losses.iter().map(|l| l.id.clone()).collect() };
+        let token = self.discards.issue(&place.uid, pending);
+        Ok(WorktreeDiscardPreviewRes { losses: state.losses, branch_kept: true, confirm_token: token })
+    }
+
+    /// The branch is always kept: the app never deletes one (DESIGN §7-7,
+    /// A17.5 — the request has no such field). git removes the worktree —
+    /// with its one `--force` only when every listed loss was acknowledged —
+    /// and any failure leaves the tree to git's own refusal and Gilde's lock
+    /// as it was (A36.4, A36.6): there is no fallback that deletes a
+    /// directory, and no repo-wide prune (A36.5).
+    async fn discard(&self, req: &WorktreeDiscardReq) -> std::result::Result<(), IpcError> {
+        // A37.4: taken before the first `await`. A loss the preview listed
+        // and the request did not acknowledge is refused first, without an
+        // `await`, and keeps the token.
+        let pending = self.discards.take_if(&req.confirm_token, &req.uid, |p| {
+            match p.loss_ids.iter().find(|id| !req.accepted_losses.contains(id)) {
+                Some(id) => {
+                    tracing::info!(target: "worktree", loss = %id, "discard refused: a loss was not acknowledged");
+                    Err(IpcError::refused("unacknowledgedLoss"))
+                }
+                None => Ok(()),
+            }
+        })?;
+        let (place, view) = self.place(&req.uid)?;
+        let state = self.discard_state(&place, &view).await?;
+        if state.digest != pending.digest {
+            return Err(IpcError::conflict("changed"));
+        }
+        if state.losses.iter().any(|l| !req.accepted_losses.contains(&l.id)) {
+            return Err(IpcError::refused("unacknowledgedLoss"));
+        }
+
+        let repo = &place.project_root;
+        let loc = &place.location;
+        if state.lock == LockState::Gilde {
+            git::set_worktree_lock(loc, false, "").await.map_err(git_err)?;
+        }
+        let removed = if state.losses.is_empty() {
+            git::remove_worktree(repo, loc).await
+        } else {
+            git::remove_worktree_acknowledged(repo, loc).await
+        };
+        if let Err(e) = removed {
+            restore_after_failed_remove(repo, loc, state.lock).await;
+            return Err(e.to_ipc());
+        }
+        tracing::info!(target: "worktree", losses = state.losses.len(), "worktree discarded; branch kept");
+        Ok(())
+    }
+
+    async fn create_worktree(&self, project: &ProjectId, slug: &str, base: Option<&str>) -> std::result::Result<LocationFacts, IpcError> {
+        if !naming::is_worktree_slug(slug) {
+            return Err(IpcError::invalid_argument("location.slug", if slug.is_empty() { "required" } else { "pattern" }));
+        }
+        let base = base.filter(|b| !b.is_empty());
+        if let Some(b) = base {
+            if !crate::contract::ipc::sessions::is_base_ref(b) {
+                return Err(IpcError::invalid_argument("location.base", "pattern"));
+            }
+        }
+        let view = self.src.view();
+        let proj = view.projects.iter().find(|p| &p.id == project).ok_or_else(|| IpcError::not_found("project"))?;
+        if proj.kind != ProjectKind::Git {
+            return Err(IpcError::refused("worktreeGate"));
+        }
+        let root = std::fs::canonicalize(proj.root.as_str()).map_err(|_| IpcError::not_found("project"))?;
+        let gate = |detail: Option<String>| {
+            let e = IpcError::refused("worktreeGate");
+            match detail {
+                Some(d) => e.with_detail(d),
+                None => e,
+            }
+        };
+        let id = crate::discovery::location::identify(&root, &self.home).ok_or_else(|| gate(None))?;
+        if !id.git || id.worktree || &id.project_id != project {
+            return Err(gate(None));
+        }
+        let base_sha = match base {
+            Some(b) => git::resolve_commit(&root, b).await.map_err(gate_err)?.ok_or_else(|| gate(None))?,
+            None => git::resolve_commit(&root, "HEAD").await.map_err(gate_err)?.ok_or_else(|| gate(None))?,
+        };
+        let layout = self.layout();
+        let path = naming::worktree_path(layout, &root, slug).ok_or_else(|| gate(None))?;
+        if std::fs::symlink_metadata(&path).is_ok() {
+            return Err(IpcError::conflict("worktreeExists"));
+        }
+        let branch = naming::branch_name(slug);
+        if git::branch_present(&root, &branch).await.map_err(gate_err)? {
+            return Err(IpcError::conflict("worktreeExists"));
+        }
+        if layout == naming::WorktreeLayout::InRepo {
+            // Before the directory exists, so it never shows as untracked (A6).
+            let common = git::common_dir(&root).await.map_err(gate_err)?;
+            git::ensure_excluded(&common, naming::IN_REPO_EXCLUDE).map_err(|e| IpcError::from(&GildeError::Io(e)))?;
+        }
+        // Detached first, then the branch (only if it does not exist), then
+        // HEAD onto it: a failure at any step leaves no stray `gilde/` branch
+        // that would block the slug (a failed `worktree add -b` keeps the
+        // branch it created), and the app never deletes a branch to clean up.
+        git::add_worktree_detached(&root, &path, &base_sha).await.map_err(gate_err)?;
+        let attached = match git::create_branch_at(&path, &branch, &base_sha).await {
+            Ok(()) => git::attach_head(&path, &branch).await.map_err(gate_err),
+            Err(git::GitError::Failed { .. }) if git::branch_present(&root, &branch).await.unwrap_or(false) => {
+                Err(IpcError::conflict("worktreeExists"))
+            }
+            Err(e) => Err(gate_err(e)),
+        };
+        if let Err(e) = attached {
+            // The fresh worktree is pristine: a plain remove (never `--force`).
+            if let Err(err) = git::remove_worktree(&root, &path).await {
+                tracing::warn!(target: "worktree", code = err.to_ipc().code.as_str(), "could not remove a half-made worktree");
+            }
+            return Err(e);
+        }
+        // Locked while a session may live in it (DESIGN §7-3).
+        if let Err(err) = git::set_worktree_lock(&path, true, git::LOCK_REASON).await {
+            tracing::warn!(target: "worktree", code = err.to_ipc().code.as_str(), "worktree lock failed");
+        }
+        let facts = crate::discovery::location::identify(&path, &self.home)
+            .and_then(|i| i.facts())
+            .ok_or_else(|| IpcError::internal("worktree-identity"))?;
+        self.src.location_seen(facts.clone());
+        Ok(facts)
     }
 }
 
@@ -1348,18 +2849,6 @@ fn is_interesting(path: &Path) -> bool {
         let s = c.as_os_str().to_string_lossy();
         WATCH_IGNORED.contains(&s.as_ref())
     })
-}
-
-/// Last `max` bytes of `s`, cut on a character boundary.
-fn tail_of(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return s.to_string();
-    }
-    let mut start = s.len() - max;
-    while start < s.len() && !s.is_char_boundary(start) {
-        start += 1;
-    }
-    s[start..].to_string()
 }
 
 /// Copy `src` to `dest`, skipping `.git` (DESIGN §7-7, `ArchiveThenRemove`).
@@ -1529,16 +3018,6 @@ mod tests {
         assert!(!is_interesting(Path::new("/wt/node_modules/a/b.js")));
         assert!(!is_interesting(Path::new("/wt/target/debug/x")));
         assert!(!is_interesting(Path::new("/wt/dist/bundle.js")));
-    }
-
-    #[test]
-    fn tail_keeps_the_end_on_a_char_boundary() {
-        assert_eq!(tail_of("abc", 10), "abc");
-        assert_eq!(tail_of("abcdef", 3), "def");
-        let s = "한글한글한글";
-        let t = tail_of(s, 7);
-        assert!(s.ends_with(&t));
-        assert!(t.chars().count() <= 3);
     }
 
     #[test]

@@ -1,0 +1,12 @@
+{
+  "workers": [
+    { "name": "work", "configDir": "~/.claude-work", "model": "opus" },
+    { "name": "personal", "configDir": "~/.claude-personal/", "model": "opus" }
+  ],
+  "permissionMode": "acceptEdits",
+  "claudePath": "/opt/fixture/bin/claude",
+  "cooldownMinutes": 30,
+  "workerTimeoutMinutes": 45,
+  "frontierWorkerDispatch": "block",
+  "overageWorkerDispatch": "block"
+}

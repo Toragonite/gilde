@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-account-set-default"
+description = "Enables the account_set_default command without any pre-configured scope."
+commands.allow = ["account_set_default"]
+
+[[permission]]
+identifier = "deny-account-set-default"
+description = "Denies the account_set_default command without any pre-configured scope."
+commands.deny = ["account_set_default"]

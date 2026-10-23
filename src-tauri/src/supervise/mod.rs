@@ -24,6 +24,7 @@ pub mod identity; // T08  the three identity fences
 pub mod kill; // T10  kill escalation
 pub mod procscan;
 pub mod reaper; // T11  boot sweep, planned-row adoption, generation sweep, reconcile
+pub mod redact; // T09  the one argv redaction helper (contract §9.7, F-03)
 pub mod registry; // T08  Supervisor, SpawnPlan, SpawnGuard, compose_env
 pub mod spawn; // T08  process-group discipline
 pub mod watchdog; // T12  memory budget, idle, system pressure
@@ -32,8 +33,19 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::graph::PressureLevel;
 use crate::store::models::{ProcKind, ProcState};
+
+/// System memory pressure, as read from `kern.memorystatus_vm_pressure_level`
+/// (or the documented fallbacks). Never triggers an automatic kill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PressureLevel {
+    #[default]
+    Unknown,
+    Normal,
+    Warn,
+    Critical,
+}
 
 pub use procscan::{
     classify, cwd_of, environ_of, mask_argv, ps_args_of, ps_snapshot, start_time_of, total_memory,
@@ -577,7 +589,7 @@ mod tests {
 
     #[test]
     fn scan_filter_narrows_by_group_query_and_rss() {
-        let rows = vec![
+        let rows = [
             row(2, ProcGroupKind::OursLive, 1_000, 0.0, "claude"),
             row(3, ProcGroupKind::Other, 9_000, 0.0, "zsh"),
         ];

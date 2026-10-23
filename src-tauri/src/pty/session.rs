@@ -1,267 +1,318 @@
-//! One live PTY session: the wire types, the three threads, and the closing
-//! ceremony (DESIGN §6-1 … §6-5).
-//!
-//! ## The three threads
+//! One live PTY: the reader, the coalescer, the exit watcher, the one attached
+//! view, and the write lock (contract §6.2.3, §6.2.6, §6.2.7).
 //!
 //! ```text
-//!   reader (OS thread)      ring.push  ─┐            never blocks, ever
-//!        │ try_send                     │
-//!        ▼                              ▼
-//!   coalescer (tokio task) ── 8 ms / 32 KiB ──► Channel<PtyChunk>
+//!   reader (OS thread)   ring.push → status.on_output → view? try_send : replies
+//!        │                                     (DA1/DSR answered only without a view)
+//!        ▼
+//!   coalescer (task)  ── 8 ms / 32 KiB ──► the attached view's Channel<PtyChunk>
 //!
-//!   exit watcher (OS thread) ── child.wait() ──► mark_exited + gilde://session/exit
+//!   exit watcher (OS thread) ── waitpid → drain → close the held slave → EOF
+//!                               ──► status, registry, PtyExitSink
 //! ```
 //!
-//! The reader gets its own **OS thread** rather than `spawn_blocking`: the read
-//! blocks for the entire life of the session, and a `spawn_blocking` task that
-//! never returns permanently consumes one of tokio's blocking workers.
+//! **A child's last output is never lost (A52.1).** On macOS the last close
+//! of a pty's slave waits at most ~0.6 s for the master to read what is still
+//! queued, then discards it (measured on Darwin 23.6, T49). The core
+//! therefore holds its own slave descriptor ([`open_held_slave`], from
+//! before the fork) for the whole life of the child, so no close by the
+//! child, and no close of the spawn-time slave, is ever that last one. A
+//! child that leads its terminal's session (every PTY child does) cannot
+//! even finish exiting until its output has been read, and its exit then
+//! revokes the terminal. After `waitpid` the exit watcher waits until the
+//! master holds nothing its reader has not taken, one check after each of
+//! the reader's reads, and then closes the held slave. Both waits sleep on
+//! [`Shared::progress`]; nothing polls on a timer. Exit is reported after
+//! EOF, or when [`EXIT_EOF_GRACE`] runs out, whichever comes first. The
+//! reader always reads (it never waits on a view), so a child's exit is
+//! never stuck waiting for a drain that cannot happen.
 //!
-//! ## The invariant that shapes everything here
+//! **A slow or wedged view never applies back-pressure to the agent.** The
+//! reader pushes into the ring (which evicts, never waits) and then *tries* to
+//! hand the frame on. A full queue drops it and marks `resync`; the view gets
+//! `Resync{offset}` and re-snapshots — a visual hiccup, never a stalled agent.
 //!
-//! **A slow or wedged webview must never apply back-pressure to the agent.**
-//! The reader pushes into the ring (which evicts, never waits) and then
-//! *attempts* to hand the frame to the coalescer with `try_send`. A full queue
-//! sets `resync` and the frame is dropped: the user loses intermediate frames
-//! and gets a `gilde://pty/resync` telling the frontend to re-snapshot, which is a
-//! visual hiccup rather than a stalled agent.
+//! **No byte is decoded here.** Bytes go ring → base64 → `PtyChunk::Data`;
+//! xterm.js decodes them exactly once.
 //!
-//! ## No byte is ever decoded here
-//!
-//! Bytes go ring → base64 → `PtyChunk`. Decoding happens exactly once, in
-//! xterm.js. `scripts/lint-forbidden.sh` enforces the absence of the two
-//! conversions that would break it.
+//! **No periodic wakeups.** The coalescer sleeps on its queue and only arms a
+//! timer while it holds bytes to flush (§11.2 rule 1); status evaluation is
+//! the status engine's ticker's job.
 
 use std::io::{Read, Write};
-use std::os::fd::{BorrowedFd, RawFd};
-use std::path::PathBuf;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU16, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use portable_pty::{Child, MasterPty, PtySize};
-use serde::{Deserialize, Serialize};
-use tauri::ipc::Channel;
 
-use crate::agents::AgentKind;
-use crate::error::{GildeError, Result};
-use crate::events::bus::EventBus;
-use crate::events::{self, PtyResyncEvent, SessionExitEvent};
-use crate::model::status::{SessionStatus, SessionStatusReport};
-use crate::status::evidence::PROMPT_GATE_CONFIDENCE; // T16
-use crate::status::StatusEngine; // T16
-use crate::store::{dao, now_ms, Db};
-use crate::supervise::registry::SpawnGuard;
+use crate::contract::activity::ExitInfo;
+use crate::contract::content::{DetachReason, PtyChunk};
+use crate::contract::ids::{PtyId, ViewId};
+use crate::contract::ipc::PtyInfo;
+use crate::contract::process::ProcKind;
+use crate::contract::services::SpawnTicket;
+use crate::contract::IpcError;
+use crate::status::StatusEngine;
+use crate::store::now_ms;
 
-use super::dump; // PINNED §36
+use super::dump;
 use super::ring::Ring;
 
 // ---------------------------------------------------------------------------
-// tuning constants — DESIGN §6-2
+// tuning constants (R1 §3, kept)
 // ---------------------------------------------------------------------------
 
-/// One `read()` at a time. Matches the boundary the `binary-flood` fixture
-/// stresses on purpose.
+/// One `read()` at a time.
 pub const READ_CHUNK: usize = 64 * 1024;
-
 /// Coalescer flush cadence.
 pub const FLUSH_INTERVAL: Duration = Duration::from_millis(8);
-
 /// Coalescer flush size.
 pub const FLUSH_BYTES: usize = 32 * 1024;
-
-/// Frames the reader may queue before it starts dropping them. 64 × 64 KiB is a
-/// 4 MiB ceiling per session — big enough to ride out a garbage-collection
-/// pause in the webview, small enough that a wedged UI cannot exhaust memory.
+/// Frames the reader may queue before it starts dropping them.
 pub const QUEUE_FRAMES: usize = 64;
 
-/// How often the coalescer task re-evaluates the session's status while no
-/// bytes are flowing.
-///
-/// T16's [`StatusEngine`] also runs a 500 ms tick of its own — that one carries
-/// the `ps` snapshot and is what the OS-truth signal needs. This one exists
-/// because it is already awake for the flush timer: it costs a comparison, it
-/// keeps a session evaluating even in a test with no ticker running, and
-/// evaluating more often than DESIGN's 500 ms is only ever an improvement (the
-/// 300 ms debounce, not the tick, is what bounds transitions).
-pub const STATUS_TICK: Duration = Duration::from_millis(250);
-
-/// `Standard` close: how long the TUI gets to honour `^C` / `^D` before
-/// `kill_tree` takes over (DESIGN §6-5).
-pub const STANDARD_CLOSE_GRACE: Duration = Duration::from_secs(2);
-
-/// Terminal size floor. `codex` renders nothing into a 0×0 pty (PINNED §9-4),
-/// so a session is never opened smaller than this even if the frontend asks
-/// before its first `FitAddon.fit()`.
+/// Terminal size bounds (§4.2.4 `pty_resize` clamp).
 pub const MIN_COLS: u16 = 20;
 pub const MIN_ROWS: u16 = 5;
-/// What a request of `0` becomes — the classic default, and a size every CLI
-/// is happy to draw into.
-pub const FALLBACK_COLS: u16 = 80;
-pub const FALLBACK_ROWS: u16 = 24;
+pub const MAX_COLS: u16 = 1000;
+pub const MAX_ROWS: u16 = 500;
+/// What a size of `0` becomes (§6.2.1: "else 120×40").
+pub const FALLBACK_COLS: u16 = 120;
+pub const FALLBACK_ROWS: u16 = 40;
 
-/// ETX — what `^C` puts on the wire.
-const CTRL_C: u8 = 0x03;
-/// EOT — what `^D` puts on the wire.
-const CTRL_D: u8 = 0x04;
-/// Bracketed paste, DESIGN §6-5.
-const PASTE_START: &[u8] = b"\x1b[200~";
-const PASTE_END: &[u8] = b"\x1b[201~";
+/// How long after `waitpid` the exit watcher waits for the master to drain
+/// and the reader's EOF before reporting an exit anyway (a grandchild may
+/// hold the slave open; A52.1).
+pub const EXIT_EOF_GRACE: Duration = Duration::from_secs(2);
 
-// ---------------------------------------------------------------------------
-// wire types — mirrored in `src/lib/ipc.ts` §8
-// ---------------------------------------------------------------------------
+/// Bracketed paste markers (§6.2.3).
+pub const PASTE_START: &[u8] = b"\x1b[200~";
+pub const PASTE_END: &[u8] = b"\x1b[201~";
 
-/// One coalesced run of pty bytes, base64-encoded (DESIGN §6-3).
+/// Clamp a requested size (never rejected, §4.2.4).
+pub fn sanitize_size(cols: u16, rows: u16) -> (u16, u16) {
+    let cols = if cols == 0 { FALLBACK_COLS } else { cols.clamp(MIN_COLS, MAX_COLS) };
+    let rows = if rows == 0 { FALLBACK_ROWS } else { rows.clamp(MIN_ROWS, MAX_ROWS) };
+    (cols, rows)
+}
+
+/// The bytes of a bracketed paste of `text`, then `\r` iff `submit` (§6.2.3).
 ///
-/// `seq` is the ring sequence number of the **first** byte in `b64`, which is
-/// what lets a remount drop duplicates after a snapshot.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PtyChunk {
-    pub seq: u64,
-    pub b64: String,
-}
-
-/// How a session ends (DESIGN §6-5).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum CloseMode {
-    /// `SIGHUP` to the pty's foreground group — "the terminal window closed".
-    Gentle,
-    /// `^C`, `^D`, two seconds of patience, then `kill_tree`.
-    #[default]
-    Standard,
-    /// Deliberate orphaning: `keep_alive = 1`, delivery stops, process lives.
-    Detach,
-}
-
-/// Signals `session_signal` may deliver to the foreground process group.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum PtySignal {
-    Int,
-    Hup,
-    Term,
-}
-
-impl PtySignal {
-    fn as_nix(self) -> nix::sys::signal::Signal {
-        use nix::sys::signal::Signal;
-        match self {
-            PtySignal::Int => Signal::SIGINT,
-            PtySignal::Hup => Signal::SIGHUP,
-            PtySignal::Term => Signal::SIGTERM,
+/// The end marker can never be injected from content: the text is split at
+/// every `ESC[201~` it contains and each piece goes into its own bracketed
+/// segment, so the marker bytes from content are never sent and no piece can
+/// close a paste early.
+pub fn paste_bytes(text: &str, submit: bool) -> Vec<u8> {
+    let end = std::str::from_utf8(PASTE_END).expect("ascii");
+    let mut out = Vec::with_capacity(text.len() + 16);
+    for piece in text.split(end) {
+        if piece.is_empty() {
+            continue;
         }
+        out.extend_from_slice(PASTE_START);
+        out.extend_from_slice(piece.as_bytes());
+        out.extend_from_slice(PASTE_END);
     }
+    if submit {
+        out.push(b'\r');
+    }
+    out
+}
 
-    pub fn as_str(self) -> &'static str {
-        match self {
-            PtySignal::Int => "int",
-            PtySignal::Hup => "hup",
-            PtySignal::Term => "term",
-        }
+// ---------------------------------------------------------------------------
+// the view
+// ---------------------------------------------------------------------------
+
+/// Where a view's chunks go. `false` = the view is gone.
+pub trait ChunkSink: Send + Sync {
+    fn send(&self, chunk: PtyChunk) -> bool;
+}
+
+impl ChunkSink for tauri::ipc::Channel<PtyChunk> {
+    fn send(&self, chunk: PtyChunk) -> bool {
+        tauri::ipc::Channel::send(self, chunk).is_ok()
     }
 }
 
-/// What the UI needs to render one terminal tab.
-///
-/// `project_id` / `worktree_id` are empty strings for a session that is not
-/// attached to one (the fixture sessions the tests open). Every session the
-/// product opens goes through `session_open`, which requires both.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PtySessionInfo {
-    pub id: String,
-    pub spawn_id: String,
-    pub project_id: String,
-    pub worktree_id: String,
-    pub agent: AgentKind,
-    pub account_id: Option<String>,
-    pub title: String,
-    pub cwd: String,
-    pub cols: u16,
-    pub rows: u16,
-    pub pid: i32,
-    pub pgid: i32,
-    pub opened_at: i64,
-    pub detached: bool,
-    pub first_retained_seq: u64,
-    pub next_seq: u64,
-}
-
-/// The answer to `session_send_prompt` — never a bare boolean, because a
-/// refusal has to be explainable (DESIGN §6-5).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SendPromptOutcome {
-    pub sent: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub refused_reason: Option<String>,
-    pub bracketed_paste: bool,
-}
-
-/// How the child ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct ExitInfo {
-    pub code: Option<i32>,
-    pub signal: Option<i32>,
+struct View {
+    id: ViewId,
+    sink: Arc<dyn ChunkSink>,
 }
 
 // ---------------------------------------------------------------------------
 // shared state
 // ---------------------------------------------------------------------------
 
-/// Everything the reader thread, the coalescer task and the exit watcher touch.
-/// Split out of [`PtySession`] so the threads hold an `Arc` of exactly what they
-/// need and nothing that would make the session un-droppable.
+/// What the reader thread, the coalescer and the exit watcher share.
 pub(crate) struct Shared {
     pub(crate) id: String,
     pub(crate) ring: Mutex<Ring>,
-    pub(crate) sink: Mutex<Option<Channel<PtyChunk>>>,
-    /// Set by the reader when a frame had to be dropped; cleared by the
-    /// coalescer when it emits `gilde://pty/resync`.
-    pub(crate) resync: AtomicBool,
-    /// False once the session is detached: the reader keeps draining the pty
-    /// (so the child never blocks on write) but nothing is delivered.
-    pub(crate) delivering: AtomicBool,
+    view: Mutex<Option<View>>,
+    /// Mirrors `view.is_some()` for the reader's hot path.
+    delivering: AtomicBool,
+    /// Set by the reader when a frame had to be dropped.
+    resync: AtomicBool,
     pub(crate) eof: AtomicBool,
     pub(crate) exited: AtomicBool,
     pub(crate) exit: Mutex<Option<ExitInfo>>,
-    pub(crate) last_io_at: AtomicI64,
-    /// T16: the three-source inference engine. Shared by every session in the
-    /// app, keyed by [`Shared::id`], so the 500 ms tick and the `ps` snapshot
-    /// are paid for once rather than once per terminal tab.
+    pub(crate) last_output_at: AtomicI64,
     pub(crate) status: Arc<StatusEngine>,
-    pub(crate) events: Option<EventBus>,
+    /// Woken on every chunk of output (screen actions wait on it).
+    pub(crate) output: tokio::sync::Notify,
+    /// Woken once when the child was reaped.
+    pub(crate) exit_notify: tokio::sync::Notify,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    /// Signalled after every read the reader pushed into the ring, at its
+    /// EOF and when the child was reaped. Each of those changes is made
+    /// under the ring lock, so a thread that checks the ring's offset, `eof`
+    /// or `reaped` under that lock and then waits misses no wakeup (A52.1).
+    pub(crate) progress: Condvar,
+    /// `waitpid` returned (set before the drain; `exited` is set after it).
+    pub(crate) reaped: AtomicBool,
+    /// A52.1: the core's own descriptor on the pty's slave (`O_CLOEXEC`,
+    /// `O_NOCTTY`), held until the child is reaped and the master drained.
+    /// `None` once closed ([`Shared::close_held_slave`]).
+    held_slave: Mutex<Option<OwnedFd>>,
+    /// Test hook (T49): hold the reader back until the child is reaped, or
+    /// this long.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    hold_reader: Option<Duration>,
+    /// Test hook: what released the held-back reader (0 = not held yet,
+    /// 1 = the reap, 2 = the ceiling).
+    #[cfg(any(test, feature = "test-fixtures"))]
+    hold_outcome: std::sync::atomic::AtomicU8,
 }
 
 impl Shared {
-    fn emit_resync(&self) {
-        let next_seq = self.ring.lock().next_seq();
-        tracing::debug!(
-            target: "pty",
-            session = %self.id,
-            next_seq,
-            "output outran the ipc channel; asking the view to re-snapshot"
-        );
-        if let Some(bus) = &self.events {
-            bus.emit(
-                events::PTY_RESYNC,
-                PtyResyncEvent {
-                    session_id: self.id.clone(),
-                    next_seq,
-                },
-            );
+    /// Close the core's slave descriptor (A52.1). Idempotent. The close runs
+    /// outside the lock.
+    pub(crate) fn close_held_slave(&self) {
+        let held = self.held_slave.lock().take();
+        drop(held);
+    }
+
+    #[cfg(any(test, feature = "test-fixtures"))]
+    fn held_slave_fd(&self) -> Option<RawFd> {
+        self.held_slave.lock().as_ref().map(|fd| fd.as_raw_fd())
+    }
+
+    fn send_to_view(&self, chunk: PtyChunk) {
+        let view = self.view.lock();
+        if let Some(view) = view.as_ref() {
+            if !view.sink.send(chunk) {
+                tracing::debug!(target: "pty", session = %self.id, "chunk delivery failed; the view resyncs on its next attach");
+            }
         }
+    }
+
+    fn announce_resync(&self) {
+        self.resync.store(false, Ordering::Release);
+        let offset = self.ring.lock().next_seq();
+        self.send_to_view(PtyChunk::Resync { offset });
     }
 }
 
-/// One frame as it travels from the reader thread to the coalescer.
-struct Frame {
-    seq: u64,
-    bytes: Vec<u8>,
+enum Msg {
+    Data { offset: u64, bytes: Vec<u8> },
+    /// Terminal-query replies for a PTY with no view (§6.2.6).
+    Reply(Vec<u8>),
+}
+
+/// Everything [`PtySession::start`] needs besides the pty itself.
+pub(crate) struct SessionParts {
+    pub(crate) pty_id: PtyId,
+    pub(crate) kind: ProcKind,
+    pub(crate) ticket: SpawnTicket,
+    pub(crate) agent_key: String,
+    pub(crate) cwd: PathBuf,
+    pub(crate) pid: i32,
+    pub(crate) pgid: i32,
+    pub(crate) start_sec: Option<i64>,
+    pub(crate) cols: u16,
+    pub(crate) rows: u16,
+    pub(crate) ring_bytes: usize,
+    pub(crate) idle_after_ms: u64,
+    pub(crate) status: Arc<StatusEngine>,
+    /// Called once on exit, from the exit watcher thread.
+    pub(crate) on_exit: Box<dyn FnOnce(ExitInfo, i64) + Send>,
+    /// A52.1: the core's own slave descriptor ([`open_held_slave`]), opened
+    /// before the fork. The session closes it; dropping these parts closes
+    /// it too (a start that fails).
+    pub(crate) held_slave: OwnedFd,
+    /// Test hook (T49): the reader waits until the child is reaped, or this
+    /// long, before its first read.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub(crate) hold_reader: Option<Duration>,
+}
+
+/// What released a reader the T49 hook held back.
+#[cfg(any(test, feature = "test-fixtures"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReaderHold {
+    /// The child was reaped first.
+    Reaped,
+    /// The ceiling ran out first: the child could not be reaped while its
+    /// output was unread.
+    Ceiling,
+}
+
+/// A52.1: a second descriptor on the slave named `tty` (the master's
+/// `tty_name`), for the core to hold. `std` opens it `O_CLOEXEC` atomically,
+/// so no spawn inherits it, not even one forked by another thread meanwhile
+/// (a PTY child's `pre_exec` closes every descriptor above 2 anyway).
+/// `O_NOCTTY`: the core never takes the terminal as its own.
+///
+/// It is a fresh open of the device, not a `dup` of portable-pty's slave:
+/// `SlavePty` exposes no descriptor, and that one only gets `FD_CLOEXEC`
+/// set by an `fcntl` after `openpty` returns.
+pub(crate) fn open_held_slave(tty: &Path) -> std::io::Result<OwnedFd> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open(tty)?;
+    Ok(OwnedFd::from(file))
+}
+
+/// A `FD_CLOEXEC` duplicate of `fd`.
+fn dup_cloexec(fd: RawFd) -> std::io::Result<OwnedFd> {
+    // SAFETY: `fcntl(F_DUPFD_CLOEXEC)` only reads `fd`; a non-negative
+    // result is a new descriptor that nothing else owns.
+    let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if dup < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: see above.
+    Ok(unsafe { OwnedFd::from_raw_fd(dup) })
+}
+
+/// Whether a read on the master would return at once: output its reader
+/// has not taken, or an EOF (hang-up) it has not seen yet.
+///
+/// `ioctl(FIONREAD)` cannot answer this on macOS. On a pty master it reports
+/// 0 even with output queued for the master (measured on Darwin 23.6, T49),
+/// so the drain asks `poll`.
+fn master_readable(master: BorrowedFd<'_>) -> bool {
+    let mut fds = [libc::pollfd {
+        fd: master.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    }];
+    loop {
+        // SAFETY: one valid `pollfd`, a zero timeout; `master` is borrowed
+        // for the call.
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), 1, 0) };
+        if ready < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return ready > 0 && fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -271,146 +322,117 @@ struct Frame {
 /// A live pty and the child attached to it.
 pub struct PtySession {
     pub(crate) shared: Arc<Shared>,
-    spawn_id: String,
-    project_id: String,
-    worktree_id: String,
-    agent: AgentKind,
-    account_id: Option<String>,
-    title: String,
+    pty_id: PtyId,
+    kind: ProcKind,
+    ticket: SpawnTicket,
+    agent_key: String,
     cwd: PathBuf,
     pid: i32,
     pgid: i32,
+    start_sec: Option<i64>,
     opened_at: i64,
     cols: AtomicU16,
     rows: AtomicU16,
-    detached: AtomicBool,
-    /// `MasterPty` is `Send` but not `Sync`; the mutex is what makes a session
-    /// shareable across the command surface.
+    /// `MasterPty` is `Send` but not `Sync`.
     master: Mutex<Box<dyn MasterPty + Send>>,
-    /// Kept for `tcgetpgrp` and for the record; valid as long as `master` is.
     master_fd: RawFd,
-    writer: Mutex<Box<dyn Write + Send>>,
-    /// Held so that `Drop` cannot mark a running row `lost`, and so the exit
-    /// watcher can close the row with a code.
-    #[allow(dead_code)]
-    guard: Arc<SpawnGuard>,
+    /// The PTY write lock (§6.2.4): every write, paste and screen action holds
+    /// it, so a multi-key screen action is never interleaved with typing.
+    pub(crate) write_gate: tokio::sync::Mutex<()>,
 }
 
 impl std::fmt::Debug for PtySession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PtySession")
-            .field("id", &self.shared.id)
-            .field("spawn_id", &self.spawn_id)
+            .field("pty_id", &self.pty_id)
             .field("pid", &self.pid)
             .finish()
     }
 }
 
-/// Everything [`PtySession::start`] needs that is not derived from the pty.
-pub(crate) struct SessionParts {
-    pub(crate) id: String,
-    pub(crate) spawn_id: String,
-    pub(crate) project_id: String,
-    pub(crate) worktree_id: String,
-    pub(crate) agent: AgentKind,
-    pub(crate) account_id: Option<String>,
-    pub(crate) title: String,
-    pub(crate) cwd: PathBuf,
-    pub(crate) pid: i32,
-    pub(crate) pgid: i32,
-    pub(crate) cols: u16,
-    pub(crate) rows: u16,
-    pub(crate) ring_bytes: usize,
-    pub(crate) idle_after_ms: u64,
-    pub(crate) status: Arc<StatusEngine>, // T16
-    pub(crate) guard: Arc<SpawnGuard>,
-    pub(crate) events: Option<EventBus>,
-    pub(crate) db: Option<Db>,
-}
-
 impl PtySession {
-    /// Wire up the ring, the three threads and the delivery channel.
-    ///
-    /// Called by [`super::manager::PtyManager::open`] once the child is running
-    /// and the registry row says so.
     pub(crate) fn start(
         parts: SessionParts,
         master: Box<dyn MasterPty + Send>,
         child: Box<dyn Child + Send + Sync>,
-        sink: Channel<PtyChunk>,
-    ) -> Result<PtySession> {
+    ) -> Result<PtySession, IpcError> {
         let now = now_ms();
         let master_fd = master
             .as_raw_fd()
-            .ok_or_else(|| GildeError::pty("the pty master has no file descriptor"))?;
+            .ok_or_else(|| IpcError::spawn_failed().with_detail("the pty master has no descriptor"))?;
         let reader = master
             .try_clone_reader()
-            .map_err(|e| GildeError::pty(format!("cannot read the pty master: {e}")))?;
+            .map_err(|e| IpcError::spawn_failed().with_detail(format!("pty reader: {e}")))?;
         let writer = master
             .take_writer()
-            .map_err(|e| GildeError::pty(format!("cannot write to the pty master: {e}")))?;
+            .map_err(|e| IpcError::spawn_failed().with_detail(format!("pty writer: {e}")))?;
+        // The exit watcher's own handle on the master, for the drain check:
+        // the session's may close first.
+        let probe = dup_cloexec(master_fd)
+            .map_err(|e| IpcError::spawn_failed().with_detail(format!("pty probe: {e}")))?;
+        let id = parts.pty_id.as_str().to_string();
 
-        // PINNED §36: the first record of the dump, and the one that says what
-        // size the child was told about before it drew anything.
-        dump::marker(
-            &parts.id,
-            format_args!("open {}x{} {}", parts.cols, parts.rows, parts.agent.signature_key()),
-        );
+        dump::marker(&id, format_args!("open {}x{} {}", parts.cols, parts.rows, parts.agent_key));
 
-        // T16: registered *before* the reader thread exists, so no byte can
-        // arrive before there is somewhere to account for it.
-        parts.status.register(
-            &parts.id,
-            parts.agent.signature_key(),
+        // Registered before the reader exists, so no byte arrives first.
+        parts.status.register_sized(
+            &id,
+            &parts.agent_key,
             parts.idle_after_ms,
+            parts.cols,
+            parts.rows,
             now,
         );
 
         let shared = Arc::new(Shared {
-            id: parts.id.clone(),
+            id: id.clone(),
             ring: Mutex::new(Ring::new(parts.ring_bytes)),
-            sink: Mutex::new(Some(sink)),
+            view: Mutex::new(None),
+            delivering: AtomicBool::new(false),
             resync: AtomicBool::new(false),
-            delivering: AtomicBool::new(true),
             eof: AtomicBool::new(false),
             exited: AtomicBool::new(false),
             exit: Mutex::new(None),
-            last_io_at: AtomicI64::new(now),
+            last_output_at: AtomicI64::new(0),
             status: parts.status.clone(),
-            events: parts.events.clone(),
+            output: tokio::sync::Notify::new(),
+            exit_notify: tokio::sync::Notify::new(),
+            writer: Arc::new(Mutex::new(writer)),
+            progress: Condvar::new(),
+            reaped: AtomicBool::new(false),
+            held_slave: Mutex::new(Some(parts.held_slave)),
+            #[cfg(any(test, feature = "test-fixtures"))]
+            hold_reader: parts.hold_reader,
+            #[cfg(any(test, feature = "test-fixtures"))]
+            hold_outcome: std::sync::atomic::AtomicU8::new(0),
         });
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<Frame>(QUEUE_FRAMES);
-
-        spawn_reader(shared.clone(), reader, tx);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Msg>(QUEUE_FRAMES);
+        if !spawn_reader(shared.clone(), reader, tx) {
+            // Nobody will read the master. A child that leads its session
+            // could then never finish exiting while the core holds a slave,
+            // so let go of it: the old, lossy behaviour, but no stuck exit.
+            shared.close_held_slave();
+        }
         spawn_coalescer(shared.clone(), rx);
-        spawn_exit_watcher(
-            shared.clone(),
-            child,
-            parts.guard.clone(),
-            parts.db.clone(),
-            parts.pid,
-        );
+        spawn_exit_watcher(shared.clone(), child, parts.pid, probe, parts.on_exit);
 
         Ok(PtySession {
             shared,
-            spawn_id: parts.spawn_id,
-            project_id: parts.project_id,
-            worktree_id: parts.worktree_id,
-            agent: parts.agent,
-            account_id: parts.account_id,
-            title: parts.title,
+            pty_id: parts.pty_id,
+            kind: parts.kind,
+            ticket: parts.ticket,
+            agent_key: parts.agent_key,
             cwd: parts.cwd,
             pid: parts.pid,
             pgid: parts.pgid,
+            start_sec: parts.start_sec,
             opened_at: now,
             cols: AtomicU16::new(parts.cols),
             rows: AtomicU16::new(parts.rows),
-            detached: AtomicBool::new(false),
             master: Mutex::new(master),
             master_fd,
-            writer: Mutex::new(writer),
-            guard: parts.guard,
+            write_gate: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -420,8 +442,20 @@ impl PtySession {
         &self.shared.id
     }
 
-    pub fn spawn_id(&self) -> &str {
-        &self.spawn_id
+    pub fn pty_id(&self) -> &PtyId {
+        &self.pty_id
+    }
+
+    pub fn kind(&self) -> ProcKind {
+        self.kind
+    }
+
+    pub fn ticket(&self) -> &SpawnTicket {
+        &self.ticket
+    }
+
+    pub fn agent_key(&self) -> &str {
+        &self.agent_key
     }
 
     pub fn pid(&self) -> i32 {
@@ -432,129 +466,173 @@ impl PtySession {
         self.pgid
     }
 
-    pub fn agent(&self) -> AgentKind {
-        self.agent
-    }
-
-    pub fn worktree_id(&self) -> &str {
-        &self.worktree_id
+    pub fn start_sec(&self) -> Option<i64> {
+        self.start_sec
     }
 
     pub fn cwd(&self) -> &std::path::Path {
         &self.cwd
     }
 
-    pub fn is_detached(&self) -> bool {
-        self.detached.load(Ordering::Acquire)
-    }
-
-    /// True once the reader has seen EOF **and** the child has been reaped.
-    /// Either alone is not enough — DESIGN §6-5 makes them independent.
-    pub fn is_finished(&self) -> bool {
-        self.shared.eof.load(Ordering::Acquire) && self.shared.exited.load(Ordering::Acquire)
-    }
-
-    pub fn saw_eof(&self) -> bool {
-        self.shared.eof.load(Ordering::Acquire)
+    pub fn opened_at(&self) -> i64 {
+        self.opened_at
     }
 
     pub fn has_exited(&self) -> bool {
         self.shared.exited.load(Ordering::Acquire)
     }
 
+    pub fn saw_eof(&self) -> bool {
+        self.shared.eof.load(Ordering::Acquire)
+    }
+
     pub fn exit_info(&self) -> Option<ExitInfo> {
         *self.shared.exit.lock()
     }
 
-    pub fn last_io_at(&self) -> i64 {
-        self.shared.last_io_at.load(Ordering::Relaxed)
+    /// The core's own slave descriptor while it holds one (A52.1; tests
+    /// check that it is close-on-exec and that it is closed after the exit).
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn held_slave_fd(&self) -> Option<RawFd> {
+        self.shared.held_slave_fd()
     }
 
-    pub fn info(&self) -> PtySessionInfo {
-        let ring = self.shared.ring.lock();
-        PtySessionInfo {
-            id: self.shared.id.clone(),
-            spawn_id: self.spawn_id.clone(),
-            project_id: self.project_id.clone(),
-            worktree_id: self.worktree_id.clone(),
-            agent: self.agent,
-            account_id: self.account_id.clone(),
-            title: self.title.clone(),
-            cwd: self.cwd.to_string_lossy().into_owned(),
-            cols: self.cols.load(Ordering::Relaxed),
-            rows: self.rows.load(Ordering::Relaxed),
-            pid: self.pid,
-            pgid: self.pgid,
-            opened_at: self.opened_at,
-            detached: self.detached.load(Ordering::Acquire),
-            first_retained_seq: ring.first_retained_seq(),
-            next_seq: ring.next_seq(),
+    /// What released the reader the T49 hook held back, once it was released.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn reader_hold(&self) -> Option<ReaderHold> {
+        match self.shared.hold_outcome.load(Ordering::Acquire) {
+            1 => Some(ReaderHold::Reaped),
+            2 => Some(ReaderHold::Ceiling),
+            _ => None,
         }
     }
 
-    /// T16: the engine re-evaluates before answering, so the prompt gate and
-    /// the Inspector never decide on a reading from before the last tick.
-    pub fn status_report(&self) -> SessionStatusReport {
-        self.shared.status.report(&self.shared.id)
+    pub fn last_output_at(&self) -> i64 {
+        self.shared.last_output_at.load(Ordering::Relaxed)
     }
 
-    /// True while a BEL has not been acknowledged (DESIGN §6-4).
-    pub fn attention(&self) -> bool {
-        self.shared.status.attention(&self.shared.id)
+    pub fn size(&self) -> (u16, u16) {
+        (self.cols.load(Ordering::Relaxed), self.rows.load(Ordering::Relaxed))
     }
 
-    // -- the io surface ------------------------------------------------------
-
-    /// Swap in the channel of a freshly mounted view (DESIGN §6-3 step 1).
-    ///
-    /// The channel is replaced **before** the caller takes a snapshot, which is
-    /// what closes the gap that the opposite order would open.
-    pub fn attach(&self, sink: Channel<PtyChunk>) {
-        *self.shared.sink.lock() = Some(sink);
-        self.shared.delivering.store(
-            !self.detached.load(Ordering::Acquire),
-            Ordering::Release,
-        );
-        // A fresh view has an empty screen; whatever the old one missed is
-        // irrelevant, and the snapshot it is about to take is authoritative.
-        self.shared.resync.store(false, Ordering::Release);
+    /// The winsize the kernel holds for this tty (`TIOCGWINSZ`).
+    pub fn tty_size(&self) -> Option<(u16, u16)> {
+        self.master.lock().get_size().ok().map(|s| (s.cols, s.rows))
     }
 
-    /// 16-byte header + the retained bytes (DESIGN §6-3).
+    /// The pty's foreground process group (`tcgetpgrp` on the master).
+    pub fn foreground_pgid(&self) -> Option<i32> {
+        if let Some(pgid) = self.master.lock().process_group_leader() {
+            if pgid > 0 {
+                return Some(pgid);
+            }
+        }
+        // SAFETY: `self.master` owns the descriptor for the life of `self`.
+        let fd = unsafe { BorrowedFd::borrow_raw(self.master_fd) };
+        nix::unistd::tcgetpgrp(fd)
+            .ok()
+            .map(|pid| pid.as_raw())
+            .filter(|pgid| *pgid > 0)
+    }
+
+    // -- the view ------------------------------------------------------------
+
+    /// Attach `view` (§6.2.6): one view per PTY; a different view takes it
+    /// over and the previous one hears `Detached{otherView}`. Attach first,
+    /// then snapshot; the view dedupes by offset.
+    pub fn attach(&self, view: ViewId, sink: Arc<dyn ChunkSink>) -> PtyInfo {
+        {
+            let mut current = self.shared.view.lock();
+            if let Some(old) = current.as_ref() {
+                if old.id != view {
+                    old.sink.send(PtyChunk::Detached {
+                        reason: DetachReason::OtherView,
+                    });
+                }
+            }
+            *current = Some(View { id: view, sink });
+            // A fresh view's snapshot is authoritative.
+            self.shared.resync.store(false, Ordering::Release);
+            self.shared.delivering.store(true, Ordering::Release);
+        }
+        let (cols, rows) = self.size();
+        PtyInfo {
+            offset: self.shared.ring.lock().next_seq(),
+            cols,
+            rows,
+            title: self.shared.status.title(&self.shared.id),
+        }
+    }
+
+    /// Idempotent; only the attached view can detach itself.
+    pub fn detach(&self, view: &ViewId) -> bool {
+        let mut current = self.shared.view.lock();
+        if current.as_ref().is_some_and(|v| &v.id == view) {
+            *current = None;
+            self.shared.delivering.store(false, Ordering::Release);
+            return true;
+        }
+        false
+    }
+
+    pub fn has_view(&self) -> bool {
+        self.shared.delivering.load(Ordering::Acquire)
+    }
+
+    /// Stop delivering to whatever view is attached (the session is ending).
+    pub(crate) fn drop_view(&self) {
+        *self.shared.view.lock() = None;
+        self.shared.delivering.store(false, Ordering::Release);
+    }
+
+    /// 16-byte header + the retained ring bytes.
     pub fn snapshot(&self) -> Vec<u8> {
         self.shared.ring.lock().snapshot()
     }
 
-    pub fn next_seq(&self) -> u64 {
+    pub fn next_offset(&self) -> u64 {
         self.shared.ring.lock().next_seq()
     }
 
-    /// Write raw bytes to the child. Never text: the frontend encodes with
-    /// `TextEncoder` so IME composition and pasted emoji survive intact.
-    pub fn write_bytes(&self, bytes: &[u8]) -> Result<()> {
-        // PINNED §36: the other half of the dialogue. xterm.js answers the
-        // child's terminal queries on its own, and a recording of the child's
-        // side alone cannot show which answer provoked which repaint.
-        dump::input(&self.shared.id, bytes);
-        let mut writer = self.writer.lock();
-        writer
-            .write_all(bytes)
-            .and_then(|()| writer.flush())
-            .map_err(|e| GildeError::pty(format!("write to the pty failed: {e}")))?;
-        self.shared
-            .last_io_at
-            .store(now_ms(), Ordering::Relaxed);
-        // T16: what the *user* types is activity too — T12's idle timeout reads
-        // `pty_session.last_io_at`, and a session being typed into is not idle.
-        self.shared.status.on_input(&self.shared.id);
-        Ok(())
+    // -- writing ---------------------------------------------------------------
+
+    /// Write raw bytes **without** taking the write lock (the caller holds it).
+    /// The write itself runs off the async runtime: a child that is not
+    /// reading can make a large write block.
+    pub(crate) async fn write_unlocked(&self, bytes: Vec<u8>) -> Result<(), IpcError> {
+        dump::input(&self.shared.id, &bytes);
+        let writer = self.shared.writer.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut w = writer.lock();
+            w.write_all(&bytes).and_then(|()| w.flush())
+        })
+        .await
+        .map_err(|_| IpcError::internal("pty-write-join"))?
+        .map_err(|e| {
+            if self.has_exited() {
+                IpcError::unsupported("noPty")
+            } else {
+                IpcError::spawn_failed().with_detail(format!("pty write failed: {e}"))
+            }
+        })
     }
 
-    /// `TIOCSWINSZ`, which makes the kernel deliver `SIGWINCH` to the
-    /// foreground group. A no-op when the size did not actually change.
-    pub fn resize(&self, cols: u16, rows: u16) -> Result<bool> {
+    /// Write raw bytes under the write lock.
+    pub async fn write(&self, bytes: &[u8]) -> Result<(), IpcError> {
+        let _gate = self.write_gate.lock().await;
+        self.write_unlocked(bytes.to_vec()).await
+    }
+
+    /// Bracketed paste + `\r` iff `submit`, under the write lock (§6.2.3).
+    pub async fn paste(&self, text: &str, submit: bool) -> Result<(), IpcError> {
+        let _gate = self.write_gate.lock().await;
+        self.write_unlocked(paste_bytes(text, submit)).await
+    }
+
+    /// `TIOCSWINSZ` (the kernel sends `SIGWINCH`). A no-op when unchanged.
+    pub fn resize(&self, cols: u16, rows: u16) -> Result<bool, IpcError> {
         let (cols, rows) = sanitize_size(cols, rows);
-        if self.cols.load(Ordering::Relaxed) == cols && self.rows.load(Ordering::Relaxed) == rows {
+        if self.size() == (cols, rows) {
             return Ok(false);
         }
         self.master
@@ -565,470 +643,336 @@ impl PtySession {
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .map_err(|e| GildeError::pty(format!("resize failed: {e}")))?;
+            .map_err(|e| IpcError::spawn_failed().with_detail(format!("resize failed: {e}")))?;
         self.cols.store(cols, Ordering::Relaxed);
         self.rows.store(rows, Ordering::Relaxed);
         dump::marker(&self.shared.id, format_args!("resize {cols}x{rows}"));
-        // T16 / PINNED §36: the child is about to get `SIGWINCH` and redraw
-        // everything. That repaint is ours, not evidence about the agent.
         self.shared.status.on_resize(&self.shared.id, cols, rows);
         Ok(true)
     }
 
-    pub fn size(&self) -> (u16, u16) {
-        (
-            self.cols.load(Ordering::Relaxed),
-            self.rows.load(Ordering::Relaxed),
-        )
-    }
+    // -- waiting ---------------------------------------------------------------
 
-    /// The winsize the **kernel** holds for this tty (`TIOCGWINSZ`), which is
-    /// what the child reads and what `SIGWINCH` announced. [`PtySession::size`]
-    /// is our own record of it; when the two disagree, this one is the truth.
-    pub fn tty_size(&self) -> Option<(u16, u16)> {
-        self.master
-            .lock()
-            .get_size()
-            .ok()
-            .map(|size| (size.cols, size.rows))
-    }
-
-    /// The pty's current foreground process group — `tcgetpgrp(master_fd)`,
-    /// which `portable-pty` exposes as `process_group_leader()` (PINNED §2).
-    ///
-    /// This is *not* the child's own pgid: when the agent runs `less`, the
-    /// foreground group is `less`. Both `Gentle` close and `session_signal`
-    /// deliberately target this group, which is what a real terminal does.
-    pub fn foreground_pgid(&self) -> Option<i32> {
-        if let Some(pgid) = self.master.lock().process_group_leader() {
-            if pgid > 0 {
-                return Some(pgid);
-            }
-        }
-        // The version-independent path DESIGN §6-4 asks for, kept as a fallback
-        // even though PINNED §2 confirms `process_group_leader()` exists in
-        // portable-pty 0.9: the two are the same `tcgetpgrp` call, and having
-        // ours means a future crate bump cannot silently remove the signal.
-        nix::unistd::tcgetpgrp(self.master_fd())
-            .ok()
-            .map(|pid| pid.as_raw())
-            .filter(|pgid| *pgid > 0)
-    }
-
-    /// Deliver `sig` to the foreground process group.
-    ///
-    /// Refuses any group that is not plausibly ours: `pgid <= 1` and this
-    /// process's own group are never signalled (DESIGN §8-6's exclusion rules,
-    /// applied to the one path that does not go through `kill_tree`).
-    pub fn signal_foreground(&self, sig: PtySignal) -> Result<i32> {
-        let pgid = self
-            .foreground_pgid()
-            .ok_or_else(|| GildeError::pty("the pty has no foreground process group"))?;
-        self.guard_pgid(pgid)?;
-        nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pgid), sig.as_nix())
-            .map_err(|e| GildeError::pty(format!("killpg({pgid}, {}) failed: {e}", sig.as_str())))?;
-        tracing::info!(
-            target: "pty",
-            session = %self.shared.id,
-            pgid,
-            signal = sig.as_str(),
-            "signalled the foreground process group"
-        );
-        Ok(pgid)
-    }
-
-    fn guard_pgid(&self, pgid: i32) -> Result<()> {
-        if pgid <= 1 {
-            return Err(GildeError::refused("init"));
-        }
-        if Some(pgid) == crate::supervise::spawn::pgid_of(std::process::id() as i32) {
-            return Err(GildeError::refused("self"));
-        }
-        Ok(())
-    }
-
-    /// Type a prompt into a live TUI (DESIGN §6-5).
-    ///
-    /// The gate is deliberate: typing a paragraph into a `[y/N]` dialog answers
-    /// the dialog with garbage. Multi-line text is wrapped in bracketed paste so
-    /// the TUI submits once, at the end, instead of on the first newline.
-    pub fn send_prompt(&self, text: &str) -> SendPromptOutcome {
-        let report = self.status_report();
-        if !matches!(report.status, SessionStatus::Idle) {
-            return SendPromptOutcome {
-                sent: false,
-                refused_reason: Some(format!("status:{}", report.status.kind())),
-                bracketed_paste: false,
-            };
-        }
-        if report.confidence < PROMPT_GATE_CONFIDENCE {
-            return SendPromptOutcome {
-                sent: false,
-                refused_reason: Some("lowConfidence".to_string()),
-                bracketed_paste: false,
-            };
-        }
-
-        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-        let trimmed = normalized.trim_end_matches('\n');
-        // Whitespace is not a prompt: submitting it costs the user a turn and
-        // teaches the agent nothing, so it is refused like an empty string.
-        if trimmed.trim().is_empty() {
-            return SendPromptOutcome {
-                sent: false,
-                refused_reason: Some("empty".to_string()),
-                bracketed_paste: false,
-            };
-        }
-        let bracketed = trimmed.contains('\n');
-
-        let mut payload: Vec<u8> = Vec::with_capacity(trimmed.len() + 16);
-        if bracketed {
-            payload.extend_from_slice(PASTE_START);
-            payload.extend_from_slice(trimmed.as_bytes());
-            payload.extend_from_slice(PASTE_END);
-        } else {
-            payload.extend_from_slice(trimmed.as_bytes());
-        }
-        payload.push(b'\r');
-
-        match self.write_bytes(&payload) {
-            Ok(()) => SendPromptOutcome {
-                sent: true,
-                refused_reason: None,
-                bracketed_paste: bracketed,
-            },
-            Err(err) => SendPromptOutcome {
-                sent: false,
-                refused_reason: Some(format!("write:{}", err.code())),
-                bracketed_paste: bracketed,
-            },
-        }
-    }
-
-    // -- closing -------------------------------------------------------------
-
-    /// `^C` then `^D`, as a real user would (`Standard` close, step one).
-    pub(crate) fn interrupt_and_eof(&self) -> Result<()> {
-        self.write_bytes(&[CTRL_C])?;
-        self.write_bytes(&[CTRL_D])
-    }
-
-    /// Wait up to `budget` for the child to disappear. Returns `true` if it did.
-    pub(crate) fn wait_for_exit(&self, budget: Duration) -> bool {
-        let deadline = Instant::now() + budget;
+    /// Wait until the screen changed after `since` (a status-engine grid
+    /// generation) and then held still for `quiet`, or `max` passed. Returns
+    /// whether it changed at all.
+    pub(crate) async fn wait_screen_change(&self, since: Option<u64>, quiet: Duration, max: Duration) -> bool {
+        let deadline = Instant::now() + max;
+        let generation = || {
+            self.shared
+                .status
+                .screen(&self.shared.id)
+                .map(|s| s.generation)
+        };
+        // First: anything at all.
         loop {
-            if self.shared.exited.load(Ordering::Acquire) {
-                return true;
+            let notified = self.shared.output.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if generation() != since || self.has_exited() {
+                break;
             }
-            if Instant::now() >= deadline {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
                 return false;
             }
-            std::thread::sleep(Duration::from_millis(20));
+            if tokio::time::timeout(left, notified).await.is_err() {
+                return generation() != since;
+            }
+        }
+        // Then: the repaint is over.
+        loop {
+            let notified = self.shared.output.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() || self.has_exited() {
+                return true;
+            }
+            if tokio::time::timeout(quiet.min(left), notified).await.is_err() {
+                return true;
+            }
         }
     }
 
-    /// Stop delivering, keep the pty open (DESIGN §6-5 `Detach`).
-    ///
-    /// The master fd stays open on purpose: closing it hangs up the tty and the
-    /// kernel sends `SIGHUP` to the very process we promised to keep alive. The
-    /// reader thread keeps draining and discarding, because a detached agent
-    /// whose pty buffer fills would block on its next `write` — "detached" must
-    /// mean "we stopped watching", never "we froze it".
-    pub(crate) fn detach(&self) {
-        self.detached.store(true, Ordering::Release);
-        self.shared.delivering.store(false, Ordering::Release);
-        *self.shared.sink.lock() = None;
-        self.shared.status.on_detach(&self.shared.id);
-    }
-
-    pub(crate) fn mark_killed(&self) {
-        self.shared.status.on_killed(&self.shared.id);
-    }
-
-    /// Stop delivering to a channel that is about to go away.
-    pub(crate) fn stop_delivery(&self) {
-        self.shared.delivering.store(false, Ordering::Release);
-        *self.shared.sink.lock() = None;
-    }
-
-    /// The raw master descriptor, borrowed for the life of this session.
-    fn master_fd(&self) -> BorrowedFd<'_> {
-        // SAFETY: `self.master` owns the descriptor and outlives the borrow.
-        unsafe { BorrowedFd::borrow_raw(self.master_fd) }
+    /// Wait up to `budget` for the child to be reaped.
+    pub async fn wait_exit(&self, budget: Duration) -> bool {
+        let notified = self.shared.exit_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.has_exited() {
+            return true;
+        }
+        tokio::time::timeout(budget, notified).await.is_ok() || self.has_exited()
     }
 }
 
-/// Clamp a requested terminal size into something a TUI can draw into.
-pub fn sanitize_size(cols: u16, rows: u16) -> (u16, u16) {
-    let cols = if cols == 0 { FALLBACK_COLS } else { cols.max(MIN_COLS) };
-    let rows = if rows == 0 { FALLBACK_ROWS } else { rows.max(MIN_ROWS) };
-    (cols, rows)
+impl Drop for PtySession {
+    /// The manager let go of the session: its slave descriptor goes too
+    /// (A52.1). The exit watcher has usually closed it already.
+    fn drop(&mut self) {
+        self.shared.close_held_slave();
+    }
 }
 
 // ---------------------------------------------------------------------------
 // the three threads
 // ---------------------------------------------------------------------------
 
-fn spawn_reader(
-    shared: Arc<Shared>,
-    mut reader: Box<dyn Read + Send>,
-    tx: tokio::sync::mpsc::Sender<Frame>,
-) {
-    let name = format!("gilde-pty-read-{}", short(&shared.id));
+fn short(id: &str) -> &str {
+    let tail = id.len().saturating_sub(8);
+    &id[tail..]
+}
+
+/// Test hook (T49): hold the reader back until the child is reaped or
+/// `ceiling` passes, and record which came first.
+#[cfg(any(test, feature = "test-fixtures"))]
+fn hold_until_reaped(shared: &Shared, ceiling: Duration) {
+    let deadline = Instant::now() + ceiling;
+    let mut ring = shared.ring.lock();
+    while !shared.reaped.load(Ordering::Acquire) {
+        if shared.progress.wait_until(&mut ring, deadline).timed_out() {
+            break;
+        }
+    }
+    let outcome = if shared.reaped.load(Ordering::Acquire) { 1 } else { 2 };
+    shared.hold_outcome.store(outcome, Ordering::Release);
+}
+
+/// Start the reader thread; `false` if it could not be started.
+fn spawn_reader(shared: Arc<Shared>, mut reader: Box<dyn Read + Send>, tx: tokio::sync::mpsc::Sender<Msg>) -> bool {
+    let name = format!("gilde-pty-r-{}", short(&shared.id));
     let spawned = std::thread::Builder::new().name(name).spawn(move || {
+        use tokio::sync::mpsc::error::TrySendError;
+        #[cfg(any(test, feature = "test-fixtures"))]
+        if let Some(ceiling) = shared.hold_reader {
+            hold_until_reaped(&shared, ceiling);
+        }
         let mut buf = vec![0u8; READ_CHUNK];
         loop {
             match reader.read(&mut buf) {
-                // `portable-pty` maps the master's `EIO` (all slaves closed) to
-                // a clean EOF, so this is the one and only end condition.
+                // `portable-pty` maps the master's EIO (all slaves closed) to EOF.
                 Ok(0) => break,
                 Ok(n) => {
-                    let now = now_ms();
-                    shared.last_io_at.store(now, Ordering::Relaxed);
-                    // PINNED §36: before anything interprets them.
+                    shared.last_output_at.store(now_ms(), Ordering::Relaxed);
                     dump::output(&shared.id, &buf[..n]);
-                    let seq = shared.ring.lock().push(&buf[..n]);
-                    // T16: the tail parser and the state machine, on the bytes
-                    // themselves. Output just arrived, so this returns on the
-                    // first branch of DESIGN §6-4's table — the regexes are not
-                    // on the hot path.
-                    shared.status.on_output(&shared.id, &buf[..n]);
-
+                    let offset = shared.ring.lock().push(&buf[..n]);
+                    // The exit watcher's drain re-checks the master after it.
+                    shared.progress.notify_all();
+                    let queries = shared.status.on_output(&shared.id, &buf[..n]);
+                    shared.output.notify_waiters();
                     if shared.delivering.load(Ordering::Acquire) {
-                        use tokio::sync::mpsc::error::TrySendError;
-                        match tx.try_send(Frame {
-                            seq,
+                        match tx.try_send(Msg::Data {
+                            offset,
                             bytes: buf[..n].to_vec(),
                         }) {
                             Ok(()) => {}
-                            // The view is behind. Drop the frame, remember that
-                            // we did, and keep reading — the child must never
-                            // wait for a webview.
-                            Err(TrySendError::Full(_)) => {
-                                shared.resync.store(true, Ordering::Release);
-                            }
-                            // No coalescer any more; the ring is still the truth.
+                            Err(TrySendError::Full(_)) => shared.resync.store(true, Ordering::Release),
                             Err(TrySendError::Closed(_)) => {}
                         }
+                    } else if !queries.is_empty() {
+                        // No view: the core answers DA1 and DSR itself so a
+                        // hidden TUI never stalls on a reply (§6.2.6).
+                        let reply: Vec<u8> = queries.iter().flat_map(|q| q.reply()).collect();
+                        let _ = tx.try_send(Msg::Reply(reply));
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) => {
-                    tracing::debug!(
-                        target: "pty",
-                        session = %shared.id,
-                        error = %e,
-                        "pty read ended"
-                    );
+                    tracing::debug!(target: "pty", session = %shared.id, error = %e, "pty read ended");
                     break;
                 }
             }
         }
-        shared.eof.store(true, Ordering::Release);
+        {
+            // Under the ring lock: the exit watcher checks `eof` under it.
+            let _ring = shared.ring.lock();
+            shared.eof.store(true, Ordering::Release);
+        }
+        shared.progress.notify_all();
+        shared.output.notify_waiters();
         dump::marker(&shared.id, format_args!("eof"));
         dump::close(&shared.id);
-        tracing::debug!(target: "pty", session = %shared.id, "reader saw eof");
     });
-    if let Err(err) = spawned {
-        tracing::error!(target: "pty", error = %err, "could not start the pty reader thread");
+    match spawned {
+        Ok(_) => true,
+        Err(err) => {
+            tracing::error!(target: "pty", error = %err, "could not start the pty reader thread");
+            false
+        }
     }
 }
 
-fn spawn_coalescer(shared: Arc<Shared>, mut rx: tokio::sync::mpsc::Receiver<Frame>) {
+fn spawn_coalescer(shared: Arc<Shared>, mut rx: tokio::sync::mpsc::Receiver<Msg>) {
     tauri::async_runtime::spawn(async move {
         let mut pending: Vec<u8> = Vec::with_capacity(FLUSH_BYTES);
-        let mut pending_seq: u64 = 0;
-        let mut flush_at: Option<Instant> = None;
-        let mut tick_at = Instant::now() + STATUS_TICK;
-        // Where the last chunk we actually delivered ended. The contract with
-        // the view is that consecutive chunks join up unless a resync was
-        // published between them, and this is what proves it.
+        let mut pending_offset: u64 = 0;
+        let mut flush_at: Option<tokio::time::Instant> = None;
+        // Where the last delivered chunk ended: consecutive chunks join up
+        // unless a resync was published between them.
         let mut delivered_end: Option<u64> = None;
 
         loop {
-            let now = Instant::now();
-            let wait = flush_at
-                .unwrap_or(tick_at)
-                .min(tick_at)
-                .saturating_duration_since(now)
-                .max(Duration::from_millis(1));
-
-            match tokio::time::timeout(wait, rx.recv()).await {
-                Ok(Some(frame)) => {
-                    // A hole is discovered *here*, by comparing sequence
-                    // numbers, and never by reading the reader's `resync` flag:
-                    // that flag goes up the instant a frame is dropped, which is
-                    // up to `QUEUE_FRAMES` frames before the hole itself reaches
-                    // this loop. Trusting it would let a batch straddle the hole
-                    // and go out stamped with the seq of its first frame — a
-                    // chunk whose bytes are not the bytes at that offset, which
-                    // is the one thing the seq protocol exists to prevent.
+            let msg = match flush_at {
+                // Bytes to flush: wait at most until the flush is due.
+                Some(at) => match tokio::time::timeout_at(at, rx.recv()).await {
+                    Ok(msg) => msg,
+                    Err(_) => {
+                        flush(&shared, &mut pending, pending_offset, &mut delivered_end);
+                        flush_at = None;
+                        // A drop that nothing arrived after must still be
+                        // announced; a view that is behind dedupes by offset.
+                        if shared.resync.load(Ordering::Acquire) {
+                            shared.announce_resync();
+                        }
+                        continue;
+                    }
+                },
+                // Nothing pending: sleep until the reader sends something.
+                None => rx.recv().await,
+            };
+            match msg {
+                Some(Msg::Data { offset, bytes }) => {
                     let joins_up = if pending.is_empty() {
                         delivered_end
                     } else {
-                        Some(pending_seq + pending.len() as u64)
+                        Some(pending_offset + pending.len() as u64)
                     }
-                    .is_none_or(|end| end == frame.seq);
+                    .is_none_or(|end| end == offset);
                     if !joins_up {
-                        // What we hold is still valid on its own and still joins
-                        // up with the chunk before it, so send it — then tell the
-                        // view to re-snapshot, before anything from the far side
-                        // of the hole reaches it.
-                        flush(&shared, &mut pending, pending_seq, &mut delivered_end);
-                        announce_resync(&shared);
+                        // A hole: send what joins up, then tell the view to
+                        // re-snapshot before anything from the far side.
+                        flush(&shared, &mut pending, pending_offset, &mut delivered_end);
+                        shared.announce_resync();
                         flush_at = None;
                     }
                     if pending.is_empty() {
-                        pending_seq = frame.seq;
-                        flush_at = Some(Instant::now() + FLUSH_INTERVAL);
+                        pending_offset = offset;
+                        flush_at = Some(tokio::time::Instant::now() + FLUSH_INTERVAL);
                     }
-                    pending.extend_from_slice(&frame.bytes);
+                    pending.extend_from_slice(&bytes);
                     if pending.len() >= FLUSH_BYTES {
-                        flush(&shared, &mut pending, pending_seq, &mut delivered_end);
+                        flush(&shared, &mut pending, pending_offset, &mut delivered_end);
                         flush_at = None;
                     }
                 }
-                // Every sender is gone: the reader thread ended.
-                Ok(None) => {
-                    flush(&shared, &mut pending, pending_seq, &mut delivered_end);
-                    break;
-                }
-                Err(_elapsed) => {
-                    let now = Instant::now();
-                    if flush_at.map(|at| at <= now).unwrap_or(false) {
-                        flush(&shared, &mut pending, pending_seq, &mut delivered_end);
-                        flush_at = None;
-                    }
-                    if now >= tick_at {
-                        tick_at = now + STATUS_TICK;
-                        // A drop that nothing has arrived after — the flood
-                        // ended on the far side of the hole — would otherwise
-                        // never be announced.
-                        if pending.is_empty() && shared.resync.load(Ordering::Acquire) {
-                            announce_resync(&shared);
+                Some(Msg::Reply(bytes)) => {
+                    let writer = shared.writer.clone();
+                    let id = shared.id.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        dump::input(&id, &bytes);
+                        let mut w = writer.lock();
+                        if let Err(e) = w.write_all(&bytes).and_then(|()| w.flush()) {
+                            tracing::debug!(target: "pty", error = %e, "terminal query reply not written");
                         }
-                        shared.status.tick_session(&shared.id);
+                    })
+                    .await;
+                }
+                None => {
+                    flush(&shared, &mut pending, pending_offset, &mut delivered_end);
+                    if shared.resync.load(Ordering::Acquire) {
+                        shared.announce_resync();
                     }
+                    break;
                 }
             }
         }
-
-        // The stream ended with a hole in it: the last thing the view hears has
-        // to be "re-snapshot", or it keeps a screen that is missing bytes.
-        if shared.resync.load(Ordering::Acquire) {
-            announce_resync(&shared);
-        }
-
-        // One last evaluation so the pill does not freeze on "working" after the
-        // stream ends but before `child.wait()` returns.
         shared.status.tick_session(&shared.id);
     });
 }
 
-/// Publish `gilde://pty/resync` and lower the reader's flag.
-///
-/// Publishing twice for one hole is harmless — a re-snapshot is idempotent —
-/// but publishing *late* is not, so this is called the moment a hole is proven
-/// rather than on a timer.
-fn announce_resync(shared: &Shared) {
-    shared.resync.store(false, Ordering::Release);
-    shared.emit_resync();
-}
-
-/// Send one coalesced chunk. `seq` is the ring offset of `pending[0]`, and the
-/// caller guarantees `pending` holds one unbroken run of bytes from there.
-/// `delivered_end` is advanced to the offset just past the chunk.
-fn flush(shared: &Shared, pending: &mut Vec<u8>, seq: u64, delivered_end: &mut Option<u64>) {
+/// Send one coalesced chunk; `offset` is the ring offset of `pending[0]`.
+fn flush(shared: &Shared, pending: &mut Vec<u8>, offset: u64, delivered_end: &mut Option<u64>) {
     if pending.is_empty() {
         return;
     }
-    *delivered_end = Some(seq + pending.len() as u64);
+    *delivered_end = Some(offset + pending.len() as u64);
     let b64 = base64::engine::general_purpose::STANDARD.encode(&pending[..]);
     pending.clear();
-    let sink = shared.sink.lock();
-    if let Some(channel) = sink.as_ref() {
-        if let Err(err) = channel.send(PtyChunk { seq, b64 }) {
-            tracing::debug!(
-                target: "pty",
-                session = %shared.id,
-                error = %err,
-                "chunk delivery failed; the view will resync on its next mount"
-            );
+    shared.send_to_view(PtyChunk::Data { offset, b64 });
+}
+
+/// After the reap (A52.1): wait until the reader has taken everything the
+/// master holds, or `deadline` passes. The check is made again after each
+/// of the reader's reads: the watcher sleeps on [`Shared::progress`] until
+/// the ring's offset moves or the reader sees EOF. Returns whether the
+/// master drained.
+fn drain_master(shared: &Shared, master: BorrowedFd<'_>, deadline: Instant) -> bool {
+    loop {
+        let seen = {
+            let ring = shared.ring.lock();
+            if shared.eof.load(Ordering::Acquire) {
+                return true;
+            }
+            ring.next_seq()
+        };
+        if !master_readable(master) {
+            return true;
+        }
+        let mut ring = shared.ring.lock();
+        while ring.next_seq() == seen && !shared.eof.load(Ordering::Acquire) {
+            if shared.progress.wait_until(&mut ring, deadline).timed_out() {
+                return false;
+            }
         }
     }
+}
+
+/// Wait for the reader's EOF until `deadline`; whether it came.
+fn wait_eof(shared: &Shared, deadline: Instant) -> bool {
+    let mut ring = shared.ring.lock();
+    while !shared.eof.load(Ordering::Acquire) {
+        if shared.progress.wait_until(&mut ring, deadline).timed_out() {
+            return shared.eof.load(Ordering::Acquire);
+        }
+    }
+    true
 }
 
 fn spawn_exit_watcher(
     shared: Arc<Shared>,
     mut child: Box<dyn Child + Send + Sync>,
-    guard: Arc<SpawnGuard>,
-    db: Option<Db>,
     pid: i32,
+    probe: OwnedFd,
+    on_exit: Box<dyn FnOnce(ExitInfo, i64) + Send>,
 ) {
-    let name = format!("gilde-pty-wait-{}", short(&shared.id));
+    let name = format!("gilde-pty-w-{}", short(&shared.id));
     let spawned = std::thread::Builder::new().name(name).spawn(move || {
         let exit = reap(&mut child);
         let at = now_ms();
-
+        {
+            let _ring = shared.ring.lock();
+            shared.reaped.store(true, Ordering::Release);
+        }
+        shared.progress.notify_all();
+        // Report the exit only once the child's last bytes are in the ring
+        // (A52.1). First the master drains into the reader; then the core
+        // lets go of its slave, which (with no grandchild holding one) is
+        // the last close and gives the reader EOF. A grandchild that keeps
+        // the slave open must not hold the exit back: one bound covers
+        // the drain and the EOF.
+        let deadline = Instant::now() + EXIT_EOF_GRACE;
+        let drained = drain_master(&shared, probe.as_fd(), deadline);
+        drop(probe);
+        shared.close_held_slave();
+        let eof = wait_eof(&shared, deadline);
+        if !drained || !eof {
+            tracing::debug!(target: "pty", pty = %shared.id, drained, eof, "pty exit reported at the grace bound");
+        }
         *shared.exit.lock() = Some(exit);
         shared.exited.store(true, Ordering::Release);
-        // T16: terminal, immediately — an exit never waits out the debounce.
         shared.status.on_exit(&shared.id, exit.code, exit.signal);
-
-        if let Err(err) = guard.mark_exited(exit.code, exit.signal) {
-            tracing::warn!(target: "pty", error = %err, "could not close the registry row");
-        }
-        if let Some(db) = &db {
-            let id = shared.id.clone();
-            if let Err(err) = db.blocking(|conn| {
-                dao::pty_session::mark_closed(
-                    conn,
-                    &id,
-                    at,
-                    exit.code.map(i64::from),
-                    exit.signal.map(i64::from),
-                )
-                .map(|_| ())
-            }) {
-                tracing::warn!(target: "pty", error = %err, "could not close the pty_session row");
-            }
-        }
-
-        tracing::info!(
-            target: "pty",
-            session = %shared.id,
-            pid,
-            code = ?exit.code,
-            signal = ?exit.signal,
-            "pty child exited"
-        );
-
-        if let Some(bus) = &shared.events {
-            bus.emit(
-                events::SESSION_EXIT,
-                SessionExitEvent {
-                    session_id: shared.id.clone(),
-                    pid,
-                    exit_code: exit.code,
-                    signal: exit.signal,
-                    at,
-                },
-            );
-        }
+        tracing::info!(target: "pty", pty = %shared.id, pid, code = ?exit.code, signal = ?exit.signal, "pty child exited");
+        on_exit(exit, at);
+        shared.exit_notify.notify_waiters();
+        shared.output.notify_waiters();
     });
     if let Err(err) = spawned {
         tracing::error!(target: "pty", error = %err, "could not start the pty exit watcher");
     }
 }
 
-/// `waitpid`, through whichever door gives us the **numeric** signal.
-///
-/// `portable_pty::ExitStatus` reports a signal as `strsignal()` prose
-/// ("Hangup"), which is useless to the UI and unstable across platforms. On unix
-/// the boxed child *is* a `std::process::Child`, so we downcast and use
-/// `ExitStatusExt::signal()`; the fall-back keeps the code honest on any future
-/// backend rather than pretending a signal was an exit code.
+/// `waitpid`, through whichever door gives the numeric signal.
 fn reap(child: &mut Box<dyn Child + Send + Sync>) -> ExitInfo {
     let generic: &mut dyn Child = &mut **child;
     if let Some(std_child) = generic.downcast_mut::<std::process::Child>() {
@@ -1039,7 +983,7 @@ fn reap(child: &mut Box<dyn Child + Send + Sync>) -> ExitInfo {
             },
             Err(err) => {
                 tracing::warn!(target: "pty", error = %err, "waitpid failed");
-                ExitInfo::default()
+                ExitInfo { code: None, signal: None }
             }
         };
     }
@@ -1050,14 +994,9 @@ fn reap(child: &mut Box<dyn Child + Send + Sync>) -> ExitInfo {
         },
         Err(err) => {
             tracing::warn!(target: "pty", error = %err, "child wait failed");
-            ExitInfo::default()
+            ExitInfo { code: None, signal: None }
         }
     }
-}
-
-/// Thread names are capped at 15 bytes on macOS; a uuid is longer than that.
-fn short(id: &str) -> &str {
-    &id[..id.len().min(8)]
 }
 
 #[cfg(test)]
@@ -1065,90 +1004,107 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_zero_size_becomes_a_size_a_tui_can_draw_into() {
+    fn a_size_is_clamped_never_rejected() {
         assert_eq!(sanitize_size(0, 0), (FALLBACK_COLS, FALLBACK_ROWS));
         assert_eq!(sanitize_size(1, 1), (MIN_COLS, MIN_ROWS));
         assert_eq!(sanitize_size(120, 40), (120, 40));
+        assert_eq!(sanitize_size(5_000, 9_000), (MAX_COLS, MAX_ROWS));
     }
 
-    /// The status stub T15 carried is gone: T16's `StatusEngine` owns every
-    /// transition now, and its state machine is tested where it lives
-    /// (`status::engine`). What is still this module's business is that the
-    /// session hands the engine the right things — proven end-to-end against a
-    /// real pty in `tests/status_streams.rs` and `tests/pty_fidelity.rs`.
+    /// T-pty-pasteMarker: the end marker in content never closes the paste.
+    #[test]
+    fn paste_splits_the_end_marker_out_of_content() {
+        assert_eq!(paste_bytes("hi", true), b"\x1b[200~hi\x1b[201~\r".to_vec());
+        assert_eq!(paste_bytes("hi", false), b"\x1b[200~hi\x1b[201~".to_vec());
+        let hostile = "a\x1b[201~rm -rf ~\r\x1b[201~b";
+        let bytes = paste_bytes(hostile, true);
+        assert_eq!(
+            bytes,
+            b"\x1b[200~a\x1b[201~\x1b[200~rm -rf ~\r\x1b[201~\x1b[200~b\x1b[201~\r".to_vec()
+        );
+        // Every end marker that is sent closes a segment the core opened.
+        let count = |needle: &[u8]| bytes.windows(needle.len()).filter(|w| *w == needle).count();
+        assert_eq!(count(PASTE_START), count(PASTE_END));
+        assert!(paste_bytes("\x1b[201~", false).is_empty(), "nothing but a marker sends nothing");
+    }
 
-    /// Regression: a batch must never straddle a dropped frame.
-    ///
-    /// The reader raises `resync` the instant it drops a frame, which can be up
-    /// to `QUEUE_FRAMES` frames before the hole reaches the coalescer. An
-    /// earlier version consumed that flag in `flush`, so the flag was already
-    /// spent by the time the hole arrived and the two sides of it were
-    /// concatenated into one chunk stamped with the seq of the first — a chunk
-    /// whose bytes are not the bytes at that offset. Only the sequence numbers
-    /// can prove contiguity, so only they are trusted.
-    #[tokio::test]
-    async fn a_dropped_frame_never_lets_a_chunk_lie_about_its_offset() {
-        let received: Arc<std::sync::Mutex<Vec<(u64, Vec<u8>)>>> =
-            Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink = received.clone();
-        let channel = Channel::new(move |body| {
-            let json = match body {
-                tauri::ipc::InvokeResponseBody::Json(json) => json,
-                tauri::ipc::InvokeResponseBody::Raw(_) => unreachable!("chunks are json"),
-            };
-            let chunk: PtyChunk = serde_json::from_str(&json).expect("chunk");
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(chunk.b64.as_bytes())
-                .expect("b64");
-            sink.lock().expect("sink").push((chunk.seq, bytes));
-            Ok(())
-        });
+    struct Collect(Mutex<Vec<PtyChunk>>);
+    impl ChunkSink for Collect {
+        fn send(&self, chunk: PtyChunk) -> bool {
+            self.0.lock().push(chunk);
+            true
+        }
+    }
 
+    fn shared_for_test() -> (Arc<Shared>, Arc<Collect>) {
+        let sink = Arc::new(Collect(Mutex::new(Vec::new())));
+        let writer: Box<dyn Write + Send> = Box::new(std::io::sink());
         let shared = Arc::new(Shared {
             id: "unit".to_string(),
             ring: Mutex::new(Ring::new(1024)),
-            sink: Mutex::new(Some(channel)),
-            resync: AtomicBool::new(false),
+            view: Mutex::new(Some(View {
+                id: ViewId::parse("v1").unwrap(),
+                sink: sink.clone(),
+            })),
             delivering: AtomicBool::new(true),
+            resync: AtomicBool::new(false),
             eof: AtomicBool::new(false),
             exited: AtomicBool::new(false),
             exit: Mutex::new(None),
-            last_io_at: AtomicI64::new(0),
+            last_output_at: AtomicI64::new(0),
             status: Arc::new(StatusEngine::new()),
-            events: None,
+            output: tokio::sync::Notify::new(),
+            exit_notify: tokio::sync::Notify::new(),
+            writer: Arc::new(Mutex::new(writer)),
+            progress: Condvar::new(),
+            reaped: AtomicBool::new(false),
+            held_slave: Mutex::new(None),
+            hold_reader: None,
+            hold_outcome: std::sync::atomic::AtomicU8::new(0),
         });
-
-        let (tx, rx) = tokio::sync::mpsc::channel::<Frame>(8);
-        spawn_coalescer(shared.clone(), rx);
-
-        tx.send(Frame {
-            seq: 0,
-            bytes: b"aaaa".to_vec(),
-        })
-        .await
-        .expect("send");
-        // Frames covering 4..8 were dropped by the reader, which is the only
-        // party that knows it happened.
-        shared.resync.store(true, Ordering::Release);
-        tokio::time::sleep(Duration::from_millis(40)).await;
-        tx.send(Frame {
-            seq: 8,
-            bytes: b"cccc".to_vec(),
-        })
-        .await
-        .expect("send");
-        tokio::time::sleep(Duration::from_millis(80)).await;
-
-        let chunks = received.lock().expect("sink").clone();
-        assert_eq!(
-            chunks,
-            vec![(0, b"aaaa".to_vec()), (8, b"cccc".to_vec())],
-            "each chunk carries the offset its own bytes came from"
-        );
-        assert!(
-            !shared.resync.load(Ordering::Acquire),
-            "the hole was announced, so the flag is spent"
-        );
+        (shared, sink)
     }
 
+    /// Regression: a batch never straddles a dropped frame — only offsets
+    /// prove contiguity.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_frame_never_lets_a_chunk_lie_about_its_offset() {
+        let (shared, sink) = shared_for_test();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Msg>(8);
+        spawn_coalescer(shared.clone(), rx);
+        tx.send(Msg::Data { offset: 0, bytes: b"aaaa".to_vec() }).await.unwrap();
+        shared.resync.store(true, Ordering::Release);
+        tx.send(Msg::Data { offset: 8, bytes: b"cccc".to_vec() }).await.unwrap();
+        drop(tx);
+        // Event-driven: the coalescer ends when the queue closes.
+        for _ in 0..500 {
+            if sink.0.lock().iter().filter(|c| matches!(c, PtyChunk::Data { .. })).count() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let chunks = sink.0.lock().clone();
+        let data: Vec<(u64, Vec<u8>)> = chunks
+            .iter()
+            .filter_map(|c| match c {
+                PtyChunk::Data { offset, b64 } => Some((
+                    *offset,
+                    base64::engine::general_purpose::STANDARD.decode(b64).unwrap(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(data, vec![(0, b"aaaa".to_vec()), (8, b"cccc".to_vec())]);
+        let first_resync = chunks.iter().position(|c| matches!(c, PtyChunk::Resync { .. }));
+        let second_data = chunks
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| matches!(c, PtyChunk::Data { .. }))
+            .nth(1)
+            .map(|(i, _)| i);
+        assert!(
+            first_resync.is_some() && first_resync < second_data,
+            "the hole is announced before the far side of it: {chunks:?}"
+        );
+    }
 }

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-undo-cancel"
+description = "Enables the undo_cancel command without any pre-configured scope."
+commands.allow = ["undo_cancel"]
+
+[[permission]]
+identifier = "deny-undo-cancel"
+description = "Denies the undo_cancel command without any pre-configured scope."
+commands.deny = ["undo_cancel"]

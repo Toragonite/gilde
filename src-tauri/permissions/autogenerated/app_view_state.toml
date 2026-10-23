@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-app-view-state"
+description = "Enables the app_view_state command without any pre-configured scope."
+commands.allow = ["app_view_state"]
+
+[[permission]]
+identifier = "deny-app-view-state"
+description = "Denies the app_view_state command without any pre-configured scope."
+commands.deny = ["app_view_state"]

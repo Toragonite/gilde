@@ -6,12 +6,21 @@
 //!   because a desktop app started from a terminal during development should say
 //!   something.
 //!
+//! **Content never reaches the log** (contract §9.7): fields are an allowlist of
+//! ids, counts, kinds, durations, error codes, row types and byte counts. The
+//! [`ContentGuard`] layer counts every event that carries a content-named
+//! field ([`CONTENT_FIELDS`]); tests assert the count stays zero, and debug
+//! builds say which field it was. An argv is logged only as
+//! [`redacted_argv`] (the one helper of `supervise::redact`); an `IpcError`
+//! only as its code, key and detail length (§4.4).
+//!
 //! `panic = "abort"` is deliberately absent from `[profile.release]` (DESIGN §2-2):
 //! this app runs PTY reader threads, a watchdog, and user-editable regexes, and one
 //! thread panicking must not take the process — and every open PTY — down with it.
 //! [`install_panic_hook`] makes those panics loud in the log instead of silent.
 
 use std::panic::PanicHookInfo;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 use tracing_appender::non_blocking::WorkerGuard;
@@ -86,11 +95,65 @@ pub fn init_tracing(paths: &AppPaths) -> Result<WorkerGuard> {
 
     tracing_subscriber::registry()
         .with(env_filter())
+        .with(ContentGuard)
         .with(file_layer)
         .with(stderr_layer)
         .init();
 
     Ok(guard)
+}
+
+/// Field names that are content or secrets (contract §3.9, §9.7): never a
+/// log field.
+pub const CONTENT_FIELDS: &[&str] = &[
+    "text", "prompt", "content", "title", "body", "preview", "summary", "subject", "blocks",
+    "raw", "token", "secret", "argv", "command", "env", "detail", "stderr", "stdout",
+];
+
+static CONTENT_VIOLATIONS: AtomicU64 = AtomicU64::new(0);
+
+/// How many events carried a content-named field since start.
+pub fn content_violations() -> u64 {
+    CONTENT_VIOLATIONS.load(Ordering::SeqCst)
+}
+
+/// The tracing layer that watches the field allowlist (see the module docs).
+pub struct ContentGuard;
+
+struct FieldNames(Option<&'static str>);
+
+impl tracing::field::Visit for FieldNames {
+    fn record_debug(&mut self, field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {
+        if self.0.is_none() && is_content_field(field.name()) {
+            self.0 = Some(field.name());
+        }
+    }
+}
+
+/// Whether a field name is a content name: the name itself or its last
+/// `.`/`_` part (`user.prompt`, `first_prompt`); `detail_len` (a byte count)
+/// is not.
+pub fn is_content_field(name: &str) -> bool {
+    let last = name.rsplit(['.', '_']).next().unwrap_or(name);
+    CONTENT_FIELDS.contains(&name) || CONTENT_FIELDS.contains(&last)
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ContentGuard {
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+        let mut names = FieldNames(None);
+        event.record(&mut names);
+        if let Some(field) = names.0 {
+            CONTENT_VIOLATIONS.fetch_add(1, Ordering::SeqCst);
+            if cfg!(debug_assertions) {
+                eprintln!("gilde-code: a log event carried the content field `{field}` (contract §9.7)");
+            }
+        }
+    }
+}
+
+/// An argv in the only form a log line may carry (§9.7).
+pub fn redacted_argv(argv: &[String]) -> String {
+    crate::supervise::redact::redact_display(argv)
 }
 
 /// `GILDE_LOG` → `RUST_LOG` → `info`. An unparsable value falls back to `info`
@@ -160,6 +223,35 @@ fn panic_message(info: &PanicHookInfo<'_>) -> String {
 mod tests {
     use super::*;
     use rusty_fork::rusty_fork_test;
+
+    #[test]
+    fn content_field_names() {
+        assert!(is_content_field("prompt"));
+        assert!(is_content_field("first_prompt"));
+        assert!(is_content_field("argv"));
+        assert!(!is_content_field("spawn_id"));
+        assert!(!is_content_field("count"));
+        assert!(!is_content_field("detail_len"));
+        let line = redacted_argv(&["/x/claude".into(), "-p".into(), "secret plan".into()]);
+        assert!(!line.contains("secret plan"));
+    }
+
+    rusty_fork_test! {
+        #[test]
+        fn the_content_guard_counts_content_fields() {
+            let home = tempfile::tempdir().expect("tempdir");
+            let paths = AppPaths::for_home(home.path());
+            paths.ensure_all().expect("ensure_all");
+            unsafe { std::env::set_var(LOG_STDERR_ENV, "0") };
+            let guard = init_tracing(&paths).expect("init_tracing");
+            let before = content_violations();
+            tracing::info!(spawn_id = "x", count = 3, "fine");
+            assert_eq!(content_violations(), before);
+            tracing::info!(prompt = "do not log me", "bad");
+            assert_eq!(content_violations(), before + 1);
+            drop(guard);
+        }
+    }
 
     rusty_fork_test! {
         #[test]

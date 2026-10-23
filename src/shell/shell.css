@@ -1,0 +1,244 @@
+/*
+ * The two-zone shell (ux-ia §2.4, §2.8): sidebar + main, the top bar, the
+ * overlay drawer, toasts, the help sheet. Tokens only (styles/tokens.css);
+ * transitions ≤ 160 ms, opacity/transform only, none under reduced motion.
+ */
+
+.shell {
+  display: flex;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: var(--n0);
+  color: var(--n11);
+}
+
+.shell-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--n0);
+}
+
+/* -- top bar -------------------------------------------------------------- */
+.topbar {
+  flex: none;
+  height: var(--topbar-h);
+  display: flex;
+  align-items: center;
+  gap: var(--sp-6);
+  padding: 0 var(--sp-8);
+  border-bottom: 1px solid var(--border);
+  background: var(--n1);
+  min-width: 0;
+}
+
+.topbar-toggle {
+  padding: 0 var(--sp-6);
+}
+
+.topbar-count {
+  font-size: var(--fs-label);
+  font-weight: 600;
+  color: var(--warn);
+}
+
+.topbar-title {
+  min-width: 0;
+  padding: 0 var(--sp-4);
+  color: var(--n9);
+  font-size: var(--fs-sub);
+}
+
+.topbar-needs {
+  border-color: color-mix(in srgb, var(--warn) 45%, var(--border));
+  background: var(--n1);
+}
+
+.topbar-needs[data-zero='true'] {
+  border-color: var(--border);
+  color: var(--n9);
+}
+
+.topbar-needs-n {
+  font-weight: 600;
+  color: var(--warn);
+}
+
+.topbar-needs[data-zero='true'] .topbar-needs-n {
+  color: var(--n9);
+}
+
+.btn .kbd {
+  margin-left: var(--sp-2);
+}
+
+.btn.primary .kbd {
+  color: inherit;
+  background: transparent;
+  border-color: color-mix(in srgb, currentColor 35%, transparent);
+}
+
+/* -- main ----------------------------------------------------------------- */
+.shell-view {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  outline: none;
+}
+
+/* A sidebar session dragged over Main (T32): where it will go, never a blocker. */
+.shell-drop {
+  position: absolute;
+  inset: var(--sp-8);
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px dashed var(--n9);
+  border-radius: var(--r-md);
+  background: color-mix(in srgb, var(--n1) 72%, transparent);
+  pointer-events: none;
+}
+
+.shell-drop-label {
+  padding: var(--sp-6) var(--sp-12);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--n2);
+  color: var(--n12);
+  font-size: var(--fs-sub);
+  font-weight: 600;
+}
+
+.shell-notinbuild {
+  padding: var(--sp-32) var(--sp-24);
+  color: var(--n9);
+  font-size: var(--fs-body);
+}
+
+.shell-notinbuild p {
+  margin: 0;
+}
+
+/* -- overlay drawer (narrow windows; Split/Team/Floor below 1200 px) ------- */
+.shell-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+}
+
+.shell-scrim {
+  position: absolute;
+  inset: 0;
+  background: var(--scrim);
+}
+
+.shell-overlay .sidebar {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  max-width: 88%;
+  box-shadow: var(--shadow-popover);
+  animation: shell-slide-in var(--motion-base) var(--easing);
+}
+
+@keyframes shell-slide-in {
+  from {
+    transform: translateX(-16px);
+    opacity: 0;
+  }
+  to {
+    transform: none;
+    opacity: 1;
+  }
+}
+
+/* -- toasts --------------------------------------------------------------- */
+.toasts {
+  position: fixed;
+  right: var(--sp-16);
+  bottom: var(--sp-16);
+  z-index: 70;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-6);
+  width: min(400px, calc(100vw - 32px));
+}
+
+.toast {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-8);
+  padding: var(--sp-6) var(--sp-6) var(--sp-6) var(--sp-12);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--n2);
+  box-shadow: var(--shadow-popover);
+  font-size: var(--fs-sub);
+  color: var(--n11);
+  animation: g-fade-in var(--motion-fast) var(--easing);
+}
+
+.toast[data-level='error'] {
+  border-color: color-mix(in srgb, var(--error) 45%, var(--border));
+}
+
+.toast-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+/* -- keyboard help sheet -------------------------------------------------- */
+.help-groups {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: var(--sp-16) var(--sp-24);
+}
+
+.help-scope {
+  margin: 0 0 var(--sp-4);
+  font-size: var(--fs-label);
+  font-weight: 600;
+  color: var(--n8);
+}
+
+.help-list {
+  margin: 0;
+}
+
+.help-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-8);
+  min-height: 24px;
+  font-size: var(--fs-sub);
+}
+
+.help-row dt {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--n11);
+}
+
+.help-keys {
+  flex: none;
+  display: flex;
+  gap: var(--sp-4);
+  margin: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .shell-overlay .sidebar,
+  .toast {
+    animation: none;
+  }
+}

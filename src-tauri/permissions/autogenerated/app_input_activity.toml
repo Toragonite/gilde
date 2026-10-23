@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-app-input-activity"
+description = "Enables the app_input_activity command without any pre-configured scope."
+commands.allow = ["app_input_activity"]
+
+[[permission]]
+identifier = "deny-app-input-activity"
+description = "Denies the app_input_activity command without any pre-configured scope."
+commands.deny = ["app_input_activity"]

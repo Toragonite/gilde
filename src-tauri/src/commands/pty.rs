@@ -1,143 +1,99 @@
-//! `session_*` commands — the PTY lane's IPC surface (DESIGN §3, §6).
+//! `pty_*` commands (contract §4.2.4, §6.2.3, §6.2.6) — thin: validate (the
+//! `Req` envelope already did), resolve the PTY service, call it.
 //!
-//! Thin, like every command module: validate, call [`PtyManager`], hand back a
-//! small value. Two of them are unusual and deliberately so:
+//! * `pty_attach` takes the view's `Channel<PtyChunk>`; one view per PTY, the
+//!   previous one hears `Detached{otherView}`. Attach first, then snapshot.
+//! * `pty_snapshot` answers with **raw bytes** (`GLDP` header + ring).
+//! * `pty_write` takes base64, so pasted emoji and IME output reach the child
+//!   as the exact bytes the view produced.
+//! * `pty_paste` is the bracketed paste of §6.2.3, ungated by status.
 //!
-//! * `session_snapshot` returns [`tauri::ipc::Response`], i.e. **raw bytes**.
-//!   It is the one bulk transfer in the app; sending 2 MiB of scrollback as a
-//!   JSON number array would cost roughly 8 MiB of string and a full parse.
-//! * `session_write` takes base64 rather than a string. The frontend encodes
-//!   with `TextEncoder`, so a pasted emoji, a lone surrogate or an IME
-//!   composition reaches the child as the exact bytes the user produced.
-//!
-//! `session_close` returns a `KillReport` even when it did not have to kill
-//! anything: DESIGN §8-6 forbids reporting a bare "ok" for anything that ends a
-//! process.
+//! The service is resolved per call: an app without it answers
+//! `UNSUPPORTED{notBuilt}`, an unknown PTY `UNSUPPORTED{noPty}`.
 
 use std::sync::Arc;
 
 use base64::Engine as _;
 use tauri::ipc::{Channel, Response};
-use tauri::State;
 
-use crate::error::{GildeError, GildeErrorPayload, CmdResult};
-use crate::model::status::SessionStatusReport;
-use crate::pty::{
-    CloseMode, OpenSessionReq, PtyChunk, PtyManager, PtySessionInfo, PtySignal, SendPromptOutcome,
+use crate::commands::app::state_of;
+use crate::contract::content::PtyChunk;
+use crate::contract::ipc::{
+    PtyAttachReq, PtyDetachReq, PtyDetachRes, PtyInfo, PtyPasteReq, PtyPasteRes, PtyResizeReq,
+    PtyResizeRes, PtySnapshotReq, PtyWriteReq, PtyWriteRes,
 };
-use crate::supervise::kill::KillReport;
+use crate::contract::services::PtyApi;
+use crate::contract::{IpcError, Req};
+use crate::pty::PtyManager;
 
-/// Managed state alias so later tasks ask for the same thing.
+/// Managed state: the PTY manager.
 pub type PtyState = Arc<PtyManager>;
 
-/// Open a pty, start the agent in it, and stream its bytes to `on_chunk`.
+/// `pty_attach` (+ `Channel<PtyChunk>`).
 #[tauri::command]
-pub async fn session_open(
-    req: OpenSessionReq,
-    on_chunk: Channel<PtyChunk>,
-    pty: State<'_, PtyState>,
-) -> CmdResult<PtySessionInfo> {
-    Ok(pty.open_request(req, on_chunk).await?)
+pub async fn pty_attach<R: tauri::Runtime>(
+    req: Req<PtyAttachReq>,
+    channel: Channel<PtyChunk>,
+    app: tauri::AppHandle<R>,
+) -> Result<PtyInfo, IpcError> {
+    let req = req.into_inner();
+    let pty: PtyState = state_of(&app)?;
+    pty.attach(&req.pty_id, req.view_id, Arc::new(channel))
 }
 
-/// Point a session at a freshly mounted view's channel.
-///
-/// Step **one** of the remount sequence (DESIGN §6-3): attach, *then* snapshot.
-/// The other order loses whatever arrives in between.
+/// `pty_snapshot`: raw bytes.
 #[tauri::command]
-pub async fn session_attach(
-    id: String,
-    on_chunk: Channel<PtyChunk>,
-    pty: State<'_, PtyState>,
-) -> CmdResult<()> {
-    Ok(pty.attach(&id, on_chunk)?)
+pub async fn pty_snapshot<R: tauri::Runtime>(
+    req: Req<PtySnapshotReq>,
+    app: tauri::AppHandle<R>,
+) -> Result<Response, IpcError> {
+    let pty: PtyState = state_of(&app)?;
+    Ok(Response::new(pty.snapshot(&req.pty_id)?))
 }
 
-/// 16-byte header (`GLDP`, version, `next_seq`) followed by the raw ring bytes.
+/// `pty_write`: ≤ 1 MiB decoded (validated by the envelope).
 #[tauri::command]
-pub async fn session_snapshot(id: String, pty: State<'_, PtyState>) -> CmdResult<Response> {
-    Ok(Response::new(pty.snapshot(&id)?))
-}
-
-/// Write base64-encoded bytes to the child's tty.
-#[tauri::command]
-pub async fn session_write(
-    id: String,
-    b64: String,
-    pty: State<'_, PtyState>,
-) -> CmdResult<()> {
+pub async fn pty_write<R: tauri::Runtime>(
+    req: Req<PtyWriteReq>,
+    app: tauri::AppHandle<R>,
+) -> Result<PtyWriteRes, IpcError> {
+    let pty: PtyState = state_of(&app)?;
     let bytes = base64::engine::general_purpose::STANDARD
-        .decode(b64.as_bytes())
-        .map_err(|e| GildeErrorPayload::from(GildeError::pty(format!("not base64: {e}"))))?;
-    Ok(pty.write(&id, &bytes)?)
+        .decode(req.b64.as_bytes())
+        .map_err(|_| IpcError::invalid_argument("b64", "pattern"))?;
+    pty.write(&req.pty_id, &bytes).await?;
+    Ok(PtyWriteRes {})
 }
 
-/// `TIOCSWINSZ`; the kernel delivers `SIGWINCH` to the foreground group.
+/// `pty_paste`: bracketed paste, then CR iff `submit`.
 #[tauri::command]
-pub async fn session_resize(
-    id: String,
-    cols: u16,
-    rows: u16,
-    pty: State<'_, PtyState>,
-) -> CmdResult<()> {
-    Ok(pty.resize(&id, cols, rows)?)
+pub async fn pty_paste<R: tauri::Runtime>(
+    req: Req<PtyPasteReq>,
+    app: tauri::AppHandle<R>,
+) -> Result<PtyPasteRes, IpcError> {
+    let pty: PtyState = state_of(&app)?;
+    pty.paste(&req.pty_id, &req.text, req.submit).await?;
+    Ok(PtyPasteRes {})
 }
 
-/// Signal the pty's **foreground** process group — what `^C` does in a real
-/// terminal, and therefore what reaches the pager rather than the agent when a
-/// pager is up.
+/// `pty_resize`: clamped, never rejected; a no-op size is ignored.
 #[tauri::command]
-pub async fn session_signal(
-    id: String,
-    sig: PtySignal,
-    pty: State<'_, PtyState>,
-) -> CmdResult<()> {
-    Ok(pty.signal(&id, sig)?)
+pub async fn pty_resize<R: tauri::Runtime>(
+    req: Req<PtyResizeReq>,
+    app: tauri::AppHandle<R>,
+) -> Result<PtyResizeRes, IpcError> {
+    let pty: PtyState = state_of(&app)?;
+    pty.resize(&req.pty_id, req.cols, req.rows).await?;
+    Ok(PtyResizeRes {})
 }
 
-/// Type a prompt into a live TUI. Gated on an idle session (DESIGN §6-5).
+/// `pty_detach`: idempotent.
 #[tauri::command]
-pub async fn session_send_prompt(
-    id: String,
-    text: String,
-    pty: State<'_, PtyState>,
-) -> CmdResult<SendPromptOutcome> {
-    Ok(pty.send_prompt(&id, &text)?)
-}
-
-/// End a session. Always answers with what it did, what it spared and what
-/// survived.
-#[tauri::command]
-pub async fn session_close(
-    id: String,
-    mode: CloseMode,
-    pty: State<'_, PtyState>,
-) -> CmdResult<KillReport> {
-    Ok(pty.close(&id, mode).await?)
-}
-
-/// Every session this app still owns, oldest first.
-///
-/// M1.5-6: the first call also adopts the `pty_session` rows a crashed host left
-/// behind (their ptys died with it), so a SIGKILL no longer makes interactive
-/// sessions disappear without a trace. An adopted row comes back with `pid == 0`
-/// and answers `session_status` with `exited`; `session_close` dismisses it.
-/// The adoption is idempotent, so every later call is a plain read.
-#[tauri::command]
-pub async fn session_list(pty: State<'_, PtyState>) -> CmdResult<Vec<PtySessionInfo>> {
-    pty.adopt_crashed_sessions().await;
-    Ok(pty.list())
-}
-
-/// The current status and the evidence behind it.
-///
-/// T15 answers from output dynamics alone; T16 replaces the tracker behind this
-/// command with the three-source engine of DESIGN §6-4 without changing the
-/// shape returned here.
-#[tauri::command]
-pub async fn session_status(
-    id: String,
-    pty: State<'_, PtyState>,
-) -> CmdResult<SessionStatusReport> {
-    Ok(pty.status(&id)?)
+pub async fn pty_detach<R: tauri::Runtime>(
+    req: Req<PtyDetachReq>,
+    app: tauri::AppHandle<R>,
+) -> Result<PtyDetachRes, IpcError> {
+    let pty: PtyState = state_of(&app)?;
+    pty.detach(&req.pty_id, &req.view_id);
+    Ok(PtyDetachRes {})
 }

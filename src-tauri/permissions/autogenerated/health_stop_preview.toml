@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-health-stop-preview"
+description = "Enables the health_stop_preview command without any pre-configured scope."
+commands.allow = ["health_stop_preview"]
+
+[[permission]]
+identifier = "deny-health-stop-preview"
+description = "Denies the health_stop_preview command without any pre-configured scope."
+commands.deny = ["health_stop_preview"]

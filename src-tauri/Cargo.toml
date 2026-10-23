@@ -1,6 +1,6 @@
 [package]
 name = "gilde-code"
-version = "0.1.0"
+version = "0.2.0"
 description = "Desktop orchestrator for coding agent CLIs"
 authors = ["Toragonite"]
 license = "Apache-2.0"
@@ -8,11 +8,14 @@ edition = "2021"
 # The highest `rust-version` any shipped dependency declares (sysinfo 0.39).
 # Builds are verified on the stable toolchain; see BUILDING.md.
 rust-version = "1.95"
-# `fake_agent` is a second [[bin]]; without this, `cargo run` (and therefore
+# There are several [[bin]]s; without this, `cargo run` (and therefore
 # `npm run tauri dev`) cannot decide which binary to launch.
 default-run = "gilde"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+# Dependency manifest of record (Gilde 2 contract §15.2 T01, F-17). Every
+# dependency is pinned to an exact version (`=x.y.z`, matching Cargo.lock).
+# After wave 0 this file is frozen (H4): an additional dependency is an
+# append-only contract change made by the lead, never by a task.
 
 [lib]
 # The `_lib` suffix may seem redundant but it is necessary
@@ -28,17 +31,28 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 name = "gilde"
 path = "src/main.rs"
 
-# Test fixture binary (T06). `cargo test` builds it and exposes its path to
-# integration tests as CARGO_BIN_EXE_fake_agent. It is a deterministic stand-in
-# for a real agent CLI: see tests/fixtures/fake_agent/main.rs.
+# The `gilde-tmux` shim (contract §7.4.2, T07). Ships as
+# `Contents/MacOS/gilde-tmux`; it includes only `src/panehost/proto.rs` by path
+# and never links `gilde_code_lib`.
+[[bin]]
+name = "gilde-tmux"
+path = "src/bin/gilde-tmux.rs"
+test = false
+bench = false
+doc = false
+
+# Test fixture binaries. `cargo test` builds them and exposes their paths to
+# integration tests as CARGO_BIN_EXE_<name>.
 #
-# It must never ship. cargo-tauri copies every `[[bin]]` of this package into
+# They must never ship. cargo-tauri copies every `[[bin]]` of this package into
 # `Contents/MacOS/` *unless* the bin's `required-features` are missing from the
 # feature list `tauri build` was given — and that list never contains Cargo's
 # default features (only `--features` plus `tauri/custom-protocol`). So the
-# fixture sits behind `test-fixtures`, which is a default feature: plain
-# `cargo test` / `cargo build` still build it, the release bundle leaves it out.
-# BUILDING.md's proof run checks `Contents/MacOS/` for exactly this.
+# fixtures sit behind `test-fixtures`, which is a default feature: plain
+# `cargo test` / `cargo build` still build them, the release bundle leaves them
+# out. BUILDING.md's proof run checks `Contents/MacOS/` for exactly this.
+
+# T06: deterministic stand-in for an agent CLI TUI (tests/fixtures/fake_agent/).
 [[bin]]
 name = "fake_agent"
 path = "tests/fixtures/fake_agent/main.rs"
@@ -47,48 +61,103 @@ test = false
 bench = false
 doc = false
 
+# T05: scenario-driven stream-json peer (contract §14.1).
+[[bin]]
+name = "fake_claude"
+path = "tests/fixtures/fake_claude/main.rs"
+required-features = ["test-fixtures"]
+test = false
+bench = false
+doc = false
+
+# T07: records its argv and env and exits with a configured code (§14.1).
+[[bin]]
+name = "fake_real_tmux"
+path = "tests/fixtures/fake_real_tmux/main.rs"
+required-features = ["test-fixtures"]
+test = false
+bench = false
+doc = false
+
 [features]
 default = ["test-fixtures"]
-# Builds the `fake_agent` test fixture (above). No code and no dependencies.
+# Builds the fixture binaries (above). No code and no dependencies.
 test-fixtures = []
+# Turns the ts-rs `export_bindings_*` tests on (scripts/gen-ipc.mjs runs them).
+ts-export = []
+# The showcase backend and the fake team adapter outside `cfg(test)` (T19, T02).
+showcase = []
+# The shim appends argv + exit code to `GILDE_TMUX_LOG` (LP-10 only; never release).
+probe-log = []
+# The conditional Agent-SDK bridge transport (`convo/l2.rs`, T20, §6.1.10).
+l2 = []
+# The core wakeup counter for the T-wakeups gate (§11.1).
+wakeup-count = []
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+tauri-build = { version = "=2.6.3", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
-tauri-plugin-opener = "2"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tauri-plugin-dialog = "2.7.3"
-# 2.4 is the last line that builds on tauri 2.11 (2.5+ needs tauri ^2.12);
-# keep it in step with `@tauri-apps/plugin-notification` in package.json.
-tauri-plugin-notification = "2.4.0"
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time", "fs", "signal"] }
-thiserror = "2.0.20"
-anyhow = "1.0.104"
-rusqlite = { version = "0.40.2", features = ["bundled", "functions"] }
-portable-pty = "0.9.0"
-sysinfo = "0.39.6"
-libproc = "0.14.11"
-libc = "0.2.189"
-nix = { version = "0.31.3", features = ["signal", "process", "term"] }
-notify = "8.2.0"
-notify-debouncer-full = "0.7.0"
-which = "8.0.6"
-regex = "1.13.1"
-base64 = "0.23.1"
-sha2 = "0.11.0"
-hex = "0.4.3"
-vte = "0.15.0"
-parking_lot = "0.12.5"
-dashmap = "6.2.1"
-shell-words = "1.1.1"
-tempfile = "3.27.0"
-uuid = { version = "1.26.0", features = ["v4", "v5", "v7", "serde"] }
-tracing = "0.1.44"
-tracing-appender = "0.2.5"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+tauri = { version = "=2.11.5", features = [] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+# Rust API only (folder pickers, native confirmations); no JS permission is granted (§9.2).
+tauri-plugin-dialog = "=2.7.3"
+# Rust API only, the LP-28 fallback (§8.4). 2.4 is the last line that builds on
+# tauri 2.11 (2.5+ needs tauri ^2.12).
+tauri-plugin-notification = "=2.4.0"
+tokio = { version = "=1.53.1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time", "fs", "signal"] }
+thiserror = "=2.0.20"
+anyhow = "=1.0.104"
+rusqlite = { version = "=0.40.2", features = ["bundled", "functions"] }
+portable-pty = "=0.9.0"
+sysinfo = "=0.39.6"
+libproc = "=0.14.11"
+libc = "=0.2.189"
+# `event` = kqueue EVFILT_PROC (§5.9), `socket` = the PaneHost socket and
+# LOCAL_PEERPID (§4.6), `user` = getpeereid/uid checks.
+nix = { version = "=0.31.3", features = ["signal", "process", "term", "socket", "user", "event"] }
+notify = "=8.2.0"
+notify-debouncer-full = "=0.7.0"
+which = "=8.0.6"
+regex = "=1.13.1"
+base64 = "=0.23.1"
+sha2 = "=0.11.0"
+hex = "=0.4.3"
+vte = "=0.15.0"
+parking_lot = "=0.12.5"
+dashmap = "=6.2.1"
+shell-words = "=1.1.1"
+tempfile = "=3.27.0"
+uuid = { version = "=1.26.0", features = ["v4", "v5", "v7", "serde"] }
+tracing = "=0.1.44"
+tracing-appender = "=0.2.5"
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "json"] }
+# -- added by the Gilde 2 contract (§15.2 T01 row, N-08) ----------------------
+# TypeScript generation from the contract types (§3.1, C1).
+ts-rs = { version = "=12.0.1", features = ["serde-json-impl", "no-serde-warnings"] }
+async-trait = "=0.1.92"
+# Zeroing read buffers of files that mix metadata and secrets (§9.7).
+zeroize = "=1.9.1"
+# macOS integration (§8.3–§8.4, §9.4–§9.5): NSWorkspace, NSRunningApplication,
+# dock, UNUserNotificationCenter.
+objc2 = "=0.6.4"
+objc2-foundation = "=0.3.2"
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "NSApplication", "NSRunningApplication", "NSWorkspace", "NSDockTile", "NSResponder", "NSWindow", "NSView", "NSMenu", "NSMenuItem", "NSSound", "NSImage", "NSAlert", "NSGraphics"] }
+objc2-user-notifications = { version = "=0.3.2", default-features = false, features = ["std", "block2", "bitflags", "NSString_UserNotifications", "UNError", "UNNotification", "UNNotificationContent", "UNNotificationRequest", "UNNotificationResponse", "UNNotificationSettings", "UNNotificationSound", "UNNotificationTrigger", "UNUserNotificationCenter"] }
+# Objective-C blocks for UNUserNotificationCenter completion handlers (contract A16.6;
+# already in the lock through objc2-user-notifications, now a direct dependency).
+block2 = "=0.6.2"
+# Display text: grapheme-safe truncation, East Asian width, NFC (§3.1 rule 6, §13.3).
+unicode-segmentation = "=1.13.3"
+unicode-width = "=0.2.2"
+unicode-normalization = "=0.1.26"
+# cursor chat dirs are `md5(cwd)` (§5.4).
+md-5 = "=0.11.0"
+memchr = "=2.8.3"
+url = "=2.5.8"
+# The multi-literal static canary scan (§3.10 input 2); shape regexes use `regex`.
+aho-corasick = "=1.1.5"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
@@ -99,5 +168,9 @@ opt-level = 3
 strip = true
 
 [dev-dependencies]
-rusty-fork = "0.3.1"
-serial_test = "4.0.1"
+rusty-fork = "=0.3.1"
+serial_test = "=4.0.1"
+# Property-based IPC fuzzing (T-ipc-2) and sanitizer properties.
+proptest = "=1.12.0"
+# The mock runtime for the IPC contract tests (T-ipc-1, T-contract-*).
+tauri = { version = "=2.11.5", features = ["test"] }

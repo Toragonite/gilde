@@ -1,82 +1,79 @@
 /**
- * The terminal pool — module-level, LRU, capped at eight (DESIGN §6-7, §9-4).
+ * The terminal pool — module-level, LRU, capped at eight (contract §6.2.6).
  *
- * A `Terminal` outlives the React component that shows it. Switching tabs,
- * changing the split or moving a tab to another pane detaches a DOM node and
- * re-attaches it; it never rebuilds the terminal, because rebuilding means
- * losing the scrollback the user was reading. **Only `session_close` disposes**
- * (`disposeTerminal`).
+ * A `Terminal` outlives the React component that shows it: switching sub-views
+ * or moving a session into a tile detaches its DOM node and re-attaches it,
+ * never rebuilding the terminal (that would lose the scrollback the user was
+ * reading). Only eviction (more than eight held, the oldest off screen) or
+ * the session's end disposes it.
  *
- * The pool also owns the wire accounting, and that is the point of this file:
+ * The pool also owns the byte accounting:
+ *  - `PtyChunk.offset` is the ring offset of the chunk's first byte; the
+ *    snapshot header's `nextSeq` is the total the PTY has produced.
+ *  - "Drop what we already have" is `end <= nextSeq`; a chunk that straddles
+ *    the boundary is written from `nextSeq` on rather than dropped whole. The
+ *    same arithmetic makes a resync snapshot write only the missing tail.
+ *  - Attach first, then snapshot (§6.2.6): chunks that arrive in between are
+ *    buffered and de-duplicated by offset once the snapshot lands.
  *
- *  - `PtyChunk.seq` is a **byte offset**, not a frame counter — it is where the
- *    chunk's first byte sits in the session's byte stream. `next_seq` in the
- *    snapshot header is the total number of bytes the session has produced.
- *  - So "drop what we already have" is `chunk.end <= nextSeq`, and a chunk that
- *    straddles the boundary is written from `nextSeq` on rather than dropped
- *    whole. The same arithmetic makes a resync snapshot write only the missing
- *    tail instead of repainting two megabytes.
- *
- * Bytes never enter React state: a chunk is decoded once and handed straight to
- * `term.write(Uint8Array)` (DESIGN §9-3 rule 1).
+ * Bytes never enter React state.
  */
 
-import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
-import { WebLinksAddon } from '@xterm/addon-web-links';
 import { WebglAddon } from '@xterm/addon-webgl';
+import { Terminal } from '@xterm/xterm';
 
 import { b64ToBytes } from '../lib/codec';
-import type { PtyChunk, SessionId, TerminalConfig } from '../lib/ipc';
+import type { PtyId } from '../lib/gen/PtyId';
 import { readTerminalTheme, terminalOptions, watchTerminalTheme } from './terminalTheme';
 
-/** DESIGN §6-7: eight live terminals is the cap. */
 export const POOL_LIMIT = 8;
 
+/** A data chunk as the pool consumes it. */
+export interface DataChunk {
+  offset: number;
+  b64: string;
+}
+
 export interface PooledTerminal {
-  sessionId: SessionId;
-  term: Terminal;
-  fit: FitAddon;
-  /**
-   * The terminal's own parent. It is moved between hosts, never re-opened —
-   * `Terminal.open()` on a second parent is not a supported way to keep state.
-   */
+  ptyId: PtyId;
+  term: Pick<Terminal, 'write' | 'dispose' | 'open' | 'focus' | 'loadAddon' | 'onData' | 'onBinary' | 'cols' | 'rows' | 'options'>;
+  fit: Pick<FitAddon, 'fit'>;
   container: HTMLDivElement;
   webgl: WebglAddon | null;
   opened: boolean;
   mounted: boolean;
-  /** A channel is attached in Rust and feeding this terminal. */
+  /** A channel is attached in the core and feeding this terminal. */
   attached: boolean;
-  /** The session ended: never re-attach, and dispose as soon as it is hidden. */
-  closed: boolean;
-  /** Total bytes applied to this terminal, in session stream coordinates. */
+  /** Another view took the PTY (`Detached{otherView}`): the view offers "Show here". */
+  detached: boolean;
+  /** Total bytes applied, in PTY stream coordinates. */
   nextSeq: number;
   /** Chunks that arrived before the first snapshot landed. */
-  pending: PtyChunk[];
-  /** True until the first snapshot has been applied after an attach. */
+  pending: DataChunk[];
   buffering: boolean;
-  /** The `(cols, rows)` last sent to `session_resize`. */
   lastSize: { cols: number; rows: number } | null;
   lastUsed: number;
   disposers: (() => void)[];
+  /** Listeners for `detached` changes (the view re-renders). */
+  listeners: Set<() => void>;
 }
 
-const pool = new Map<SessionId, PooledTerminal>();
-let clock = 0;
+const pool = new Map<PtyId, PooledTerminal>();
+let useCounter = 0;
 let themeWatcher: (() => void) | null = null;
 
 // ---------------------------------------------------------------------------
-// Snapshot wire format (DESIGN §6-3)
+// Snapshot wire format (`GLDP` header + ring)
 // ---------------------------------------------------------------------------
 
 export const SNAPSHOT_HEADER_LEN = 16;
-/** The four tag bytes `GLDP` that open every snapshot. */
 export const SNAPSHOT_TAG = [0x47, 0x4c, 0x44, 0x50] as const;
 export const SNAPSHOT_VERSION = 1;
 
 export interface SnapshotHeader {
   version: number;
-  /** Total bytes the session has produced; the byte after the ring's last. */
+  /** Total bytes the PTY has produced; the offset after the ring's last byte. */
   nextSeq: number;
 }
 
@@ -87,31 +84,17 @@ export function readSnapshotHeader(bytes: Uint8Array): SnapshotHeader {
     if (bytes[i] !== SNAPSHOT_TAG[i]) throw new Error('pty snapshot: bad tag bytes');
   }
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  return {
-    version: bytes[4],
-    // Little-endian u64 at offset 8. A session would have to emit 9 PB before
-    // this loses precision as a JS number.
-    nextSeq: Number(view.getBigUint64(8, true)),
-  };
+  return { version: bytes[4] as number, nextSeq: Number(view.getBigUint64(8, true)) };
 }
 
 export interface WriteSlice {
-  /** Index into the incoming bytes to start writing at. */
   from: number;
-  /** The `nextSeq` to record once the write happened. */
   nextSeq: number;
   /** Bytes were missed between what we had and what arrived. */
   gap: boolean;
 }
 
-/**
- * How much of an incoming run of bytes is new.
- *
- * `start` is the stream offset of the run's first byte. Returns `null` when the
- * run is entirely old — the "`seq < nextSeq` ⇒ drop" rule of DESIGN §6-3,
- * refined so a chunk that begins before `nextSeq` and ends after it keeps its
- * tail instead of being dropped whole.
- */
+/** How much of an incoming run of bytes is new (`null` = all old). */
 export function writeSlice(nextSeq: number, start: number, length: number): WriteSlice | null {
   const end = start + length;
   if (end <= nextSeq) return null;
@@ -119,43 +102,42 @@ export function writeSlice(nextSeq: number, start: number, length: number): Writ
   return { from: nextSeq - start, nextSeq: end, gap: false };
 }
 
-// ---------------------------------------------------------------------------
-// Applying bytes
-// ---------------------------------------------------------------------------
-
-/** Write a chunk into the terminal, or drop it if the view already has it. */
-export function applyChunk(entry: PooledTerminal, chunk: PtyChunk): void {
+/** Write a chunk, or drop it if the view already has it. */
+export function applyChunk(entry: PooledTerminal, chunk: DataChunk): void {
   if (entry.buffering) {
     entry.pending.push(chunk);
     return;
   }
   const bytes = b64ToBytes(chunk.b64);
-  const slice = writeSlice(entry.nextSeq, chunk.seq, bytes.length);
+  const slice = writeSlice(entry.nextSeq, chunk.offset, bytes.length);
   if (!slice) return;
   entry.term.write(slice.from > 0 ? bytes.subarray(slice.from) : bytes);
   entry.nextSeq = slice.nextSeq;
 }
 
-export interface SnapshotResult {
-  /** Bytes actually written to the terminal. */
-  written: number;
-  /** The session's total byte count as of the snapshot. */
-  nextSeq: number;
-  /** The ring was empty although the session has produced bytes. */
-  scrollbackLost: boolean;
+function drain(entry: PooledTerminal): void {
+  entry.buffering = false;
+  const pending = entry.pending;
+  entry.pending = [];
+  for (const chunk of pending) applyChunk(entry, chunk);
 }
 
 /**
- * Apply a `session_snapshot` buffer: header, then only the part of the ring the
- * view has not already seen. A first mount (`nextSeq === 0`) writes the whole
- * ring; a resync writes just the tail after the hole.
+ * Apply a `pty_snapshot` buffer: only the part of the ring the view has not
+ * seen, then whatever arrived while it was in flight. A buffer without the
+ * header is not a snapshot: it is ignored and the live chunks carry on.
  */
-export function applySnapshot(entry: PooledTerminal, buffer: ArrayBuffer): SnapshotResult {
+export function applySnapshot(entry: PooledTerminal, buffer: ArrayBuffer): { written: number; valid: boolean } {
   const bytes = new Uint8Array(buffer);
-  const header = readSnapshotHeader(bytes);
+  let header: SnapshotHeader;
+  try {
+    header = readSnapshotHeader(bytes);
+  } catch {
+    drain(entry);
+    return { written: 0, valid: false };
+  }
   const body = bytes.subarray(SNAPSHOT_HEADER_LEN);
   const start = header.nextSeq - body.length;
-
   let written = 0;
   const slice = writeSlice(entry.nextSeq, start, body.length);
   if (slice) {
@@ -166,19 +148,8 @@ export function applySnapshot(entry: PooledTerminal, buffer: ArrayBuffer): Snaps
   } else if (header.nextSeq > entry.nextSeq) {
     entry.nextSeq = header.nextSeq;
   }
-
-  // Drain whatever arrived while the snapshot was in flight; the byte
-  // arithmetic above and in `applyChunk` is what makes this free of duplicates.
-  entry.buffering = false;
-  const pending = entry.pending;
-  entry.pending = [];
-  for (const chunk of pending) applyChunk(entry, chunk);
-
-  return {
-    written,
-    nextSeq: header.nextSeq,
-    scrollbackLost: body.length === 0 && header.nextSeq > 0,
-  };
+  drain(entry);
+  return { written, valid: true };
 }
 
 /** Start buffering again: the next snapshot decides what is new. */
@@ -187,49 +158,50 @@ export function beginAttach(entry: PooledTerminal): void {
   entry.pending = [];
 }
 
+/** The snapshot failed: stop buffering so the live chunks are not held forever. */
+export function endAttachWithoutSnapshot(entry: PooledTerminal): void {
+  drain(entry);
+}
+
+export function setDetached(entry: PooledTerminal, detached: boolean): void {
+  if (entry.detached === detached) return;
+  entry.detached = detached;
+  if (detached) entry.attached = false;
+  for (const fn of [...entry.listeners]) fn();
+}
+
 // ---------------------------------------------------------------------------
 // Pool
 // ---------------------------------------------------------------------------
 
-/**
- * How a terminal is built. Swapped by the unit test to exercise the LRU without
- * a DOM (the same seam `graphSlice` uses for `graph_snapshot()`); production
- * never calls the setter.
- */
 export interface TerminalParts {
-  term: Terminal;
-  fit: FitAddon;
+  term: PooledTerminal['term'];
+  fit: PooledTerminal['fit'];
   container: HTMLDivElement;
 }
 
-export type TerminalFactory = (config: TerminalConfig) => TerminalParts;
+export type TerminalFactory = () => TerminalParts;
 
-const defaultFactory: TerminalFactory = (config) => {
-  const term = new Terminal(terminalOptions(config));
+const defaultFactory: TerminalFactory = () => {
+  const term = new Terminal(terminalOptions());
   const fit = new FitAddon();
   term.loadAddon(fit);
-  term.loadAddon(new WebLinksAddon());
-
   const container = document.createElement('div');
-  container.className = 'term-surface';
+  container.className = 'g-term-surface';
   return { term, fit, container };
 };
 
 let factory: TerminalFactory = defaultFactory;
 
-export function setTerminalFactory(next: TerminalFactory): void {
-  factory = next;
+/** Tests: build terminals without xterm's renderer (`null` restores xterm). */
+export function setTerminalFactory(next: TerminalFactory | null): void {
+  factory = next ?? defaultFactory;
 }
 
-export function resetTerminalFactory(): void {
-  factory = defaultFactory;
-}
-
-function makeEntry(sessionId: SessionId, config: TerminalConfig): PooledTerminal {
-  const { term, fit, container } = factory(config);
-
+function makeEntry(ptyId: PtyId): PooledTerminal {
+  const { term, fit, container } = factory();
   return {
-    sessionId,
+    ptyId,
     term,
     fit,
     container,
@@ -237,38 +209,34 @@ function makeEntry(sessionId: SessionId, config: TerminalConfig): PooledTerminal
     opened: false,
     mounted: false,
     attached: false,
-    closed: false,
+    detached: false,
     nextSeq: 0,
     pending: [],
     buffering: true,
     lastSize: null,
-    lastUsed: ++clock,
+    lastUsed: ++useCounter,
     disposers: [],
+    listeners: new Set(),
   };
 }
 
 /**
- * WebGL, guarded (DESIGN §9-4). WKWebView drops the GL context under memory
- * pressure and an unguarded WebGL renderer paints an empty terminal at the
- * worst possible moment, so a context loss disposes the addon and falls back to
- * the DOM renderer.
+ * WebGL, guarded: WKWebView drops the GL context under memory pressure, so a
+ * context loss disposes the addon and falls back to the DOM renderer.
  */
 function enableWebgl(entry: PooledTerminal): void {
-  if (entry.webgl) return;
+  if (entry.webgl || factory !== defaultFactory) return;
   try {
     const addon = new WebglAddon();
     const off = addon.onContextLoss(() => {
       addon.dispose();
       entry.webgl = null;
-      console.warn('[gilde] webgl context lost; falling back to the dom renderer');
     });
     entry.term.loadAddon(addon);
     entry.webgl = addon;
     entry.disposers.push(() => off.dispose());
-  } catch (e) {
-    // No WebGL in this webview: the DOM renderer is the fallback, not an error.
+  } catch {
     entry.webgl = null;
-    console.warn('[gilde] webgl renderer unavailable', e);
   }
 }
 
@@ -279,78 +247,53 @@ function evict(): void {
       if (entry.mounted) continue;
       if (!victim || entry.lastUsed < victim.lastUsed) victim = entry;
     }
-    // Every survivor is on screen — the cap yields rather than blanking a pane.
     if (!victim) return;
-    disposeTerminal(victim.sessionId);
+    disposeTerminal(victim.ptyId);
   }
 }
 
-/** The pooled terminal for a session, created on first use. */
-export function acquireTerminal(sessionId: SessionId, config: TerminalConfig): PooledTerminal {
-  let entry = pool.get(sessionId);
+export function acquireTerminal(ptyId: PtyId): PooledTerminal {
+  let entry = pool.get(ptyId);
   if (!entry) {
-    entry = makeEntry(sessionId, config);
-    pool.set(sessionId, entry);
+    entry = makeEntry(ptyId);
+    pool.set(ptyId, entry);
   }
-  entry.lastUsed = ++clock;
+  entry.lastUsed = ++useCounter;
   entry.mounted = true;
-
-  if (!themeWatcher) themeWatcher = watchTerminalTheme(retheme);
+  if (!themeWatcher && factory === defaultFactory) themeWatcher = watchTerminalTheme(retheme);
   evict();
   return entry;
 }
 
-/**
- * Mount the pooled terminal into a host element. Safe to call on every remount:
- * the terminal is opened exactly once, in its own container, and afterwards the
- * container is simply moved.
- */
-export function mountTerminal(entry: PooledTerminal, host: HTMLElement, webgl: boolean): void {
+/** Mount into a host element; the terminal is opened once and moved afterwards. */
+export function mountTerminal(entry: PooledTerminal, host: HTMLElement): void {
   host.appendChild(entry.container);
   if (!entry.opened) {
     entry.term.open(entry.container);
     entry.opened = true;
-    if (webgl) enableWebgl(entry);
+    enableWebgl(entry);
   }
 }
 
-/** Detach from the host but keep the terminal, its scrollback and its channel. */
-export function releaseTerminal(sessionId: SessionId): void {
-  const entry = pool.get(sessionId);
+/** Detach from the host but keep the terminal and its channel. */
+export function releaseTerminal(ptyId: PtyId): void {
+  const entry = pool.get(ptyId);
   if (!entry) return;
   entry.mounted = false;
-  entry.lastUsed = ++clock;
+  entry.lastUsed = ++useCounter;
   entry.container.remove();
-  if (entry.closed) {
-    disposeTerminal(sessionId);
-    return;
-  }
   evict();
 }
 
-/**
- * The session is over (`session_close`). The terminal is disposed as soon as
- * nobody is looking at it — while a pane still shows it, the last screen the
- * agent painted stays readable, which is the whole reason a user stops a
- * session and then reads what it said.
- */
-export function closeTerminal(sessionId: SessionId): void {
-  const entry = pool.get(sessionId);
+export function disposeTerminal(ptyId: PtyId): void {
+  const entry = pool.get(ptyId);
   if (!entry) return;
-  entry.closed = true;
-  if (!entry.mounted) disposeTerminal(sessionId);
-}
-
-/** The one thing that ends a terminal: `session_close` (DESIGN §6-7). */
-export function disposeTerminal(sessionId: SessionId): void {
-  const entry = pool.get(sessionId);
-  if (!entry) return;
-  pool.delete(sessionId);
+  pool.delete(ptyId);
   for (const dispose of entry.disposers) {
     try {
       dispose();
     } catch {
-      /* a disposed addon is not an error */
+      /* already disposed */
     }
   }
   entry.webgl?.dispose();
@@ -362,35 +305,20 @@ export function disposeTerminal(sessionId: SessionId): void {
   }
 }
 
-/** Repaint every live terminal after a theme change. */
 export function retheme(): void {
   const theme = readTerminalTheme();
   for (const entry of pool.values()) entry.term.options.theme = theme;
 }
 
-/** Apply changed terminal settings to every live terminal. */
-export function applyTerminalConfig(config: TerminalConfig): void {
-  const options = terminalOptions(config);
-  for (const entry of pool.values()) {
-    entry.term.options.fontFamily = options.fontFamily;
-    entry.term.options.fontSize = options.fontSize;
-    entry.term.options.theme = options.theme;
-    if (!config.webgl && entry.webgl) {
-      entry.webgl.dispose();
-      entry.webgl = null;
-    }
-  }
+export function pooledTerminal(ptyId: PtyId): PooledTerminal | undefined {
+  return pool.get(ptyId);
 }
 
-/** Sessions currently held, most recently used last. Diagnostics and tests. */
-export function pooledSessionIds(): SessionId[] {
-  return [...pool.values()].sort((a, b) => a.lastUsed - b.lastUsed).map((e) => e.sessionId);
+export function pooledPtyIds(): PtyId[] {
+  return [...pool.values()].sort((a, b) => a.lastUsed - b.lastUsed).map((e) => e.ptyId);
 }
 
-export function pooledTerminal(sessionId: SessionId): PooledTerminal | undefined {
-  return pool.get(sessionId);
-}
-
-export function terminalPoolSize(): number {
-  return pool.size;
+/** Tests only. */
+export function resetPoolForTests(): void {
+  for (const id of [...pool.keys()]) disposeTerminal(id);
 }

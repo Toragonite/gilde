@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-session-set-permission-mode"
+description = "Enables the session_set_permission_mode command without any pre-configured scope."
+commands.allow = ["session_set_permission_mode"]
+
+[[permission]]
+identifier = "deny-session-set-permission-mode"
+description = "Denies the session_set_permission_mode command without any pre-configured scope."
+commands.deny = ["session_set_permission_mode"]

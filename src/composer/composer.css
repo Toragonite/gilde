@@ -1,0 +1,170 @@
+/*
+ * The session composer (UI-GUIDELINES §2-1b: --n0 background, 1px border,
+ * --r-md, a text area and one bottom row of chips and actions).
+ */
+
+.g-composer {
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--n0);
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.g-composer:focus-within {
+  border-color: var(--n6);
+}
+
+.g-composer-hint {
+  margin: 0;
+  font-size: var(--fs-sub);
+  color: var(--warn);
+}
+
+.g-composer-input {
+  border: 0;
+  background: transparent;
+  resize: none;
+  min-height: 44px;
+  max-height: 180px;
+  padding: 2px 4px;
+  font: inherit;
+  font-size: var(--fs-body);
+  line-height: 1.5;
+  color: var(--n11);
+  width: 100%;
+  caret-color: var(--accent);
+  field-sizing: content;
+}
+
+.g-composer[data-compact='true'] .g-composer-input {
+  min-height: 24px;
+}
+
+.g-composer-input:focus {
+  outline: none;
+}
+
+.g-composer-input::placeholder {
+  color: var(--n8);
+}
+
+.g-composer-line,
+.g-composer-note {
+  margin: 0;
+  font-size: var(--fs-label);
+  color: var(--n9);
+}
+
+.g-composer-detail {
+  display: block;
+  color: var(--n8);
+  overflow-wrap: anywhere;
+}
+
+.g-composer-queue {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.g-composer-queued {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: var(--fs-sub);
+}
+
+.g-composer-qtext {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--n10);
+}
+
+.g-composer-chip {
+  display: inline-flex;
+  align-items: center;
+  height: 20px;
+  padding: 0 6px;
+  border-radius: var(--r-sm);
+  background: var(--n3);
+  color: var(--n10);
+  font-size: var(--fs-label);
+  white-space: nowrap;
+  flex: none;
+}
+
+.g-composer-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.g-composer-chips {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.g-composer-chipnote {
+  font-size: var(--fs-label);
+  color: var(--n8);
+  padding-left: 4px;
+}
+
+.g-composer-spacer {
+  flex: 1;
+}
+
+.g-composer-stop,
+.g-composer-sendnow {
+  font-size: var(--fs-label);
+  color: var(--n8);
+  white-space: nowrap;
+}
+
+.g-chipbtn {
+  height: 22px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--n9);
+  font: inherit;
+  font-size: var(--fs-sub);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+button.g-chipbtn:hover,
+.g-chipbtn[aria-expanded='true'] {
+  background: var(--n3);
+  color: var(--n11);
+}
+
+.g-chipbtn:focus-visible {
+  outline: 1px solid var(--accent);
+}
+
+.g-composer-menuline {
+  margin: 0;
+  padding: 4px 8px;
+  font-size: var(--fs-sub);
+  color: var(--n8);
+}

@@ -1,23 +1,35 @@
-//! The process scanner — DESIGN §8-7 "데이터 소스".
+//! The process scanner — DESIGN §8-7 "데이터 소스", reworked for Gilde 2
+//! (contract §2.2.1 `supervise/procscan.rs`, §5.2.2).
 //!
-//! One `ps` invocation gives us everything except the working directory:
+//! The whole-machine scan is **in-process**: `proc_listallpids` plus, per pid,
+//! `PROC_PIDTASKALLINFO` (ppid, pgid, uid, start time, RSS, CPU time) and
+//! `sysctl(KERN_PROCARGS2)` for the command line. No `/bin/ps` runs per tick
+//! any more; `ps` and `lsof` remain only as lazy **single-pid** fallbacks
+//! ([`ps_args_of`] for a pid whose arguments the kernel will not hand us,
+//! `cwd_of`'s `lsof` path), and each of those runs is registered as a `probe`
+//! row once the supervisor installed its hook ([`install_probe_hook`]) — which
+//! closes R1 §2 limit 3.
 //!
-//! ```text
-//! ps -A -o pid=,ppid=,pgid=,rss=,%cpu=,etime=,user=,args=
-//! ```
+//! The scan keeps the `Snapshot`/`PsRow` shape every supervision path (and the
+//! PTY status engine) already reads: the first seven `ps` columns, and `args`
+//! as the arguments joined with single spaces.
 //!
-//! The first seven whitespace-separated fields are parsed; **everything after
-//! them is `args`**, because argv contains spaces and splitting it would corrupt
-//! the very string the panel exists to show.
+//! Classification (`OursLive`/`OursOrphan`/`AgentUnmanaged`/`ExternalResidue`/
+//! `McpServer`) is unchanged; the discovery scan T03 produces
+//! ([`crate::contract::ProcSnapshot`]) is shared through [`ScanHub`], so the
+//! watchdog, health and leftovers read one scan instead of each taking their own.
 //!
-//! Three rules this module never breaks:
+//! Rules this module never breaks:
 //!
 //! 1. **`cwd` resolution is lazy.** It is a syscall per pid and this machine can
 //!    have 800 processes. [`ps_snapshot`] never calls [`cwd_of`]; only the rows
 //!    the panel actually renders do (`ScanFilter::include_cwd`).
-//! 2. **Failing to read another process's environment is a normal outcome**, not
-//!    an error (DESIGN §8-4 limitation). [`environ_of`] returns `None`, callers
-//!    fall through to the argv fence.
+//! 2. **Another process's environment values are never copied** (contract §5.2.2,
+//!    §9.7). The environment block that follows the arguments is compared in
+//!    place against the one entry a caller asks about (our own spawn marker, or
+//!    an env-name marker), and the read buffer is zeroed afterwards.
+//!    [`environ_of`] returns only the allowlisted marker entries
+//!    ([`ENV_MARKER_KEYS`]). Failing to read is a normal outcome, not an error.
 //! 3. **Masking happens here**, at the source, because the same string is
 //!    rendered *and* written to `event_log`.
 //!
@@ -27,19 +39,25 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::os::raw::{c_char, c_int};
-use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::mpsc;
 use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use std::cell::RefCell;
+use std::sync::Arc;
+
 use libproc::bsd_info::BSDInfo;
 use libproc::libproc::proc_pid::{pidinfo, pidpath, PIDInfo, PidInfoFlavor};
+use libproc::libproc::task_info::TaskAllInfo;
+use parking_lot::Mutex;
 use regex::Regex;
-use sysinfo::{MemoryRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System, UpdateKind};
+use sysinfo::{MemoryRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
+use zeroize::Zeroize as _;
 
+use crate::contract::services::ProcSnapshot;
 use crate::error::{GildeError, Result};
 use crate::supervise::{ProcGroupKind, ProcRow, ProcTag, RegistryIndex};
 
@@ -47,7 +65,6 @@ use crate::supervise::{ProcGroupKind, ProcRow, ProcTag, RegistryIndex};
 const PS_BIN: &str = "/bin/ps";
 const LSOF_BIN: &str = "/usr/sbin/lsof";
 
-const PS_ARGS: [&str; 3] = ["-A", "-o", "pid=,ppid=,pgid=,rss=,%cpu=,etime=,user=,args="];
 
 /// A `ps` that has not answered in this long is not going to.
 const PS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -196,6 +213,38 @@ impl Snapshot {
         }
     }
 
+    /// The shared discovery scan (contract `ProcSnapshot`: every process of
+    /// this user, argv redacted) in this module's row shape, so the watchdog,
+    /// health and the status engine read the one scan (A12.2). The process
+    /// group is read per pid (`getpgid`; `0` = gone, which matches no group);
+    /// CPU% is not part of the shared scan and reads 0; `args` is the
+    /// redacted argv joined with single spaces, or the executable path when
+    /// discovery did not read the arguments.
+    pub fn from_proc_snapshot(scan: &ProcSnapshot) -> Snapshot {
+        let now_s = scan.taken_at / 1000;
+        let rows = scan
+            .procs
+            .iter()
+            .map(|p| PsRow {
+                pid: p.pid,
+                ppid: p.ppid,
+                pgid: crate::supervise::spawn::pgid_of(p.pid).unwrap_or(0),
+                rss_kb: p.rss_bytes / 1024,
+                cpu_pct: 0.0,
+                elapsed_secs: (now_s - p.start_sec).max(0) as u64,
+                user: user_name(p.uid),
+                args: if p.argv_redacted.is_empty() {
+                    p.exec_path.clone().unwrap_or_default()
+                } else {
+                    p.argv_redacted.join(" ")
+                },
+            })
+            .collect();
+        let mut snap = Snapshot::from_rows(rows);
+        snap.at = scan.taken_at;
+        snap
+    }
+
     pub fn rows(&self) -> &[PsRow] {
         &self.rows
     }
@@ -278,17 +327,19 @@ impl Snapshot {
             .collect()
     }
 
-    /// Pids whose environment contains `key=value`.
+    /// Pids whose environment contains exactly `key=value`.
     ///
     /// **Best effort by design** (DESIGN §8-4): reading another process's
     /// environment block is increasingly restricted on macOS and fails for
     /// signed / hardened binaries even at the same uid. An empty result is a
     /// normal outcome and callers must have another fence.
     ///
-    /// Only same-uid processes are probed — the rest cannot be read anyway.
+    /// Only same-uid processes are probed — the rest cannot be read anyway —
+    /// and the comparison happens in place: no value is copied out of the
+    /// kernel's buffer, which is zeroed afterwards (contract §5.2.2, §9.7).
     pub fn with_env(&self, key: &str, value: &str) -> Vec<i32> {
         let our_uid = uid_of(std::process::id() as i32);
-        let candidates: Vec<Pid> = self
+        let mut out: Vec<i32> = self
             .rows
             .iter()
             .filter(|r| r.pid > 1)
@@ -296,27 +347,8 @@ impl Snapshot {
                 Some(uid) => uid_of(r.pid) == Some(uid),
                 None => true,
             })
-            .map(|r| Pid::from_u32(r.pid as u32))
-            .collect();
-        if candidates.is_empty() {
-            return Vec::new();
-        }
-
-        let mut system = System::new();
-        system.refresh_processes_specifics(
-            ProcessesToUpdate::Some(&candidates),
-            false,
-            ProcessRefreshKind::nothing().with_environ(UpdateKind::Always),
-        );
-
-        let needle = format!("{key}={value}");
-        let mut out: Vec<i32> = candidates
-            .iter()
-            .filter(|pid| match system.process(**pid) {
-                Some(p) => p.environ().iter().any(|e| e.to_string_lossy() == needle),
-                None => false,
-            })
-            .map(|pid| pid.as_u32() as i32)
+            .filter(|r| env_entry_matches(r.pid, key, value) == Some(true))
+            .map(|r| r.pid)
             .collect();
         out.sort_unstable();
         out.dedup();
@@ -420,7 +452,7 @@ impl Snapshot {
         let entry = ctx.registry.get(ps.pid);
         let start_time = bsd
             .as_ref()
-            .map(|b| bsd_start_millis(b))
+            .map(bsd_start_millis)
             .unwrap_or_else(|| self.at - (ps.elapsed_secs as i64) * 1000);
 
         ProcRow {
@@ -487,31 +519,34 @@ impl<'a> RowContext<'a> {
 // the scan itself
 // ---------------------------------------------------------------------------
 
-/// One `ps` call for the whole machine — DESIGN §8-7.
+/// One scan of the whole machine — DESIGN §8-7, in-process since Gilde 2.
 ///
-/// Never resolves `cwd`: that is [`cwd_of`], called lazily for rendered rows.
+/// `proc_listallpids` + `PROC_PIDTASKALLINFO` + `KERN_PROCARGS2` per pid; no
+/// child process. Never resolves `cwd`: that is [`cwd_of`], called lazily for
+/// rendered rows. The name is kept because every supervision path (and the PTY
+/// status engine) calls it.
 pub fn ps_snapshot() -> Result<Snapshot> {
-    let out = run_capture(PS_BIN, &PS_ARGS, PS_TIMEOUT).ok_or_else(|| {
-        GildeError::Spawn(format!(
-            "{PS_BIN} produced no snapshot within {}s",
-            PS_TIMEOUT.as_secs()
-        ))
-    })?;
-    // `args` can hold arbitrary bytes; the monitor is a display surface, so a
-    // lossy decode here is the honest choice (the byte-exact rule is the PTY's).
-    let text = String::from_utf8_lossy(&out);
-    let rows: Vec<PsRow> = text.lines().filter_map(PsRow::parse_line).collect();
+    let rows = kernel_rows()?;
     if rows.is_empty() {
-        return Err(GildeError::Spawn(format!("{PS_BIN} returned no parsable rows")));
+        return Err(GildeError::Spawn("the kernel process list was empty".into()));
     }
     Ok(Snapshot::from_rows(rows))
 }
 
 /// Fresh command line of a single pid — the argv fence re-reads this right
 /// before signalling, because a snapshot may be seconds old.
+///
+/// The kernel's `KERN_PROCARGS2` first; `/bin/ps` only when the kernel will not
+/// hand the arguments over (a zombie, another user's process), registered as a
+/// `probe` row once the supervisor installed its hook.
 pub fn ps_args_of(pid: i32) -> Option<String> {
     if pid <= 0 {
         return None;
+    }
+    if let Some(args) = proc_args(pid) {
+        if !args.argv.is_empty() {
+            return Some(args.argv.join(" "));
+        }
     }
     let pid_s = pid.to_string();
     let out = run_capture(PS_BIN, &["-o", "args=", "-p", &pid_s], PS_TIMEOUT)?;
@@ -557,32 +592,33 @@ fn cwd_via_lsof(pid: i32) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Environment of `pid`, one `KEY=VALUE` string per entry.
+/// The environment entries of `pid` whose key is one of [`ENV_MARKER_KEYS`],
+/// one `KEY=VALUE` string per entry — and nothing else.
 ///
 /// **Failure is a normal path**, not an error (DESIGN §8-4): macOS restricts
 /// reading another process's environment block, and it fails routinely for
 /// signed and hardened binaries even at the same uid. `None` means "could not
-/// read"; `Some(vec![])` means "read, and it was empty". Neither is a bug and
-/// neither panics.
+/// read"; `Some(vec![])` means "read, and none of the markers was there".
+/// Every other entry stays in the kernel's buffer, which is zeroed (contract
+/// §5.2.2, §9.7: other processes' environment values are never copied).
 pub fn environ_of(pid: i32) -> Option<Vec<String>> {
     if pid <= 0 {
         return None;
     }
-    let spid = Pid::from_u32(pid as u32);
-    let mut system = System::new();
-    system.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[spid]),
-        false,
-        ProcessRefreshKind::nothing().with_environ(UpdateKind::Always),
-    );
-    let process = system.process(spid)?;
-    Some(
-        process
-            .environ()
-            .iter()
-            .map(|e| e.to_string_lossy().into_owned())
-            .collect(),
-    )
+    with_procargs(pid, |buf| {
+        let parsed = parse_procargs(buf)?;
+        let mut out = Vec::new();
+        for entry in parsed.env_entries(buf) {
+            if let Some(eq) = entry.iter().position(|b| *b == b'=') {
+                let key = &entry[..eq];
+                if ENV_MARKER_KEYS.iter().any(|k| k.as_bytes() == key) {
+                    out.push(String::from_utf8_lossy(entry).into_owned());
+                }
+            }
+        }
+        Some(out)
+    })
+    .flatten()
 }
 
 /// Kernel start time of `pid` in **seconds** since the epoch.
@@ -597,6 +633,11 @@ pub fn start_time_of(pid: i32) -> Option<i64> {
     }
     if let Some(info) = bsd_info_of(pid) {
         return Some(info.pbi_start_tvsec as i64);
+    }
+    // The kernel table still lists a zombie; like `proc_pidinfo`, give it no
+    // start time (a zombie is gone for every fence and kill decision).
+    if let Some(k) = kinfo_of(pid) {
+        return (!k.is_zombie()).then_some(k.start_sec);
     }
     let spid = Pid::from_u32(pid as u32);
     let mut system = System::new();
@@ -613,7 +654,27 @@ pub fn uid_of(pid: i32) -> Option<u32> {
     if pid <= 0 {
         return None;
     }
-    bsd_info_of(pid).map(|info| info.pbi_uid)
+    bsd_info_of(pid)
+        .map(|info| info.pbi_uid)
+        .or_else(|| kinfo_of(pid).filter(|k| !k.is_zombie()).map(|k| k.uid))
+}
+
+/// One process's `kinfo_proc` (`KERN_PROC_PID`): readable for every process.
+pub fn kinfo_of(pid: i32) -> Option<KernelProc> {
+    if pid <= 0 {
+        return None;
+    }
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+    let mut buf = [0u8; KINFO_SIZE];
+    let mut len = buf.len();
+    // SAFETY: `buf` is a writable `kinfo_proc`-sized buffer.
+    let rc = unsafe {
+        libc::sysctl(mib.as_mut_ptr(), 4, buf.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0)
+    };
+    if rc != 0 || len != KINFO_SIZE {
+        return None;
+    }
+    parse_kinfo(&buf).filter(|k| k.pid == pid)
 }
 
 /// Physical RAM in bytes — the denominator of the memory budget (DESIGN §8-8).
@@ -715,15 +776,13 @@ fn find_bare_double_dash(argv: &str) -> Option<usize> {
 /// Truncate to `limit` characters (never inside a character), adding an ellipsis
 /// when anything was cut.
 fn truncate_chars(s: &str, limit: usize) -> String {
-    let mut count = 0usize;
-    for (byte_idx, _) in s.char_indices() {
+    for (count, (byte_idx, _)) in s.char_indices().enumerate() {
         if count == limit {
             let mut out = String::with_capacity(byte_idx + 3);
             out.push_str(&s[..byte_idx]);
             out.push('\u{2026}');
             return out;
         }
-        count += 1;
     }
     s.to_string()
 }
@@ -999,6 +1058,623 @@ fn our_exe_dir() -> Option<&'static std::path::Path> {
 
 
 // ---------------------------------------------------------------------------
+// the in-process scan (libproc + KERN_PROCARGS2)
+// ---------------------------------------------------------------------------
+
+/// The environment keys [`environ_of`] may return: this app's own spawn
+/// markers and the orchestrator's member marker. Every other entry is compared
+/// in place or not at all.
+pub const ENV_MARKER_KEYS: [&str; 4] = [
+    crate::supervise::identity::ENV_SPAWN_ID,
+    crate::supervise::registry::ENV_APP_INSTANCE,
+    "CCO_TEAM_MEMBER",
+    "CCO_DISPATCHED_TASK",
+];
+
+/// One process's command line as the kernel recorded it at `exec`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcArgs {
+    /// The executable path the kernel exec'd (may differ from `argv[0]`).
+    pub exec_path: String,
+    pub argv: Vec<String>,
+}
+
+/// Offsets into one `KERN_PROCARGS2` buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedArgs {
+    exec_path: std::ops::Range<usize>,
+    argv: Vec<std::ops::Range<usize>>,
+    env_start: usize,
+}
+
+impl ParsedArgs {
+    /// The environment entries (`KEY=VALUE` byte slices) that follow `argv`.
+    fn env_entries<'a>(&self, buf: &'a [u8]) -> impl Iterator<Item = &'a [u8]> + 'a {
+        let start = self.env_start.min(buf.len());
+        buf[start..]
+            .split(|b| *b == 0)
+            .take_while(|e| !e.is_empty())
+    }
+}
+
+/// Parse a `KERN_PROCARGS2` buffer: `argc` (native `i32`), the exec path, NUL
+/// padding, exactly `argc` NUL-terminated arguments, then the environment.
+/// Returns `None` for anything malformed (a racing exec, a truncated buffer).
+fn parse_procargs(buf: &[u8]) -> Option<ParsedArgs> {
+    if buf.len() < 4 {
+        return None;
+    }
+    let argc = i32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    if !(0..=65_536).contains(&argc) {
+        return None;
+    }
+    let mut pos = 4usize;
+    let path_end = pos + buf[pos..].iter().position(|b| *b == 0)?;
+    let exec_path = pos..path_end;
+    pos = path_end;
+    while pos < buf.len() && buf[pos] == 0 {
+        pos += 1;
+    }
+    let mut argv = Vec::with_capacity(argc as usize);
+    for _ in 0..argc {
+        if pos >= buf.len() {
+            return None;
+        }
+        let end = pos + buf[pos..].iter().position(|b| *b == 0).unwrap_or(buf.len() - pos);
+        argv.push(pos..end);
+        pos = end + 1;
+    }
+    Some(ParsedArgs {
+        exec_path,
+        argv,
+        env_start: pos.min(buf.len()),
+    })
+}
+
+/// `kern.argmax`, the largest buffer `KERN_PROCARGS2` can fill.
+fn argmax() -> usize {
+    static ARGMAX: OnceLock<usize> = OnceLock::new();
+    *ARGMAX.get_or_init(|| {
+        let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+        let mut value: libc::c_int = 0;
+        let mut size = std::mem::size_of::<libc::c_int>();
+        // SAFETY: `mib` names an int-valued sysctl; `value`/`size` describe a
+        // writable int; no new value is set.
+        let rc = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                2,
+                (&mut value as *mut libc::c_int).cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc == 0 && value > 0 {
+            value as usize
+        } else {
+            1 << 20
+        }
+    })
+}
+
+thread_local! {
+    /// One `kern.argmax` buffer per scanning thread, reused across pids.
+    static ARGS_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Read `pid`'s `KERN_PROCARGS2` block into the thread's buffer, run `f` on
+/// it, then zero the bytes the kernel wrote. `None` when the kernel refused
+/// (another user's process, a zombie, a vanished pid).
+fn with_procargs<R>(pid: i32, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+    if pid <= 0 {
+        return None;
+    }
+    ARGS_BUF.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        let cap = argmax();
+        if buf.len() < cap {
+            buf.resize(cap, 0);
+        }
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+        let mut size = buf.len();
+        // SAFETY: `buf` is a writable allocation of `size` bytes; the kernel
+        // writes at most `size` bytes and reports how many in `size`.
+        let rc = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                3,
+                buf.as_mut_ptr().cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc != 0 {
+            return None;
+        }
+        let used = size.min(buf.len());
+        let result = f(&buf[..used]);
+        buf[..used].zeroize();
+        Some(result)
+    })
+}
+
+/// `pid`'s exec path and arguments, or `None` when the kernel refused.
+/// The environment that follows them is never copied.
+pub fn proc_args(pid: i32) -> Option<ProcArgs> {
+    with_procargs(pid, |buf| {
+        let parsed = parse_procargs(buf)?;
+        Some(ProcArgs {
+            exec_path: String::from_utf8_lossy(&buf[parsed.exec_path.clone()]).into_owned(),
+            argv: parsed
+                .argv
+                .iter()
+                .map(|r| String::from_utf8_lossy(&buf[r.clone()]).into_owned())
+                .collect(),
+        })
+    })
+    .flatten()
+}
+
+/// Whether `pid`'s environment holds exactly `key=value`, compared in place.
+/// `None` = unreadable, or an empty block (nothing to judge by).
+pub fn env_entry_matches(pid: i32, key: &str, value: &str) -> Option<bool> {
+    with_procargs(pid, |buf| {
+        let parsed = parse_procargs(buf)?;
+        // An empty block has nothing to judge by.
+        parsed.env_entries(buf).next()?;
+        let klen = key.len();
+        Some(parsed.env_entries(buf).any(|e| {
+            e.len() == klen + 1 + value.len()
+                && &e[..klen] == key.as_bytes()
+                && e[klen] == b'='
+                && &e[klen + 1..] == value.as_bytes()
+        }))
+    })
+    .flatten()
+}
+
+/// Whether `pid`'s environment has an entry named `key` (an env-name marker,
+/// contract §5.2.2), compared in place. `None` = unreadable.
+pub fn env_has_name(pid: i32, key: &str) -> Option<bool> {
+    with_procargs(pid, |buf| {
+        let parsed = parse_procargs(buf)?;
+        let klen = key.len();
+        Some(
+            parsed
+                .env_entries(buf)
+                .any(|e| e.len() > klen && &e[..klen] == key.as_bytes() && e[klen] == b'='),
+        )
+    })
+    .flatten()
+}
+
+/// CPU time per `(pid, start)` from the previous scan, for a `%cpu` over the
+/// interval instead of the process's lifetime.
+type CpuCache = Mutex<HashMap<(i32, i64), (u64, Instant)>>;
+
+fn cpu_cache() -> &'static CpuCache {
+    static CACHE: OnceLock<CpuCache> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Nanoseconds per Mach absolute-time tick (`pti_total_*` are in ticks).
+#[allow(deprecated)] // `mach_timebase_info` lives on in libc behind a deprecation note.
+fn timebase() -> (u64, u64) {
+    static TB: OnceLock<(u64, u64)> = OnceLock::new();
+    *TB.get_or_init(|| {
+        let mut info = libc::mach_timebase_info { numer: 0, denom: 0 };
+        // SAFETY: `info` is a valid out-parameter.
+        let rc = unsafe { libc::mach_timebase_info(&mut info) };
+        if rc == 0 && info.numer > 0 && info.denom > 0 {
+            (u64::from(info.numer), u64::from(info.denom))
+        } else {
+            (1, 1)
+        }
+    })
+}
+
+fn user_name(uid: u32) -> String {
+    static NAMES: OnceLock<Mutex<HashMap<u32, String>>> = OnceLock::new();
+    let names = NAMES.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(name) = names.lock().get(&uid) {
+        return name.clone();
+    }
+    let name = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
+        .ok()
+        .flatten()
+        .map(|u| u.name)
+        .unwrap_or_else(|| uid.to_string());
+    names.lock().insert(uid, name.clone());
+    name
+}
+
+/// One process of the kernel's process table (`sysctl KERN_PROC_ALL`, the
+/// source `ps` reads): available for **every** process, other users'
+/// included, unlike `proc_pidinfo`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KernelProc {
+    pub pid: i32,
+    pub ppid: i32,
+    pub pgid: i32,
+    pub uid: u32,
+    pub start_sec: i64,
+    pub start_usec: i64,
+    /// `p_stat` (`SZOMB` = 5).
+    pub stat: u8,
+    pub comm: String,
+}
+
+/// `p_stat` of a zombie (`<sys/proc.h>`).
+pub const SZOMB_STAT: u8 = 5;
+
+impl KernelProc {
+    /// Exited, not yet reaped.
+    pub fn is_zombie(&self) -> bool {
+        self.stat == SZOMB_STAT
+    }
+}
+
+/// `sizeof(struct kinfo_proc)` on 64-bit macOS and the field offsets used
+/// (`<sys/sysctl.h>`: `extern_proc` then `eproc`), checked against a live
+/// table by the unit tests.
+const KINFO_SIZE: usize = 648;
+const KI_START_SEC: usize = 0;
+const KI_START_USEC: usize = 8;
+const KI_STAT: usize = 36;
+const KI_PID: usize = 40;
+const KI_COMM: usize = 243;
+const KI_COMM_LEN: usize = 17;
+const KI_UID: usize = 420;
+const KI_PPID: usize = 560;
+const KI_PGID: usize = 564;
+
+fn read_i32(b: &[u8], at: usize) -> i32 {
+    i32::from_ne_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+}
+
+fn read_i64(b: &[u8], at: usize) -> i64 {
+    let mut a = [0u8; 8];
+    a.copy_from_slice(&b[at..at + 8]);
+    i64::from_ne_bytes(a)
+}
+
+/// Parse one `kinfo_proc` record.
+fn parse_kinfo(rec: &[u8]) -> Option<KernelProc> {
+    if rec.len() < KINFO_SIZE {
+        return None;
+    }
+    let pid = read_i32(rec, KI_PID);
+    if pid < 0 {
+        return None;
+    }
+    let comm_bytes: Vec<u8> = rec[KI_COMM..KI_COMM + KI_COMM_LEN]
+        .iter()
+        .take_while(|c| **c != 0)
+        .copied()
+        .collect();
+    Some(KernelProc {
+        pid,
+        ppid: read_i32(rec, KI_PPID),
+        pgid: read_i32(rec, KI_PGID),
+        uid: read_i32(rec, KI_UID) as u32,
+        start_sec: read_i64(rec, KI_START_SEC),
+        start_usec: i64::from(read_i32(rec, KI_START_USEC)),
+        stat: rec[KI_STAT],
+        comm: String::from_utf8_lossy(&comm_bytes).into_owned(),
+    })
+}
+
+/// The whole kernel process table (`KERN_PROC_ALL`).
+pub fn kernel_proc_table() -> Result<Vec<KernelProc>> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_ALL];
+    for _ in 0..4 {
+        let mut size: libc::size_t = 0;
+        // SAFETY: a size query (null buffer) on a read-only sysctl.
+        let rc = unsafe {
+            libc::sysctl(mib.as_mut_ptr(), 3, std::ptr::null_mut(), &mut size, std::ptr::null_mut(), 0)
+        };
+        if rc != 0 {
+            return Err(GildeError::Spawn("sysctl(KERN_PROC_ALL) size query failed".into()));
+        }
+        // Room for processes started between the two calls.
+        let mut buf = vec![0u8; size + 64 * KINFO_SIZE];
+        let mut len = buf.len();
+        // SAFETY: `buf` is writable for `len` bytes; the kernel reports how
+        // many it wrote in `len`.
+        let rc = unsafe {
+            libc::sysctl(mib.as_mut_ptr(), 3, buf.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0)
+        };
+        if rc != 0 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOMEM) {
+                continue;
+            }
+            return Err(GildeError::Spawn("sysctl(KERN_PROC_ALL) failed".into()));
+        }
+        if !len.is_multiple_of(KINFO_SIZE) {
+            return Err(GildeError::Spawn("unexpected kinfo_proc size".into()));
+        }
+        return Ok(buf[..len].chunks_exact(KINFO_SIZE).filter_map(parse_kinfo).collect());
+    }
+    Err(GildeError::Spawn("the process table kept growing".into()))
+}
+
+/// Every process on the machine as a [`PsRow`], read in-process: the kernel
+/// process table for identity (every process), libproc for RSS/CPU and
+/// `KERN_PROCARGS2` for the command line where the kernel permits them (our
+/// own uid); otherwise the executable path or `(comm)`, as `ps` prints it.
+fn kernel_rows() -> Result<Vec<PsRow>> {
+    let table = kernel_proc_table()?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let tick = Instant::now();
+    let (numer, denom) = timebase();
+    let mut seen: HashSet<(i32, i64)> = HashSet::with_capacity(table.len());
+    let mut rows = Vec::with_capacity(table.len());
+    let mut cache = cpu_cache().lock();
+    for kp in table {
+        let pid = kp.pid;
+        if pid < 0 {
+            continue;
+        }
+        let start = kp.start_sec;
+        let elapsed_secs = (now - start).max(0) as u64;
+        let task = if pid > 0 {
+            pidinfo::<TaskAllInfo>(pid, 0).ok().map(|all| all.ptinfo)
+        } else {
+            None
+        };
+        let (rss_kb, cpu_pct) = match task {
+            Some(t) => {
+                let ticks = t.pti_total_user.saturating_add(t.pti_total_system);
+                let cpu_ns = ticks.saturating_mul(numer) / denom;
+                let pct = match cache.get(&(pid, start)) {
+                    Some((prev_ns, prev_at)) => {
+                        let wall = tick.duration_since(*prev_at).as_nanos() as f64;
+                        if wall > 0.0 {
+                            (cpu_ns.saturating_sub(*prev_ns) as f64 / wall * 100.0) as f32
+                        } else {
+                            0.0
+                        }
+                    }
+                    None if elapsed_secs > 0 => {
+                        (cpu_ns as f64 / (elapsed_secs as f64 * 1e9) * 100.0) as f32
+                    }
+                    None => 0.0,
+                };
+                cache.insert((pid, start), (cpu_ns, tick));
+                seen.insert((pid, start));
+                (t.pti_resident_size / 1024, pct)
+            }
+            None => (0, 0.0),
+        };
+        let args = match proc_args(pid) {
+            Some(a) if !a.argv.is_empty() => a.argv.join(" "),
+            Some(a) if !a.exec_path.is_empty() => a.exec_path,
+            _ => match exe_path_of(pid) {
+                Some(path) => path,
+                None => format!("({})", kp.comm),
+            },
+        };
+        rows.push(PsRow {
+            pid,
+            ppid: kp.ppid,
+            pgid: kp.pgid,
+            rss_kb,
+            cpu_pct,
+            elapsed_secs,
+            user: user_name(kp.uid),
+            args,
+        });
+    }
+    cache.retain(|k, _| seen.contains(k));
+    Ok(rows)
+}
+
+// ---------------------------------------------------------------------------
+// the vendor-CLI classifier (contract §5.2.2, §9.8)
+// ---------------------------------------------------------------------------
+
+/// Which vendor CLI an executable is (contract §5.2.2, §9.8): the one shared
+/// classifier, [`crate::agents::classify`] (A39.1(a)), given the exec path and
+/// `argv[1]` only. Kept for callers that hold no more than that; prefer
+/// [`vendor_of_argv`] with the whole argv (a `node` script after its flags,
+/// cursor-agent's `--use-system-ca`). The same answer decides the signal
+/// policy (§9.8: never SIGKILL a vendor CLI).
+///
+/// `tmux` is kept on the protected side: a `claude-swarm` server carries the
+/// panes of a team, and the classifier lists it with the vendor CLIs.
+pub fn vendor_of_exec(exec_path: &str, argv1: Option<&str>) -> Option<&'static str> {
+    let argv: Vec<&str> = std::iter::once(exec_path).chain(argv1).collect();
+    vendor_of_argv(exec_path, &argv)
+}
+
+/// [`vendor_of_exec`] with the whole argv (`argv[0]` included; empty when it
+/// could not be read): the shared classifier, plus `tmux` on the protected
+/// side.
+pub fn vendor_of_argv<S: AsRef<str>>(exec_path: &str, argv: &[S]) -> Option<&'static str> {
+    if exec_path.rsplit('/').next() == Some("tmux") {
+        return Some("tmux");
+    }
+    crate::agents::classify::vendor_of_process(exec_path, argv).map(crate::contract::common::Vendor::as_str)
+}
+
+/// [`vendor_of_argv`] for a live pid: the kernel's exec path and argv. The
+/// path the process was started by is tried first, then the resolved path
+/// (`proc_pidpath`), so a vendor started through a link or a symlinked
+/// directory is still one. `None` when the pid is gone or unreadable *and*
+/// neither path is a vendor's.
+pub fn vendor_of_pid(pid: i32) -> Option<&'static str> {
+    let args = proc_args(pid);
+    let argv: &[String] = args.as_ref().map(|a| a.argv.as_slice()).unwrap_or(&[]);
+    let started = args.as_ref().map(|a| a.exec_path.as_str()).filter(|p| !p.is_empty());
+    if let Some(vendor) = started.and_then(|exec| vendor_of_argv(exec, argv)) {
+        return Some(vendor);
+    }
+    let resolved = exe_path_of(pid)?;
+    if started == Some(resolved.as_str()) {
+        return None;
+    }
+    vendor_of_argv(&resolved, argv)
+}
+
+/// The allowlisted teammate label flags of an argv (`--key value` pairs
+/// anywhere, contract §5.2.2); read before redaction, kept as metadata.
+pub fn teammate_labels(argv: &[String]) -> crate::contract::services::TeammateLabels {
+    let mut labels = crate::contract::services::TeammateLabels::default();
+    let mut it = argv.iter().peekable();
+    while let Some(a) = it.next() {
+        let (flag, inline) = match a.split_once('=') {
+            Some((f, v)) if f.starts_with("--") => (f, Some(v.to_string())),
+            _ => (a.as_str(), None),
+        };
+        let slot = match flag {
+            "--agent-id" => &mut labels.agent_id,
+            "--agent-name" => &mut labels.agent_name,
+            "--team-name" => &mut labels.team_name,
+            "--agent-color" => &mut labels.agent_color,
+            "--parent-session-id" => &mut labels.parent_session_id,
+            _ => continue,
+        };
+        let value = inline.or_else(|| it.next().cloned());
+        if let Some(v) = value.filter(|v| !v.is_empty() && v.len() <= 256) {
+            *slot = Some(v);
+        }
+    }
+    labels
+}
+
+/// The supervision fallback for T03's discovery scan: the candidate processes
+/// (vendor CLIs, `tmux`, tool servers) of an in-process kernel scan as a
+/// [`ProcSnapshot`], argv redacted (§9.7), env markers read by name only.
+/// Used only while no discovery scan has been published to the [`ScanHub`].
+pub fn kernel_proc_snapshot() -> Result<ProcSnapshot> {
+    let snap = ps_snapshot()?;
+    let taken_at = now_millis();
+    let mut procs = Vec::new();
+    for row in snap.rows() {
+        let args = proc_args(row.pid);
+        let exec = args
+            .as_ref()
+            .map(|a| a.exec_path.clone())
+            .filter(|p| !p.is_empty())
+            .or_else(|| exe_path_of(row.pid));
+        let argv: Vec<String> = args.as_ref().map(|a| a.argv.clone()).unwrap_or_default();
+        let vendor = exec
+            .as_deref()
+            .and_then(|e| crate::agents::classify::vendor_of_process(e, &argv));
+        let is_tmux = exec.as_deref().is_some_and(|e| e.rsplit('/').next() == Some("tmux"));
+        if vendor.is_none() && !is_tmux {
+            continue;
+        }
+        let Some(start) = start_time_of(row.pid) else { continue };
+        procs.push(crate::contract::services::ProcInfo {
+            key: crate::contract::ids::ProcessKey::new(row.pid as u32, start.max(0) as u64),
+            pid: row.pid,
+            ppid: row.ppid,
+            uid: uid_of(row.pid).unwrap_or(u32::MAX),
+            start_sec: start,
+            exec_path: exec,
+            argv_redacted: crate::supervise::redact::redact_argv(&argv),
+            labels: teammate_labels(&argv),
+            cwd: None,
+            rss_bytes: row.rss_bytes(),
+            cpu_ns: 0,
+            cco_team_member: env_has_name(row.pid, "CCO_TEAM_MEMBER"),
+            gilde_app_instance: env_has_name(row.pid, crate::supervise::registry::ENV_APP_INSTANCE),
+            vendor,
+        });
+    }
+    Ok(ProcSnapshot { taken_at, procs })
+}
+
+// ---------------------------------------------------------------------------
+// the shared scan (contract §2.2.1: one scan for discovery, watchdog, health)
+// ---------------------------------------------------------------------------
+
+/// The latest discovery scan (T03's [`ProcSnapshot`]) as supervision sees it.
+///
+/// T03's scanner publishes every scan here (wired in `lib.rs`); the watchdog,
+/// health and the leftover classifier read the latest one instead of scanning
+/// on their own. `SupervisorApi::last_scan` answers from it.
+#[derive(Debug, Default)]
+pub struct ScanHub {
+    latest: Mutex<Option<Arc<ProcSnapshot>>>,
+    notify: tokio::sync::Notify,
+}
+
+impl ScanHub {
+    pub fn new() -> Arc<ScanHub> {
+        Arc::new(ScanHub::default())
+    }
+
+    /// A new scan from discovery. Wakes every waiter.
+    pub fn publish(&self, snapshot: ProcSnapshot) {
+        *self.latest.lock() = Some(Arc::new(snapshot));
+        self.notify.notify_waiters();
+    }
+
+    pub fn latest(&self) -> Option<Arc<ProcSnapshot>> {
+        self.latest.lock().clone()
+    }
+
+    /// The latest scan if it is at most `max_age_ms` old at `now_ms`.
+    pub fn fresh(&self, now_ms: i64, max_age_ms: i64) -> Option<Arc<ProcSnapshot>> {
+        self.latest()
+            .filter(|s| now_ms.saturating_sub(s.taken_at) <= max_age_ms)
+    }
+
+    /// Resolves at the next [`ScanHub::publish`].
+    pub async fn next(&self) {
+        self.notify.notified().await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// probe registration (contract §3.8: `ps`/`lsof` fallbacks are `probe` rows)
+// ---------------------------------------------------------------------------
+
+/// One registered probe process.
+pub trait ProbeRow: Send {
+    /// The `GILDE_SPAWN_ID` value to stamp on the child.
+    fn env_marker(&self) -> String;
+    fn running(&self, pid: i32, pgid: i32);
+    fn exited(&self, code: Option<i32>, signal: Option<i32>);
+}
+
+/// Writes the `probe` row before a fallback helper runs (write-before-spawn).
+pub trait ProbeRegistrar: Send + Sync {
+    /// `None` = the row could not be written; the probe then does not run.
+    fn plan(&self, argv: &[String]) -> Option<Box<dyn ProbeRow>>;
+}
+
+fn probe_hook() -> &'static OnceLock<Arc<dyn ProbeRegistrar>> {
+    static HOOK: OnceLock<Arc<dyn ProbeRegistrar>> = OnceLock::new();
+    &HOOK
+}
+
+/// Route the `ps`/`lsof` single-pid fallbacks through the registry. The first
+/// installation wins (`false` on a later call).
+pub fn install_probe_hook(hook: Arc<dyn ProbeRegistrar>) -> bool {
+    probe_hook().set(hook).is_ok()
+}
+
+/// Write the `probe` row for a helper about to run (the PATH login-shell
+/// probe, the `ps`/`lsof` fallbacks). `Ok(None)` before the hook is installed
+/// (the helper then runs unregistered, as before the supervisor existed);
+/// `Err(())` when the row could not be written — the helper must not run.
+#[allow(clippy::result_unit_err)]
+pub fn register_probe(argv: &[String]) -> std::result::Result<Option<Box<dyn ProbeRow>>, ()> {
+    match probe_hook().get() {
+        Some(hook) => hook.plan(argv).map(Some).ok_or(()),
+        None => Ok(None),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // bounded process capture
 // ---------------------------------------------------------------------------
 
@@ -1011,15 +1687,47 @@ fn our_exe_dir() -> Option<&'static std::path::Path> {
 /// T08 replaces the body's spawn with `SpawnGuard`-backed one when the registry
 /// exists; the single call site is deliberate.
 fn run_capture(program: &str, args: &[&str], timeout: Duration) -> Option<Vec<u8>> {
-    let mut child = Command::new(program)
-        .args(args)
+    // Write-before-spawn once the supervisor is up: the row exists before the
+    // helper does. Before the hook is installed (unit tests, the first moments
+    // of a boot) the helper runs unregistered, as it always did.
+    let mut argv = Vec::with_capacity(args.len() + 1);
+    argv.push(program.to_string());
+    argv.extend(args.iter().map(|a| a.to_string()));
+    let row = register_probe(&argv).ok()?;
+    // The one grouped-spawn builder of the supervise module (§9.3 launch site).
+    let mut cmd = crate::supervise::spawn::std_command_grouped(std::path::Path::new(program));
+    cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .process_group(0)
-        .spawn()
-        .ok()?;
+        .stderr(Stdio::null());
+    if let Some(row) = &row {
+        cmd.env(crate::supervise::identity::ENV_SPAWN_ID, row.env_marker());
+    }
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(_) => {
+            if let Some(row) = &row {
+                row.exited(None, None);
+            }
+            return None;
+        }
+    };
+    if let Some(row) = &row {
+        let pid = child.id() as i32;
+        row.running(pid, pid);
+    }
+    let out = capture_child(&mut child, timeout);
+    if let Some(row) = &row {
+        let status = child.try_wait().ok().flatten();
+        row.exited(
+            status.and_then(|s| s.code()),
+            status.and_then(|s| std::os::unix::process::ExitStatusExt::signal(&s)),
+        );
+    }
+    out
+}
 
+fn capture_child(child: &mut std::process::Child, timeout: Duration) -> Option<Vec<u8>> {
     let mut stdout = child.stdout.take()?;
     let (tx, rx) = mpsc::channel();
     // Read concurrently: the pipe buffer is 64 KiB and a full `ps` snapshot is
@@ -1800,13 +2508,96 @@ mod tests {
     }
 
     #[test]
+    fn procargs_buffers_parse_and_malformed_ones_are_refused() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&2i32.to_ne_bytes());
+        buf.extend_from_slice(b"/bin/claude\0\0\0/bin/claude\0-p\0SECRET=1\0PATH=/bin\0\0");
+        let parsed = parse_procargs(&buf).expect("parses");
+        assert_eq!(&buf[parsed.exec_path.clone()], b"/bin/claude");
+        assert_eq!(parsed.argv.len(), 2);
+        assert_eq!(&buf[parsed.argv[1].clone()], b"-p");
+        let env: Vec<&[u8]> = parsed.env_entries(&buf).collect();
+        assert_eq!(env, vec![&b"SECRET=1"[..], &b"PATH=/bin"[..]]);
+        assert!(parse_procargs(&[1, 2]).is_none());
+        let mut short = Vec::new();
+        short.extend_from_slice(&5i32.to_ne_bytes());
+        short.extend_from_slice(b"/x\0a\0");
+        assert!(parse_procargs(&short).is_none(), "fewer strings than argc");
+    }
+
+    #[test]
+    fn the_kernel_table_layout_matches_this_machine() {
+        let me = std::process::id() as i32;
+        let k = kinfo_of(me).expect("our kinfo");
+        assert_eq!(k.pid, me);
+        // SAFETY: plain getters.
+        assert_eq!(k.ppid, unsafe { libc::getppid() });
+        assert_eq!(k.pgid, unsafe { libc::getpgrp() });
+        assert_eq!(k.uid, unsafe { libc::getuid() });
+        assert_eq!(Some(k.start_sec), bsd_info_of(me).map(|b| b.pbi_start_tvsec as i64));
+        let launchd = kinfo_of(1).expect("pid 1 is readable through the process table");
+        assert_eq!(launchd.uid, 0);
+        assert_eq!(launchd.comm, "launchd");
+        let table = kernel_proc_table().expect("table");
+        assert!(table.iter().any(|p| p.pid == 1) && table.iter().any(|p| p.pid == me));
+    }
+
+    #[test]
+    fn the_in_process_scan_sees_us_with_our_argv() {
+        let me = std::process::id() as i32;
+        let snap = ps_snapshot().expect("kernel scan");
+        let row = snap.get(me).expect("our own row");
+        assert!(row.rss_kb > 0);
+        assert!(snap.contains(row.ppid));
+        let args = proc_args(me).expect("our args");
+        let ours: Vec<String> = std::env::args().collect();
+        assert_eq!(args.argv, ours);
+        assert_eq!(ps_args_of(me), Some(ours.join(" ")));
+    }
+
+    #[test]
+    fn the_vendor_classifier() {
+        assert_eq!(vendor_of_exec("/x/claude", None), Some("claude"));
+        assert_eq!(vendor_of_exec("/x/claude.exe", None), Some("claude"));
+        assert_eq!(vendor_of_exec("/x/codex", None), Some("codex"));
+        assert_eq!(vendor_of_exec("/x/cursor-agent", None), Some("cursor"));
+        assert_eq!(vendor_of_exec("/Users/x/.local/share/cursor-agent/agent", None), Some("cursor"));
+        assert_eq!(vendor_of_exec("/usr/local/bin/agent", None), None);
+        assert_eq!(vendor_of_exec("/x/agy", None), Some("agy"));
+        assert_eq!(vendor_of_exec("/opt/homebrew/bin/tmux", None), Some("tmux"));
+        assert_eq!(
+            vendor_of_exec("/x/node", Some("/y/node_modules/@anthropic-ai/claude-code/cli.js")),
+            Some("claude")
+        );
+        assert_eq!(vendor_of_exec("/x/node", Some("/y/server.js")), None);
+        assert_eq!(vendor_of_exec("/bin/sh", None), None);
+    }
+
+    #[test]
+    fn teammate_labels_are_read_from_flag_pairs() {
+        let argv: Vec<String> = ["/x/claude", "--agent-id", "a@t", "--agent-name=a", "--team-name", "t", "--model", "m"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let l = teammate_labels(&argv);
+        assert_eq!(l.agent_id.as_deref(), Some("a@t"));
+        assert_eq!(l.agent_name.as_deref(), Some("a"));
+        assert_eq!(l.team_name.as_deref(), Some("t"));
+        assert!(l.parent_session_id.is_none());
+    }
+
+    #[test]
     fn environ_failure_is_a_normal_result_not_a_panic() {
         // Our own environment is readable; a pid that cannot exist is not.
         let me = std::process::id() as i32;
         match environ_of(me) {
-            Some(env) => assert!(!env.is_empty(), "our own environment is not empty"),
+            // Only the allowlisted marker entries ever leave the kernel buffer.
+            Some(env) => assert!(env.iter().all(|e| ENV_MARKER_KEYS
+                .iter()
+                .any(|k| e.starts_with(&format!("{k}="))))),
             None => { /* also acceptable: DESIGN §8-4 */ }
         }
+        assert_eq!(env_entry_matches(me, "GILDE_NO_SUCH_KEY_FOR_TEST", "x"), Some(false));
         assert!(environ_of(0).is_none());
         assert!(environ_of(-1).is_none());
         // The whole point: no panic, no Err.

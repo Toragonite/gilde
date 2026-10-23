@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-newsession-options"
+description = "Enables the newsession_options command without any pre-configured scope."
+commands.allow = ["newsession_options"]
+
+[[permission]]
+identifier = "deny-newsession-options"
+description = "Denies the newsession_options command without any pre-configured scope."
+commands.deny = ["newsession_options"]

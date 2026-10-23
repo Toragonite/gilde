@@ -1,0 +1,91 @@
+{
+  "schema": 1,
+  "provenance": "Phase P live probes on account g, 2026-10-22 (research/R6-live-probes.md), folded into contract §1.3 by Appendix B A3. Per contract §15.5 a capability is marked verified only for the version its probe group ran on: 2.1.306 conversation (R6 §3, group 1), 2.1.307 paneHosting (R6 §5, group 3). A feature flag is set only where the §1.3 Status column reads 'frozen (V)' (true) or 'fallback (V)' (false: the probe contradicted the clause; an explicit false also stops forward inheritance). Absent = fallback. teamStoreVerified is never listed here: the static canary's teamStore set derives it per binary (§3.10 input 2, §5.2.4).",
+  "pending": {
+    "ruleAllowMarker": "§1.3 P13 open: LP-37 was not in R6's brief",
+    "l2SpawnSeam": "§1.3 P15 conditional (T20): LP-32 / A-P2 not run (R6 §7)",
+    "continueOtherAccountResume": "§1.3 P31 blocked (OQ1): LP-25 not run (R6 §7)"
+  },
+  "versions": {
+    "2.1.306": {
+      "conversation": "verified",
+      "features": {
+        "handshakeShape": true,
+        "sessionIdHonoured": true,
+        "permissionPromptsHost": true,
+        "allowSession": true,
+        "denyAndStop": true,
+        "resumeRearm": false,
+        "stdinEofCancel": false,
+        "idleStdinExit": true,
+        "nowPriority": true,
+        "interruptReceipt": true,
+        "sessionStateEvents": true,
+        "planAnswer": true,
+        "freeTextAnswer": true,
+        "parallelRequests": true,
+        "errorReply": true,
+        "sandboxAsk": true,
+        "getUsageLive": true,
+        "entrypointMarker": true,
+        "screenDigitNoCr": true,
+        "transcriptUsage": true
+      },
+      "evidence": {
+        "conversation": "§15.5 (2.1.306 conversation) · R6 §0, §3: the L1 protocol group ran on 2.1.306",
+        "handshakeShape": "§1.3 P1 frozen (2.1.306) · R6 §3 LP-01 CONFIRMED",
+        "sessionIdHonoured": "§1.3 P2 frozen (2.1.306, 2.1.307) · R6 §3 LP-08 CONFIRMED",
+        "permissionPromptsHost": "§1.3 P3 frozen (2.1.306) · R6 §3 A-P3 CONFIRMED",
+        "allowSession": "§1.3 P4 frozen, amended (2.1.306) · R6 §3 LP-02 PARTIAL, lead ruling 2 (addRules only)",
+        "denyAndStop": "§1.3 P5 frozen, amended (2.1.306) · R6 §3 LP-03 PARTIAL",
+        "resumeRearm": "§1.3 P6 fallback (2.1.306) · R6 §3 LP-04a CONTRADICTED, lead ruling 1",
+        "stdinEofCancel": "§1.3 P7 fallback (2.1.306) · R6 §3 LP-04b CONTRADICTED, lead ruling 1",
+        "idleStdinExit": "§1.3 P8 frozen (2.1.306) · R6 §3 A-P4 CONFIRMED (exit-1 caveat)",
+        "nowPriority": "§1.3 P9 frozen (2.1.306, 2.1.307) · R6 §3 LP-05 CONFIRMED",
+        "interruptReceipt": "§1.3 P9 frozen (2.1.306, 2.1.307) · R6 §3 LP-05 CONFIRMED",
+        "sessionStateEvents": "§1.3 P9 frozen (2.1.306, 2.1.307) · R6 §3 LP-05 CONFIRMED",
+        "planAnswer": "§1.3 P10 frozen (2.1.306) · R6 §3 LP-06 CONFIRMED",
+        "freeTextAnswer": "§1.3 P10 frozen (2.1.306) · R6 §3 LP-06 CONFIRMED",
+        "parallelRequests": "§1.3 P11 frozen, amended (2.1.306) · R6 §3 LP-07 PARTIAL",
+        "errorReply": "§1.3 P11 frozen, amended (2.1.306) · R6 §3 LP-07 PARTIAL",
+        "sandboxAsk": "§1.3 P11 frozen, amended (2.1.306) · R6 §3 LP-07b PARTIAL",
+        "getUsageLive": "§1.3 P12 frozen (2.1.306) for get_usage and sign-in · R6 §3 LP-09 CONFIRMED, lead ruling 3",
+        "entrypointMarker": "§1.3 P14 frozen (2.1.306) · R6 §6 A-P1 CONFIRMED",
+        "screenDigitNoCr": "§1.3 P20 frozen, amended (2.1.306–2.1.307) · R6 §4 LP-12 PARTIAL, lead ruling 5",
+        "transcriptUsage": "§1.3 P32 frozen (2.1.306) · R6 §6 LP-26 CONFIRMED"
+      }
+    },
+    "2.1.307": {
+      "paneHosting": "verified",
+      "features": {
+        "sessionIdHonoured": true,
+        "nowPriority": true,
+        "interruptReceipt": true,
+        "sessionStateEvents": true,
+        "paneHostingVerified": true,
+        "leadPromptsForTeammates": true,
+        "screenDigitNoCr": true,
+        "idlePerTurn": true,
+        "teammateQuestionLocation": true,
+        "sendMessageMsgId": true,
+        "inFlightSignals": false,
+        "bgAttach": true
+      },
+      "evidence": {
+        "paneHosting": "§15.5 (2.1.307 paneHosting) · R6 §5 LP-10 CONFIRMED: 46 calls, 0 deviations (emulated tmux)",
+        "sessionIdHonoured": "§1.3 P2 frozen (2.1.306, 2.1.307) · R6 §3 LP-08 CONFIRMED",
+        "nowPriority": "§1.3 P9 frozen (2.1.306, 2.1.307) · R6 §3 LP-05 CONFIRMED",
+        "interruptReceipt": "§1.3 P9 frozen (2.1.306, 2.1.307) · R6 §3 LP-05 CONFIRMED",
+        "sessionStateEvents": "§1.3 P9 frozen (2.1.306, 2.1.307) · R6 §3 LP-05 CONFIRMED",
+        "paneHostingVerified": "§1.3 P18 frozen (2.1.307) · R6 §5 LP-10 CONFIRMED",
+        "leadPromptsForTeammates": "§1.3 P19 frozen (2.1.307) · R6 §5 LP-11 CONFIRMED (exception asks stay open)",
+        "screenDigitNoCr": "§1.3 P20 frozen, amended (2.1.306–2.1.307) · R6 §4 LP-12 PARTIAL, lead ruling 5",
+        "idlePerTurn": "§1.3 P22 frozen, amended (2.1.307) · R6 §5 LP-14 PARTIAL, lead ruling 4",
+        "teammateQuestionLocation": "§1.3 P22 frozen, amended (2.1.307) · R6 §5 LP-15 PARTIAL, lead ruling 4",
+        "sendMessageMsgId": "§1.3 P22 frozen (2.1.307) · R6 §5 LP-16 CONFIRMED",
+        "inFlightSignals": "§1.3 P23 fallback (2.1.307) · R6 §5 LP-17 PARTIAL (17b not runnable: no task tools)",
+        "bgAttach": "§1.3 P28 frozen (2.1.307) · R6 §6 LP-22 CONFIRMED"
+      }
+    }
+  }
+}

@@ -1,0 +1,213 @@
+/*
+ * New session sheet (ux-ia §3.12). Tokens only (styles/tokens.css); spacing
+ * from the 4/8/12/16 scale with 2/6 inside chips; no motion beyond the sheet's.
+ */
+
+.ns-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-8);
+}
+
+.ns-prompt {
+  width: 100%;
+  min-height: 72px;
+  max-height: 240px;
+  resize: vertical;
+}
+
+.ns-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-6);
+}
+
+.ns-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-6);
+  height: 24px;
+  max-width: 100%;
+  padding: 0 var(--sp-6);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--n2);
+  color: var(--n11);
+  font-size: var(--fs-sub);
+  white-space: nowrap;
+  cursor: default;
+}
+
+.ns-chip:hover:not(:disabled) {
+  background: var(--n3);
+}
+
+.ns-chip[aria-expanded='true'],
+.ns-chip[aria-pressed='true'] {
+  background: var(--n4);
+  color: var(--n12);
+}
+
+.ns-chip:disabled {
+  color: var(--n8);
+}
+
+.ns-chip-key {
+  font-family: var(--mono);
+  font-size: var(--fs-label);
+  color: var(--n8);
+}
+
+.ns-chip-value {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 280px;
+}
+
+.ns-menu {
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--n1);
+  padding: var(--sp-4);
+}
+
+.ns-menu-list {
+  display: flex;
+  flex-direction: column;
+  max-height: 224px;
+  overflow-y: auto;
+}
+
+.ns-menu-item {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-8);
+  min-height: var(--row-h);
+  padding: 0 var(--sp-8);
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--n11);
+  font-size: var(--fs-sub);
+  text-align: left;
+  cursor: default;
+}
+
+.ns-menu-item:hover:not(:disabled),
+.ns-menu-item:focus-visible {
+  background: var(--n3);
+}
+
+.ns-menu-item:disabled {
+  color: var(--n8);
+}
+
+.ns-menu-mark {
+  width: 8px;
+  height: 8px;
+  flex: none;
+  border-radius: 50%;
+  border: 1px solid var(--n7);
+}
+
+.ns-menu-mark[data-on='true'] {
+  background: var(--n12);
+  border-color: var(--n12);
+}
+
+.ns-menu-mark[data-kind='action'] {
+  border-color: transparent;
+}
+
+.ns-menu-label {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ns-menu-sub {
+  margin-left: auto;
+  padding-left: var(--sp-12);
+  color: var(--n8);
+  font-size: var(--fs-label);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ns-slug {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-6);
+  padding: var(--sp-6) var(--sp-8) var(--sp-2);
+  border-top: 1px solid var(--border);
+  margin-top: var(--sp-4);
+}
+
+.ns-slug-label {
+  color: var(--n8);
+  font-size: var(--fs-label);
+  white-space: nowrap;
+}
+
+.ns-slug-prefix {
+  color: var(--n8);
+}
+
+.ns-slug-input {
+  flex: 1;
+  min-width: 0;
+}
+
+.ns-slug-input[aria-invalid='true'] {
+  border-color: var(--warn);
+}
+
+.ns-lines {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+}
+
+.ns-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-8);
+  margin: 0;
+  color: var(--n9);
+  font-size: var(--fs-sub);
+}
+
+.ns-line[data-tone='warn'] {
+  color: var(--warn);
+}
+
+.ns-line[data-tone='error'] {
+  color: var(--error);
+}
+
+.ns-line-action {
+  height: 20px;
+}
+
+.ns-detail {
+  flex-basis: 100%;
+  color: var(--n8);
+  font-size: var(--fs-label);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.ns-keys {
+  margin-right: auto;
+  align-self: center;
+  color: var(--n8);
+  font-size: var(--fs-label);
+}
+
+@media (max-width: 960px) {
+  .ns-keys {
+    display: none;
+  }
+}

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-pty-snapshot"
+description = "Enables the pty_snapshot command without any pre-configured scope."
+commands.allow = ["pty_snapshot"]
+
+[[permission]]
+identifier = "deny-pty-snapshot"
+description = "Denies the pty_snapshot command without any pre-configured scope."
+commands.deny = ["pty_snapshot"]

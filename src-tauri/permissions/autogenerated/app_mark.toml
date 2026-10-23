@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-app-mark"
+description = "Enables the app_mark command without any pre-configured scope."
+commands.allow = ["app_mark"]
+
+[[permission]]
+identifier = "deny-app-mark"
+description = "Denies the app_mark command without any pre-configured scope."
+commands.deny = ["app_mark"]

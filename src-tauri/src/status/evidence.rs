@@ -15,7 +15,12 @@
 //! be a lie of omission, so the weak one is reported at [`CONF_FALLBACK_IDLE`],
 //! below [`LOW_CONFIDENCE`], and the UI draws it as a hollow dashed pill.
 
-use crate::model::graph::NodeStatus;
+use crate::agents::signatures::{PromptCardPatterns, ReadySignature, TrustDialogPatterns};
+use crate::contract::activity::{EvidenceLine, ScreenOptionFact, ScreenPromptFacts};
+use crate::contract::common::{Confidence, EpochMs};
+use crate::contract::display::TextCap;
+use crate::contract::ids::RequestId;
+use crate::contract::interaction::{InteractionKind, InteractionOption, OptionRole, PendingInteraction};
 use crate::model::status::{SessionStatus, StatusEvidence};
 
 // ---------------------------------------------------------------------------
@@ -153,6 +158,55 @@ pub const RESIZE_REPAINT_MS: i64 = OUTPUT_BURST_MS;
 
 /// Fallback for `config.status.stallAfterMs`.
 pub const DEFAULT_STALL_AFTER_MS: u64 = 120_000;
+
+// ---------------------------------------------------------------------------
+// Gilde 2 S5 rules (contract §6.2.2, §6.2.4, §6.2.6, §11.2)
+// ---------------------------------------------------------------------------
+
+/// A parsed screen prompt or setup menu on a settled grid.
+pub const CONF_SCREEN_PROMPT: f32 = 0.85;
+/// The vendor's ready signature on a settled grid (§6.2.6).
+pub const CONF_READY_SIGNATURE: f32 = 0.90;
+/// The settled-grid fallback for a vendor without a ready signature (N-03):
+/// `Likely`, and exactly what §6.2.2 readiness accepts in that case.
+pub const CONF_SETTLED_FALLBACK: f32 = 0.50;
+/// Readiness threshold with a verified ready signature (§6.2.2).
+pub const READY_CONFIDENCE: f32 = 0.6;
+/// Readiness threshold without one (§6.2.2, N-03).
+pub const READY_CONFIDENCE_FALLBACK: f32 = 0.5;
+/// The prompt scanner runs only on a grid settled this long (§6.2.6).
+pub const PROMPT_SETTLE_MS: u64 = 300;
+/// A card disappears once the grid has not matched it for this long (§6.2.4).
+pub const PROMPT_GONE_MS: i64 = 300;
+/// A ready signature counts on a grid settled this long.
+pub const READY_SETTLE_MS: u64 = 500;
+/// The settled-grid fallback needs this long (§6.2.6).
+pub const FALLBACK_SETTLE_MS: u64 = 2_000;
+/// PTYs with output in this window, or a pending prompt, tick at [`TICK_MS`];
+/// everything else at [`QUIET_TICK_MS`] (§6.2.7, §11.2 rule 1).
+pub const HOT_OUTPUT_MS: i64 = 10_000;
+pub const QUIET_TICK_MS: u64 = 5_000;
+/// The prompt grammar scans the bottom 30 rows (§6.2.4).
+pub const SCAN_ROWS: usize = 30;
+/// A run within the bottom 15 rows can be `High` (§6.2.4).
+pub const NEAR_BOTTOM_ROWS: usize = 15;
+/// At most two non-option lines between consecutive options (§6.2.4).
+pub const MAX_GAP_LINES: usize = 2;
+/// The question is within 4 rows above option 1 (§6.2.4).
+pub const QUESTION_LOOKBACK: usize = 4;
+/// The prompt header reaches up to the nearest box border or rule within this
+/// many rows above the question; without one, it is these rows (A34.1).
+pub const HEADER_LOOKBACK: usize = 24;
+/// The footer is within 3 rows below the run.
+pub const FOOTER_LOOKAHEAD: usize = 3;
+/// More non-empty rows than this below a run (after its footer) means the run
+/// is text on a screen that moved on, not a prompt (false-positive guard).
+pub const MAX_TRAILING_ROWS: usize = 4;
+/// A setup-menu item longer than this is prose, not a menu item.
+pub const MAX_MENU_ITEM_CHARS: usize = 100;
+/// Card text caps (§3.4.5).
+pub const CARD_TITLE_CHARS: usize = 200;
+pub const CARD_LABEL_CHARS: usize = 120;
 
 // ---------------------------------------------------------------------------
 // the foreground sample
@@ -502,20 +556,6 @@ pub fn bypasses_debounce(status: &SessionStatus) -> bool {
     matches!(status, SessionStatus::Working { .. }) || status.is_terminal()
 }
 
-/// Graph colour for a status (DESIGN §9-5). The graph shows the same truth as
-/// the pill or it is worse than useless.
-pub fn node_status_of(status: &SessionStatus) -> NodeStatus {
-    match status {
-        SessionStatus::Starting | SessionStatus::Idle => NodeStatus::Idle,
-        SessionStatus::Working { .. } => NodeStatus::Working,
-        SessionStatus::WaitingForInput { .. } => NodeStatus::Waiting,
-        SessionStatus::Stalled { .. } => NodeStatus::Stalled,
-        SessionStatus::Exited { .. } | SessionStatus::Killed => NodeStatus::Exited,
-        SessionStatus::Detached => NodeStatus::Detached,
-        SessionStatus::Failed { .. } => NodeStatus::Error,
-    }
-}
-
 /// A matched line, cut to something a tooltip can render.
 ///
 /// The whole line is the evidence, but a TUI can draw a 400-column box and the
@@ -529,6 +569,684 @@ pub fn clip_line(line: &str) -> String {
     let mut out: String = line.chars().take(EVIDENCE_LINE_LIMIT).collect();
     out.push('…');
     out
+}
+
+// ---------------------------------------------------------------------------
+// the screen-prompt reader (contract §6.2.4)
+// ---------------------------------------------------------------------------
+
+/// What the reader takes from the signature file for one vendor.
+#[derive(Debug, Clone, Copy)]
+pub struct PromptGrammar<'a> {
+    pub card: &'a PromptCardPatterns,
+    pub trust: Option<&'a TrustDialogPatterns>,
+    pub ready: Option<&'a ReadySignature>,
+}
+
+fn indent_of(line: &str) -> usize {
+    line.chars().take_while(|c| *c == ' ').count()
+}
+
+fn width_of(s: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(s)
+}
+
+/// A line the TUI wrapped at the right margin: its first word would not have
+/// fit after `prev` on a `cols`-wide row (with a little slack for TUIs that
+/// keep a right margin). This is what tells a wrapped label ("…/proj from" /
+/// "this project") from an option's description ("Red" / "Choose red"), which
+/// share their indentation [R6 §4].
+fn wraps(prev: &str, line: &str, cols: usize) -> bool {
+    let prev_end = width_of(prev.trim_end());
+    let first = line.trim_start().split(' ').next().unwrap_or("");
+    prev_end + 1 + width_of(first) > cols.saturating_sub(4)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Part {
+    Label,
+    Description,
+    Divider,
+}
+
+#[derive(Debug, Clone)]
+struct RunOption {
+    digit: u8,
+    /// Char column of the digit: continuation and description lines are
+    /// indented deeper than this.
+    digit_col: usize,
+    label: String,
+    description: Option<String>,
+    selected: bool,
+    /// The previous line of this option, for the wrap test.
+    last_line: String,
+    last_part: Part,
+}
+
+#[derive(Debug, Clone)]
+struct Run {
+    options: Vec<RunOption>,
+    /// Non-option lines since the last option line.
+    gap: usize,
+    first_row: usize,
+    end_row: usize,
+}
+
+impl Run {
+    fn is_valid(&self) -> bool {
+        self.options.len() >= 2
+    }
+}
+
+fn append(target: &mut String, more: &str) {
+    if !target.is_empty() {
+        target.push(' ');
+    }
+    target.push_str(more);
+}
+
+/// The last valid option run (the one lowest on the screen) in `rows`.
+fn last_run(lines: &[String], from: usize, cols: usize, card: &PromptCardPatterns) -> Option<Run> {
+    let mut best: Option<Run> = None;
+    let mut cur: Option<Run> = None;
+    let finish = |run: Option<Run>, best: &mut Option<Run>| {
+        if let Some(run) = run {
+            if run.is_valid() {
+                *best = Some(run);
+            }
+        }
+    };
+
+    for (row, line) in lines.iter().enumerate().skip(from) {
+        if let Some(caps) = card.option.captures(line) {
+            let digit = caps
+                .get(1)
+                .and_then(|m| m.as_str().parse::<u8>().ok())
+                .unwrap_or(0);
+            let label = caps.get(2).map(|m| m.as_str().trim_end()).unwrap_or("");
+            let digit_col = caps
+                .get(1)
+                .map(|m| line[..m.start()].chars().count())
+                .unwrap_or(0);
+            let option = RunOption {
+                digit,
+                digit_col,
+                label: label.to_string(),
+                description: None,
+                selected: card.marker.is_match(line),
+                last_line: line.clone(),
+                last_part: Part::Label,
+            };
+            let continues = cur.as_ref().is_some_and(|run| {
+                run.gap <= MAX_GAP_LINES
+                    && run.options.last().map(|o| o.digit + 1) == Some(digit)
+                    && digit <= 9
+            });
+            if continues {
+                let run = cur.as_mut().expect("checked above");
+                run.options.push(option);
+                run.gap = 0;
+                run.end_row = row;
+            } else {
+                finish(cur.take(), &mut best);
+                if digit == 1 {
+                    cur = Some(Run {
+                        options: vec![option],
+                        gap: 0,
+                        first_row: row,
+                        end_row: row,
+                    });
+                }
+            }
+            continue;
+        }
+
+        let Some(run) = cur.as_mut() else { continue };
+        let ends_run = line.trim().is_empty()
+            || run.gap >= MAX_GAP_LINES
+            || card.footer.is_match(line);
+        if ends_run {
+            finish(cur.take(), &mut best);
+            continue;
+        }
+        let last = run.options.last_mut().expect("a run has an option");
+        if card.divider.is_match(line) {
+            run.gap += 1;
+            last.last_part = Part::Divider;
+            continue;
+        }
+        if indent_of(line) <= last.digit_col || last.last_part == Part::Divider {
+            // Not under this option: the run is over.
+            finish(cur.take(), &mut best);
+            continue;
+        }
+        let text = line.trim();
+        if card.continuation.is_match(line) && wraps(&last.last_line, line, cols) {
+            match last.last_part {
+                Part::Description => append(last.description.get_or_insert_with(String::new), text),
+                _ => append(&mut last.label, text),
+            }
+        } else if card.description.is_match(line) {
+            append(last.description.get_or_insert_with(String::new), text);
+            last.last_part = Part::Description;
+        } else if card.continuation.is_match(line) {
+            append(&mut last.label, text);
+            last.last_part = Part::Label;
+        } else {
+            finish(cur.take(), &mut best);
+            continue;
+        }
+        last.last_line = line.clone();
+        run.gap += 1;
+        run.end_row = row;
+    }
+    finish(cur, &mut best);
+    best
+}
+
+/// The first non-empty, non-divider row within `n` rows below `after`.
+fn footer_below(
+    lines: &[String],
+    after: usize,
+    n: usize,
+    divider: &regex::Regex,
+) -> Option<(usize, String)> {
+    for (row, line) in lines.iter().enumerate().skip(after + 1).take(n) {
+        if line.trim().is_empty() || divider.is_match(line) {
+            continue;
+        }
+        return Some((row, line.trim().to_string()));
+    }
+    None
+}
+
+/// Non-empty, non-divider rows below `after` to the bottom of the screen.
+fn trailing_rows(lines: &[String], after: usize, divider: &regex::Regex) -> usize {
+    lines
+        .iter()
+        .skip(after + 1)
+        .filter(|l| !l.trim().is_empty() && !divider.is_match(l))
+        .count()
+}
+
+/// The question above `first_row` (§6.2.4).
+struct Question {
+    text: Option<String>,
+    /// Where the prompt box's header ends (exclusive): the question's row, or
+    /// `first_row` when no question line was found (A34.1).
+    anchor: usize,
+}
+
+/// The question above `first_row` (§6.2.4). A `☐ <header>` line is never the
+/// question; it is part of the box header (A34.1).
+fn question_above(lines: &[String], first_row: usize, card: &PromptCardPatterns) -> Question {
+    let lo = first_row.saturating_sub(QUESTION_LOOKBACK);
+    let found = (lo..first_row)
+        .rev()
+        .find(|&row| !lines[row].trim().is_empty() && !card.divider.is_match(&lines[row]));
+    match found {
+        Some(row) if !card.header.is_match(&lines[row]) => Question {
+            text: Some(lines[row].trim().to_string()),
+            anchor: row,
+        },
+        _ => Question { text: None, anchor: first_row },
+    }
+}
+
+/// A **solid** box edge: a `─━═` rule, a line that starts at a box corner, or
+/// a divider-regex line — the top (or bottom) edge of a prompt box (A34.1,
+/// A38.5). Dashed lines (`╌┄┈╍` …) are never edges: the 2.1.307 TUI draws
+/// them **inside** the box around the command it asks about (LP-12 recording
+/// `lp12-11-perm-prompt.txt`), so they stay in the header.
+fn is_box_edge(line: &str, card: &PromptCardPatterns) -> bool {
+    let t = line.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if card.divider.is_match(line) {
+        return true;
+    }
+    let corner = |c: char| matches!(c, '╭' | '╮' | '╰' | '╯' | '┌' | '┐' | '└' | '┘' | '╔' | '╗' | '╚' | '╝');
+    let flat = |c: char| matches!(c, '─' | '━' | '═');
+    let rule = t.chars().filter(|c| flat(*c)).count();
+    let starts_at_corner = t.chars().next().is_some_and(corner);
+    rule >= 3 && (starts_at_corner || t.chars().all(|c| flat(c) || corner(c)))
+}
+
+/// One header line as it enters the digest: trailing whitespace and a
+/// leading cursor marker ignored (A34.1).
+fn header_line(line: &str, card: &PromptCardPatterns) -> String {
+    let line = line.trim_end();
+    if let Some(m) = card.marker.find(line) {
+        if m.start() == 0 {
+            let marked = &line[..m.end()];
+            let indent = marked.len() - marked.trim_start().len();
+            return format!("{}{}", &line[..indent], line[m.end()..].trim_start());
+        }
+    }
+    line.to_string()
+}
+
+/// The prompt box's header (A34.1).
+struct BoxHeader {
+    /// What enters `prompt_rev`: the rows above the question up to the nearest
+    /// solid box edge within [`HEADER_LOOKBACK`] rows, or — when there is none
+    /// — the up-to-24 rows directly above.
+    digest: String,
+    /// What the card shows (A35.2): the same rows, but only when a box edge
+    /// bounded them and one of them has text. Rows above the question with no
+    /// box around them are not known to belong to the prompt, so they are
+    /// never presented as what it approves.
+    shown: Option<String>,
+}
+
+/// The prompt box's header above `anchor` (the question's row): where the
+/// TUI names what the prompt approves (tool, command, path, diff summary), so
+/// two prompts for different commands never share a digest (A34.1) and the
+/// card can show it (A35.2).
+fn header_above(lines: &[String], anchor: usize, card: &PromptCardPatterns) -> BoxHeader {
+    let lo = anchor.saturating_sub(HEADER_LOOKBACK);
+    let edge = (lo..anchor).rev().find(|&row| is_box_edge(&lines[row], card));
+    let top = edge.map(|e| e + 1).unwrap_or(lo);
+    let rows: Vec<String> = lines[top..anchor].iter().map(|l| header_line(l, card)).collect();
+    let digest = rows.join("\n");
+    let shown = (edge.is_some() && rows.iter().any(|r| !r.trim().is_empty())).then(|| digest.clone());
+    BoxHeader { digest, shown }
+}
+
+/// `prompt_rev` (§6.2.4 as amended by A34.1): the first 16 hex of
+/// sha256(header + "\n" + question + "\n" + labels), with trailing whitespace
+/// and the cursor marker already gone, so a repaint — or a moved highlight —
+/// keeps it stable, while a prompt that approves something else (another
+/// command in the header) never shares it.
+pub fn prompt_rev(header: &str, question: Option<&str>, labels: &[&str]) -> String {
+    let mut text = String::from(header);
+    text.push('\n');
+    text.push_str(question.unwrap_or("").trim_end());
+    text.push('\n');
+    text.push_str(
+        &labels
+            .iter()
+            .map(|l| l.trim_end())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    crate::contract::ids::hash16(text.as_bytes())
+}
+
+/// Read the screen prompt — a numbered option run, or an unnumbered setup
+/// menu — off a grid (contract §6.2.4). `lines` are the grid rows, topmost
+/// first; `cols` the grid width.
+///
+/// Every guard here errs towards **no card**: a prompt the reader did not
+/// fully recognise is never offered, so it can never be answered (PM-28):
+///
+/// * the vendor's ready signature on screen means its composer is up, so
+///   nothing on that screen is a prompt;
+/// * a numbered run needs ≥ 2 consecutive options from 1, at most two
+///   continuation/description/divider lines between options, and either a
+///   recognised footer or a selection marker;
+/// * a run with more than [`MAX_TRAILING_ROWS`] rows of text below it is
+///   history on a screen that moved on (a numbered list in prose);
+/// * a setup menu needs ≥ 2 short items around one cursor line.
+pub fn parse_screen_prompt(
+    lines: &[String],
+    cols: usize,
+    grammar: PromptGrammar<'_>,
+    now: EpochMs,
+) -> Option<ScreenPromptFacts> {
+    if lines.is_empty() {
+        return None;
+    }
+    if grammar.ready.is_some_and(|ready| ready.matches(lines)) {
+        return None;
+    }
+    let card = grammar.card;
+    let n = lines.len();
+    let from = n.saturating_sub(SCAN_ROWS);
+
+    if let Some(run) = last_run(lines, from, cols, card) {
+        return numbered_prompt(lines, &run, card, now);
+    }
+    setup_menu(lines, from, grammar, now)
+}
+
+fn numbered_prompt(
+    lines: &[String],
+    run: &Run,
+    card: &PromptCardPatterns,
+    now: EpochMs,
+) -> Option<ScreenPromptFacts> {
+    let n = lines.len();
+    let footer = footer_below(lines, run.end_row, FOOTER_LOOKAHEAD, &card.divider)
+        .filter(|(_, text)| card.footer.is_match(text));
+    let below_from = footer.as_ref().map(|(row, _)| *row).unwrap_or(run.end_row);
+    if trailing_rows(lines, below_from, &card.divider) > MAX_TRAILING_ROWS {
+        return None;
+    }
+    let selected = run.options.iter().any(|o| o.selected);
+    if footer.is_none() && !selected {
+        return None;
+    }
+    let Question { text: question, anchor } = question_above(lines, run.first_row, card);
+    let header = header_above(lines, anchor, card);
+    let labels: Vec<&str> = run.options.iter().map(|o| o.label.as_str()).collect();
+    let first = labels.first().map(|l| l.to_lowercase()).unwrap_or_default();
+    let last = labels.last().map(|l| l.to_lowercase()).unwrap_or_default();
+    let footer_text = footer.map(|(_, text)| text);
+    Some(ScreenPromptFacts {
+        prompt_rev: prompt_rev(&header.digest, question.as_deref(), &labels),
+        question,
+        header: header.shown,
+        options: run
+            .options
+            .iter()
+            .map(|o| ScreenOptionFact {
+                key: o.digit.to_string(),
+                label: o.label.clone(),
+                description: o.description.clone(),
+                selected: o.selected,
+            })
+            .collect(),
+        allows_note: footer_text.as_deref().is_some_and(|f| card.amend.is_match(f)),
+        footer: footer_text,
+        permission_shaped: first.starts_with("yes") && last.starts_with("no"),
+        setup: false,
+        trust_dialog: false,
+        near_bottom: run.end_row + NEAR_BOTTOM_ROWS >= n,
+        first_seen_at: now,
+    })
+}
+
+/// A numbered line (any number of digits): never a setup-menu item — setup
+/// menus have no digits (§6.2.4).
+fn is_numbered(line: &str) -> bool {
+    let t = line.trim_start().trim_start_matches(['❯', '›', '>']).trim_start();
+    let digits = t.chars().take_while(char::is_ascii_digit).count();
+    digits > 0 && t[digits..].starts_with(". ")
+}
+
+fn is_menu_item(line: &str, marker_indent: usize, card: &PromptCardPatterns) -> bool {
+    !line.trim().is_empty()
+        && !is_numbered(line)
+        && indent_of(line) > marker_indent
+        && !card.divider.is_match(line)
+        && !card.option.is_match(line)
+        && !card.setup_marker.is_match(line)
+        && !card.footer.is_match(line)
+        && line.trim().chars().count() <= MAX_MENU_ITEM_CHARS
+}
+
+fn setup_menu(
+    lines: &[String],
+    from: usize,
+    grammar: PromptGrammar<'_>,
+    now: EpochMs,
+) -> Option<ScreenPromptFacts> {
+    let card = grammar.card;
+    let n = lines.len();
+    for row in (from..n).rev() {
+        let line = &lines[row];
+        if card.option.is_match(line) {
+            continue;
+        }
+        if is_numbered(line) {
+            continue;
+        }
+        let Some(caps) = card.setup_marker.captures(line) else {
+            continue;
+        };
+        let marker_indent = caps.get(1).map(|m| m.as_str().chars().count()).unwrap_or(0);
+        let label = caps.get(2).map(|m| m.as_str().trim()).unwrap_or("");
+        if label.is_empty() || label.chars().count() > MAX_MENU_ITEM_CHARS {
+            continue;
+        }
+        let mut items: Vec<(usize, String, bool)> = vec![(row, label.to_string(), true)];
+        let mut top = row;
+        while top > from && is_menu_item(&lines[top - 1], marker_indent, card) {
+            top -= 1;
+            items.insert(0, (top, lines[top].trim().to_string(), false));
+        }
+        let mut bottom = row;
+        while bottom + 1 < n && is_menu_item(&lines[bottom + 1], marker_indent, card) {
+            bottom += 1;
+            items.push((bottom, lines[bottom].trim().to_string(), false));
+        }
+        if items.len() < 2 {
+            continue;
+        }
+        let Question { text: question, anchor } = question_above(lines, top, card);
+        let header = header_above(lines, anchor, card);
+        let footer = footer_below(lines, bottom, FOOTER_LOOKAHEAD, &card.divider)
+            .map(|(_, text)| text)
+            .filter(|text| {
+                card.footer.is_match(text)
+                    || grammar
+                        .trust
+                        .and_then(|t| t.footer.as_ref())
+                        .is_some_and(|f| f.is_match(text))
+            });
+        let labels: Vec<&str> = items.iter().map(|(_, l, _)| l.as_str()).collect();
+        let trust_dialog = grammar.trust.is_some_and(|t| {
+            labels.iter().any(|l| t.is_trust(l))
+                && labels.iter().any(|l| t.is_exit(l))
+                && t.footer
+                    .as_ref()
+                    .is_none_or(|f| footer.as_deref().is_some_and(|text| f.is_match(text)))
+        });
+        return Some(ScreenPromptFacts {
+            prompt_rev: prompt_rev(&header.digest, question.as_deref(), &labels),
+            question,
+            header: header.shown,
+            options: items
+                .iter()
+                .map(|(_, label, selected)| ScreenOptionFact {
+                    key: String::new(),
+                    label: label.clone(),
+                    description: None,
+                    selected: *selected,
+                })
+                .collect(),
+            footer,
+            permission_shaped: false,
+            setup: true,
+            trust_dialog,
+            allows_note: false,
+            near_bottom: bottom + NEAR_BOTTOM_ROWS >= n,
+            first_seen_at: now,
+        });
+    }
+    None
+}
+
+/// The highlighted item of a setup menu and the trust option's index (A6).
+pub fn trust_positions(facts: &ScreenPromptFacts, trust: &TrustDialogPatterns) -> Option<(usize, usize)> {
+    if !facts.setup || !facts.trust_dialog {
+        return None;
+    }
+    let highlighted = facts.options.iter().position(|o| o.selected)?;
+    let target = facts.options.iter().position(|o| trust.is_trust(&o.label))?;
+    Some((highlighted, target))
+}
+
+/// The options a screen-prompt card offers and what each one means (§3.4.5,
+/// §6.2.4, A25.1) — the one role mapping every card builder uses, so a card
+/// never says more than the grid shows:
+///
+/// * **permission-shaped** prompt: option 1 `AllowOnce`, the last option
+///   `Deny` (it stops the turn, F-53), the rest `Other`. Option 1 is
+///   `AllowWithNote` instead when the footer offers "Tab to amend" and option
+///   1 is the highlighted one: Tab amends the highlighted option, and the note
+///   flow is verified on option 1 only [R6 §4 LP-12]. `AllowWithNote` is
+///   still the allow-once digit; it adds "Allow with a note".
+/// * **question-shaped** prompt: every option `Answer`.
+/// * **setup prompt**: no options (never answered, lead ruling 5), except the
+///   recognised folder-trust dialog (A6): one `TrustFolder` option whose key
+///   is the trust item's 1-based menu position and whose label is its text.
+///   The key is never sent — the core refuses keys on a setup prompt; the
+///   option's action is `screen_prompt_key{TrustFolder}`, which finds the
+///   trust item again under the write lock.
+///
+/// Keys are `^[1-9]$` and unique (§3.4.5); anything else is left out.
+pub fn card_options(facts: &ScreenPromptFacts) -> Vec<InteractionOption> {
+    let clip = |s: &str| crate::render::sanitize::sanitize_display_text(s, TextCap::Chars(CARD_LABEL_CHARS)).text;
+    if facts.setup {
+        return trust_option(facts)
+            .map(|(position, label)| InteractionOption {
+                key: position.to_string(),
+                label: clip(label),
+                role: OptionRole::TrustFolder,
+            })
+            .into_iter()
+            .collect();
+    }
+    let note = facts.permission_shaped && facts.allows_note && facts.options.first().is_some_and(|o| o.selected);
+    let last = facts.options.len().saturating_sub(1);
+    let mut keys = std::collections::HashSet::new();
+    facts
+        .options
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| o.key != "esc" && crate::contract::interaction::is_option_key(&o.key) && keys.insert(o.key.clone()))
+        .map(|(i, o)| InteractionOption {
+            key: o.key.clone(),
+            label: clip(&o.label),
+            role: match (facts.permission_shaped, i) {
+                (true, 0) if note => OptionRole::AllowWithNote,
+                (true, 0) => OptionRole::AllowOnce,
+                (true, i) if i == last => OptionRole::Deny,
+                (true, _) => OptionRole::Other,
+                (false, _) => OptionRole::Answer,
+            },
+        })
+        .collect()
+}
+
+/// The trust item of a recognised trust dialog (A6), from the facts alone:
+/// its 1-based menu position (≤ 9) and its label. `trust_dialog` was decided
+/// with the vendor's live `trustDialog` patterns when the grid was read; of
+/// the two families it requires ("No, exit" and "Yes, I trust this folder"
+/// [R6 §4]) the trust item is the one item that starts with "Yes" — read the
+/// way `permission_shaped` reads option 1. None or several such items → `None`
+/// (the card keeps "Continue in the terminal", A6's fallback).
+fn trust_option(facts: &ScreenPromptFacts) -> Option<(usize, &str)> {
+    if !facts.setup || !facts.trust_dialog {
+        return None;
+    }
+    let mut yes = facts
+        .options
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| o.label.trim_start().to_lowercase().starts_with("yes"));
+    let (index, item) = yes.next()?;
+    if yes.next().is_some() || index >= 9 {
+        return None;
+    }
+    Some((index + 1, item.label.as_str()))
+}
+
+/// A card's detail lines: ≤ 12 lines and ≤ 2 KiB of text in all (§3.4.5).
+pub const CARD_DETAIL_LINES: usize = 12;
+pub const CARD_DETAIL_BYTES: usize = 2 * 1024;
+
+const ELLIPSIS: &str = "…";
+
+/// A header row as the card shows it: its own box sides (`│ … │`) dropped;
+/// `None` for a blank row or one drawn only of box-drawing characters.
+fn shown_row(row: &str) -> Option<&str> {
+    let sides = ['│', '┃', '║'];
+    let t = row.trim().trim_start_matches(sides).trim_end_matches(sides).trim();
+    let drawing = |c: char| ('\u{2500}'..='\u{257F}').contains(&c) || c.is_whitespace();
+    (!t.is_empty() && !t.chars().all(drawing)).then_some(t)
+}
+
+/// What a screen card shows of the prompt box's header (A35.2), shared by
+/// both card builders (this module's [`screen_card`] and World's): the rows
+/// in their order as sanitized `card.detailText` lines — what the prompt
+/// approves (tool, command, path, host, description) — bounded by
+/// [`CARD_DETAIL_LINES`] and [`CARD_DETAIL_BYTES`] with "…" where cut. Empty
+/// when no header was captured: nothing is ever invented.
+pub fn card_detail_lines(facts: &ScreenPromptFacts) -> Vec<EvidenceLine> {
+    let Some(header) = facts.header.as_deref() else {
+        return Vec::new();
+    };
+    let rows: Vec<&str> = header.lines().filter_map(shown_row).collect();
+    let mut out = Vec::new();
+    let mut used = 0usize;
+    for (i, row) in rows.iter().enumerate() {
+        let more = i + 1 < rows.len();
+        // Keep room for a closing "…" line while rows remain.
+        let reserve = if more { ELLIPSIS.len() } else { 0 };
+        let room = CARD_DETAIL_BYTES.saturating_sub(used + reserve);
+        if more && (out.len() + 1 == CARD_DETAIL_LINES || room <= ELLIPSIS.len()) {
+            out.push(EvidenceLine::detail_text(ELLIPSIS));
+            break;
+        }
+        let line = crate::render::sanitize::sanitize_display_text(row, TextCap::Bytes(room));
+        if line.text.trim().is_empty() {
+            continue;
+        }
+        used += line.text.len();
+        out.push(EvidenceLine::detail_text(line.text));
+        if line.truncated {
+            break;
+        }
+    }
+    out
+}
+
+/// A35.2: a permission-shaped screen card that cannot show what it approves
+/// (no header captured) keeps `⌘⏎` inert — `default_to_no` — so the user
+/// presses the digit or opens the terminal.
+pub fn approves_unseen(facts: &ScreenPromptFacts) -> bool {
+    facts.permission_shaped && !facts.setup && card_detail_lines(facts).is_empty()
+}
+
+/// The card a screen prompt becomes (§3.4.5, §6.2.4): `sp_<prompt_rev>`,
+/// `High` iff the engine reports `WaitingForInput` at ≥ 0.6 and the run lies
+/// within the bottom 15 rows, else `Likely`; its options and their roles are
+/// [`card_options`], its detail lines the prompt box's header
+/// ([`card_detail_lines`], A35.2). `⌘⏎`/`⌘⌫` are live only on a
+/// permission-shaped prompt that is also `High` and shows what it approves
+/// (`default_to_no` otherwise).
+pub fn screen_card(facts: &ScreenPromptFacts, waiting_confidence: Option<f32>) -> PendingInteraction {
+    let high = waiting_confidence.is_some_and(|c| c >= PROMPT_GATE_CONFIDENCE) && facts.near_bottom;
+    let clip = |s: &str, n: usize| {
+        crate::render::sanitize::sanitize_display_text(s, TextCap::Chars(n)).text
+    };
+    let request_id = RequestId::parse(format!("sp_{}", facts.prompt_rev))
+        .expect("sp_ + 16 hex is a valid request id");
+    let options = card_options(facts);
+    PendingInteraction {
+        request_id,
+        kind: if facts.setup {
+            InteractionKind::SetupPrompt
+        } else {
+            InteractionKind::ScreenPrompt
+        },
+        received_at: facts.first_seen_at,
+        on_behalf_of: None,
+        answer_in: None,
+        title: facts
+            .question
+            .as_deref()
+            .map(|q| clip(q, CARD_TITLE_CHARS))
+            .unwrap_or_default(),
+        tool: None,
+        detail_lines: card_detail_lines(facts),
+        options,
+        always_label: None,
+        default_to_no: !(facts.permission_shaped && high) || approves_unseen(facts),
+        degraded: false,
+        prompt_rev: Some(facts.prompt_rev.clone()),
+        confidence: if high {
+            Confidence::High
+        } else {
+            Confidence::Likely
+        },
+        multi_select: false,
+        questions: Vec::new(),
+    }
 }
 
 #[cfg(test)]
@@ -776,6 +1494,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn the_fallback_idle_is_below_the_hollow_pill_threshold() {
         assert!(is_low_confidence(CONF_FALLBACK_IDLE));
         assert!(is_low_confidence(CONF_STARTING));

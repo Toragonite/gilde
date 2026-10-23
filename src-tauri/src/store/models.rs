@@ -119,7 +119,11 @@ impl ProcState {
 }
 
 text_enum! {
-    /// `proc_registry.kind` (DESIGN §8-2).
+    /// `proc_registry.kind` (DESIGN §8-2, contract §3.8).
+    ///
+    /// Gilde 2 adds `convo`, `pane`, `attach`, `turn`, `ide` and `vendorcli`;
+    /// `headless` and `gateway` stay readable for rows of older builds (and the
+    /// kept sidecar code), but no Gilde 2 path plans one.
     ProcKind, "proc_registry.kind" {
         Pty => "pty",
         Headless => "headless",
@@ -127,6 +131,42 @@ text_enum! {
         Gateway => "gateway",
         Probe => "probe",
         Git => "git",
+        Convo => "convo",
+        Pane => "pane",
+        Attach => "attach",
+        Turn => "turn",
+        Ide => "ide",
+        Vendorcli => "vendorcli",
+    }
+}
+
+impl From<crate::contract::process::ProcKind> for ProcKind {
+    fn from(kind: crate::contract::process::ProcKind) -> ProcKind {
+        use crate::contract::process::ProcKind as C;
+        match kind {
+            C::Pty => ProcKind::Pty,
+            C::Sidecar => ProcKind::Sidecar,
+            C::Convo => ProcKind::Convo,
+            C::Pane => ProcKind::Pane,
+            C::Attach => ProcKind::Attach,
+            C::Turn => ProcKind::Turn,
+            C::Ide => ProcKind::Ide,
+            C::Vendorcli => ProcKind::Vendorcli,
+            C::Probe => ProcKind::Probe,
+            C::Git => ProcKind::Git,
+        }
+    }
+}
+
+impl ProcKind {
+    /// Kinds whose rows are Gilde sessions (contract §10.1): a row of one of
+    /// these with a session id that a crashed instance left behind becomes an
+    /// item of the crash quit record.
+    pub const fn is_session_kind(self) -> bool {
+        matches!(
+            self,
+            ProcKind::Convo | ProcKind::Pty | ProcKind::Pane | ProcKind::Attach | ProcKind::Turn
+        )
     }
 }
 
@@ -461,6 +501,8 @@ pub struct PtySessionRow {
     pub worktree_id: Option<String>,
     pub agent_kind: String,
     pub account_id: Option<String>,
+    /// Never persisted: migration v2 dropped the column (A12.4) and PTY
+    /// titles live in memory only. Always empty when read from the store.
     pub title: String,
     pub cwd: String,
     pub cols: i64,
@@ -485,7 +527,7 @@ impl FromRow for PtySessionRow {
             worktree_id: row.get("worktree_id")?,
             agent_kind: row.get("agent_kind")?,
             account_id: row.get("account_id")?,
-            title: row.get("title")?,
+            title: String::new(),
             cwd: row.get("cwd")?,
             cols: row.get("cols")?,
             rows: row.get("rows")?,
@@ -651,6 +693,101 @@ impl FromRow for AccountRow {
             last_seen_at: row.get("last_seen_at")?,
             last_quota_json: row.get("last_quota_json")?,
             last_quota_at: row.get("last_quota_at")?,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// quit_record / quit_record_item (contract §3.9)
+// ---------------------------------------------------------------------------
+
+/// `quit_record.cause`.
+pub const CAUSE_QUIT: &str = "quit";
+pub const CAUSE_CRASH: &str = "crash";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuitRecordRow {
+    /// `r_<uuidv7>` (a `QuitRecordId`).
+    pub id: String,
+    /// `quit` | `crash`.
+    pub cause: String,
+    pub created_at: i64,
+    pub resolved_at: Option<i64>,
+}
+
+impl FromRow for QuitRecordRow {
+    fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get("id")?,
+            cause: row.get("cause")?,
+            created_at: row.get("created_at")?,
+            resolved_at: row.get("resolved_at")?,
+        })
+    }
+}
+
+/// One session of a quit record — metadata only (§3.9).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuitItemRow {
+    pub uid: String,
+    /// `conversation` | `terminal` | `turnBased`.
+    pub control_mode: String,
+    pub permission_mode: Option<String>,
+    pub model: Option<String>,
+    /// `approval` | `answer`.
+    pub was_waiting: Option<String>,
+    pub team_lead: bool,
+    /// The process outlived the 6 s quit bound (§10.2) [C5].
+    pub survivor: bool,
+}
+
+impl FromRow for QuitItemRow {
+    fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            uid: row.get("uid")?,
+            control_mode: row.get("control_mode")?,
+            permission_mode: row.get("permission_mode")?,
+            model: row.get("model")?,
+            was_waiting: row.get("was_waiting")?,
+            team_lead: row.get::<_, i64>("team_lead")? != 0,
+            survivor: row.get::<_, i64>("survivor")? != 0,
+        })
+    }
+}
+
+/// One row of `claude_compat_observed` (§3.9, keyed `(version, binary_fingerprint)`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompatObservedRow {
+    pub version: String,
+    pub conversation: Option<String>,
+    pub pane_hosting: Option<String>,
+    /// `static_canary` | `handshake` | `observed`.
+    pub source: String,
+    /// `"<size>:<mtime_ms>:<inode>"` of the scanned binary.
+    pub binary_fingerprint: Option<String>,
+    pub static_result: Option<String>,
+    pub handshake_ok: Option<bool>,
+    pub features_json: Option<String>,
+    pub note: Option<String>,
+    pub observed_at: i64,
+}
+
+impl FromRow for CompatObservedRow {
+    fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            version: row.get("version")?,
+            conversation: row.get("conversation")?,
+            pane_hosting: row.get("pane_hosting")?,
+            source: row.get("source")?,
+            binary_fingerprint: row.get("binary_fingerprint")?,
+            static_result: row.get("static_result")?,
+            handshake_ok: row.get::<_, Option<i64>>("handshake_ok")?.map(|v| v != 0),
+            features_json: row.get("features_json")?,
+            note: row.get("note")?,
+            observed_at: row.get("observed_at")?,
         })
     }
 }

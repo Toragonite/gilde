@@ -1,0 +1,136 @@
+[
+  {
+    "id": "o435",
+    "seq": 1099511627776,
+    "at": 1792641603000,
+    "kind": {
+      "kind": "userText",
+      "text": "List the files.",
+      "origin": "human",
+      "delivery": null,
+      "clientMsgId": null
+    },
+    "truncated": false
+  },
+  {
+    "id": "o819",
+    "seq": 1099511627777,
+    "at": 1792641604000,
+    "kind": {
+      "kind": "thinking",
+      "seconds": null,
+      "text": "Listing files"
+    },
+    "truncated": false
+  },
+  {
+    "id": "o994",
+    "seq": 1099511627778,
+    "at": 1792641605000,
+    "kind": {
+      "kind": "toolCall",
+      "toolUseId": "i3",
+      "summary": {
+        "tool": "CommandExecution",
+        "verb": "run",
+        "object": "bash -lc ls"
+      },
+      "inputPreview": "bash -lc ls",
+      "status": "ok",
+      "resultPreview": "Cargo.toml\nsrc\n",
+      "fileChange": null,
+      "incomplete": false
+    },
+    "truncated": false
+  },
+  {
+    "id": "o1261",
+    "seq": 1099511627779,
+    "at": 1792641606000,
+    "kind": {
+      "kind": "toolCall",
+      "toolUseId": "i4",
+      "summary": {
+        "tool": "FileChange",
+        "verb": "create",
+        "object": "NOTES.md"
+      },
+      "inputPreview": "NOTES.md",
+      "status": "ok",
+      "resultPreview": null,
+      "fileChange": {
+        "pathRel": "NOTES.md",
+        "added": 2,
+        "removed": 0,
+        "change": "added"
+      },
+      "incomplete": false
+    },
+    "truncated": false
+  },
+  {
+    "id": "o1526",
+    "seq": 1099511627780,
+    "at": 1792641607000,
+    "kind": {
+      "kind": "toolCall",
+      "toolUseId": "i5",
+      "summary": {
+        "tool": "McpToolCall",
+        "verb": "use",
+        "object": "docs · search"
+      },
+      "inputPreview": "{\n  \"q\": \"layout\"\n}",
+      "status": "ok",
+      "resultPreview": "found 3",
+      "fileChange": null,
+      "incomplete": false
+    },
+    "truncated": false
+  },
+  {
+    "id": "o1998",
+    "seq": 1099511627781,
+    "at": 1792641609000,
+    "kind": {
+      "kind": "assistantText",
+      "markdown": "There are two entries.",
+      "streaming": false,
+      "agent": null
+    },
+    "truncated": false
+  },
+  {
+    "id": "o2381",
+    "seq": 1099511627782,
+    "at": 1792641661000,
+    "kind": {
+      "kind": "toolCall",
+      "toolUseId": "i7",
+      "summary": {
+        "tool": "CommandExecution",
+        "verb": "run",
+        "object": "false"
+      },
+      "inputPreview": "false",
+      "status": "error",
+      "resultPreview": null,
+      "fileChange": null,
+      "incomplete": false
+    },
+    "truncated": false
+  },
+  {
+    "id": "o2614",
+    "seq": 1099511627783,
+    "at": 1792641662000,
+    "kind": {
+      "kind": "system",
+      "note": {
+        "kind": "interrupted"
+      },
+      "text": null
+    },
+    "truncated": false
+  }
+]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-health-process-detail"
+description = "Enables the health_process_detail command without any pre-configured scope."
+commands.allow = ["health_process_detail"]
+
+[[permission]]
+identifier = "deny-health-process-detail"
+description = "Denies the health_process_detail command without any pre-configured scope."
+commands.deny = ["health_process_detail"]

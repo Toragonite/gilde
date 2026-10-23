@@ -16,6 +16,16 @@
  *   3. The copies import nothing but Node built-ins and each other (`./host-protocol`, and
  *      host-protocol's type-only `../uiTypes`, which src/vendored/uiTypes.ts re-exports from
  *      ./cco/uiTypes — checked to be exactly that one re-export).
+ *   4. P38 (contract §1.3, §7.3.1, pixel-office Q-F5) — the static check of what the
+ *      orchestrator feed exposes, read off the vendored types themselves:
+ *        - board tasks carry NO dependency / blocked-by ids (`BoardTask` has only
+ *          `state: 'blocked'` and a free-text `note`) → the Board shows `blockedBy` only
+ *          when declared, i.e. never for orchestrator tasks in this version;
+ *        - members DO carry their undelivered-message count (`MemberState.pending`,
+ *          "Undelivered messages for it") → an in-flight count is available (the observer
+ *          forwards it; Rust's `CcoMemberState.pending`).
+ *      A re-vendored copy that changes either fact fails here, so the P38 mapping is
+ *      re-decided by a person instead of drifting.
  *
  * Read-only: `git show` / `git cat-file` only, never a command that changes a repository.
  *
@@ -64,6 +74,29 @@ for (const [file, pin] of Object.entries(manifest.files)) {
   const shim = readFileSync(join(vendoredDir, 'uiTypes.ts'), 'utf8');
   const code = shim.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '').trim();
   check("src/vendored/uiTypes.ts is exactly `export type * from './cco/uiTypes';`", code === "export type * from './cco/uiTypes';", code);
+}
+
+// ── P38: what the orchestrator feed exposes (static, from the vendored types) ──
+{
+  const proto = readFileSync(join(dir, 'host-protocol.ts'), 'utf8');
+  const body = (name) => {
+    const m = new RegExp(`export interface ${name} \\{([\\s\\S]*?)\\n\\}`).exec(proto);
+    return m === null ? undefined : m[1].replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+  };
+  const boardTask = body('BoardTask');
+  const memberState = body('MemberState');
+  check('P38 the vendored BoardTask and MemberState interfaces are present', boardTask !== undefined && memberState !== undefined);
+  const depField = /\b(blockedBy|blocked_by|dependsOn|depends_on|dependencies|deps|blocks|waitingOn)\??\s*:/;
+  const blockedBy = boardTask !== undefined && depField.test(boardTask);
+  check('P38 BoardTask declares no dependency / blocked-by ids (blockedBy only when declared → none)', boardTask !== undefined && !blockedBy, 'a dependency field appeared: re-decide P38 (§7.3.1)');
+  const undelivered = memberState !== undefined && /\bpending\s*:\s*number\s*;/.test(memberState) && /Undelivered messages for it/.test(proto);
+  check('P38 MemberState.pending (undelivered messages) is exposed → in-flight count available', undelivered, 'MemberState.pending changed: re-decide P38 (§7.3.1)');
+  const observer = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'src', 'methods', 'cco.ts'), 'utf8');
+  check('P38 the observer forwards MemberState.pending', /pending:\s*count\(raw\.pending\)/.test(observer));
+  process.stdout.write(
+    `  P38 report: blockedBy ids ${blockedBy ? 'EXPOSED' : 'not exposed (board tasks: state + note only)'}; ` +
+      `undelivered messages ${undelivered ? 'EXPOSED (MemberState.pending)' : 'not exposed'} — vendored ${manifest.commit.slice(0, 7)}\n`,
+  );
 }
 
 // Drift: byte-identical to the recorded commit.

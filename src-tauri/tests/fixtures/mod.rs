@@ -1,9 +1,22 @@
-//! Test-side driver for the `fake_agent` fixture binary.
+//! The shared test harness (Gilde 2 contract §2.2.2, §14.1; owner T01, frozen
+//! after wave 0) and the test-side driver for the `fake_agent` fixture binary.
 //!
 //! Include it from any integration test with a plain `mod fixtures;`
 //! (`tests/<name>.rs` → `tests/fixtures/mod.rs`).
 //!
-//! What it gives you:
+//! **Hermetic environment** ([`Hermetic`], contract §14.1, A38.2): every test
+//! that runs product code sets `GILDE_HOME` to a temp dir, `HOME` into that
+//! temp dir, a `PATH` that contains only fixture binaries, `SHELL` to a path
+//! that does not exist, `DISABLE_AUTOUPDATER=1` and
+//! `AGENT_CLI_CREDENTIAL_STORE=memory`, and refuses to start when a vendor CLI
+//! (see [`VENDOR_CLIS`]) is reachable outside a fixture dir — on the
+//! **process** `PATH` or on the static detection ladder of the process `HOME`
+//! (`agents::path::static_candidates`, incl. `/opt/homebrew/bin` and
+//! `/usr/local/bin`). A rig that boots the core also pins detection with
+//! [`Hermetic::detection_pins`]. No test ever runs a real vendor CLI; cargo
+//! itself runs under `scripts/gates/hermetic-cargo.sh` (A38.1).
+//!
+//! What the `fake_agent` driver gives you:
 //!
 //!   * [`fake_agent_path`] — the built fixture binary, for tests that need to
 //!     hand a *path* to something else (a PTY session, the sidecar's `cmd`);
@@ -33,6 +46,275 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use std::os::unix::process::CommandExt;
+
+// ---------------------------------------------------------------------------
+// the hermetic environment (contract §14.1)
+// ---------------------------------------------------------------------------
+
+/// Every name agent detection may run (`AgentKind::binary_names` of the vendor
+/// kinds: `agent` is cursor's fallback name, `gemini` a kind of its own), the
+/// Windows-style `claude.exe`, and tmux. A test must never reach one of them
+/// outside a fixture dir.
+pub const VENDOR_CLIS: &[&str] = &["claude", "claude.exe", "codex", "cursor-agent", "agent", "agy", "gemini", "tmux"];
+
+/// The `SHELL` of every hermetic process (A38.2): a path that does not exist
+/// (and that no user can create), so a login-shell probe can never read a real
+/// profile and detection's shell row finds nothing.
+pub const NO_SHELL: &str = "/nonexistent/gilde-hermetic-shell";
+
+/// A temp root with `home/`, `home/.gilde` (`GILDE_HOME`) and `bin/` (the only
+/// `PATH` entry). Dropping it removes everything.
+pub struct Hermetic {
+    root: tempfile::TempDir,
+}
+
+/// Serializes [`Hermetic::enter`] and [`EnvPin`]: the process environment is global.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The `bin/` dirs of the live [`Hermetic`]s: the only places a vendor-named
+/// file may be reachable from (another test's `enter` puts its own on the
+/// process `PATH`).
+static LIVE_BIN_DIRS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+impl Hermetic {
+    /// Create the tree and refuse to start when a vendor CLI is reachable
+    /// from this test process (A38.2, see [`reachable_vendor_clis`]).
+    pub fn new() -> Hermetic {
+        let root = tempfile::Builder::new()
+            .prefix("gilde-test-")
+            .tempdir()
+            .expect("hermetic temp root");
+        let h = Hermetic { root };
+        for dir in [h.home(), h.gilde_home(), h.bin_dir(), h.tmp_dir()] {
+            std::fs::create_dir_all(&dir).expect("hermetic dirs");
+        }
+        LIVE_BIN_DIRS.lock().unwrap_or_else(|p| p.into_inner()).push(h.bin_dir());
+        h.assert_no_vendor_cli_outside_fixtures();
+        h
+    }
+
+    pub fn root(&self) -> &Path {
+        self.root.path()
+    }
+
+    pub fn home(&self) -> PathBuf {
+        self.root.path().join("home")
+    }
+
+    pub fn gilde_home(&self) -> PathBuf {
+        self.home().join(".gilde")
+    }
+
+    /// The only `PATH` entry: fixture binaries installed with [`Hermetic::install_fixture`].
+    pub fn bin_dir(&self) -> PathBuf {
+        self.root.path().join("bin")
+    }
+
+    pub fn tmp_dir(&self) -> PathBuf {
+        self.root.path().join("tmp")
+    }
+
+    /// The complete environment of a hermetic child (nothing is inherited).
+    pub fn env(&self) -> Vec<(String, String)> {
+        let s = |p: PathBuf| p.to_string_lossy().into_owned();
+        vec![
+            ("HOME".into(), s(self.home())),
+            ("GILDE_HOME".into(), s(self.gilde_home())),
+            ("PATH".into(), s(self.bin_dir())),
+            ("SHELL".into(), NO_SHELL.into()),
+            ("TMPDIR".into(), s(self.tmp_dir())),
+            ("LANG".into(), "en_US.UTF-8".into()),
+            ("DISABLE_AUTOUPDATER".into(), "1".into()),
+            ("AGENT_CLI_CREDENTIAL_STORE".into(), "memory".into()),
+        ]
+    }
+
+    /// Clear `cmd`'s environment and give it exactly [`Hermetic::env`].
+    pub fn apply<'c>(&self, cmd: &'c mut Command) -> &'c mut Command {
+        cmd.env_clear();
+        for (k, v) in self.env() {
+            cmd.env(k, v);
+        }
+        cmd
+    }
+
+    /// Put a fixture binary on the hermetic `PATH` under `name` (e.g. a
+    /// `fake_claude` as `claude`). Only fixture binaries may live here.
+    pub fn install_fixture(&self, name: &str, fixture: &Path) -> PathBuf {
+        let dest = self.bin_dir().join(name);
+        std::os::unix::fs::symlink(fixture, &dest)
+            .unwrap_or_else(|e| panic!("install fixture {name}: {e}"));
+        dest
+    }
+
+    /// Set the hermetic variables in this process (for in-process code that
+    /// reads `GILDE_HOME`, `HOME`, `PATH` or `SHELL`) until the guard drops.
+    /// Tests that use it are serialized by a global lock.
+    pub fn enter(&self) -> HermeticGuard<'_> {
+        let vars = self.env();
+        let vars: Vec<(&str, &str)> = vars.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        HermeticGuard { _pin: EnvPin::set(&vars), _env: self }
+    }
+
+    /// The `config.json` patch every rig that boots the core applies before
+    /// it wires it (A38.2): `agents.pathOverride` = [`Hermetic::bin_dir`] (the
+    /// override is the whole search path, A38.3), each vendor binary pinned to
+    /// `<bin>/<name>` (the fixture a test installed there, or a path that does
+    /// not exist), and `terminal.shell` = [`NO_SHELL`].
+    pub fn detection_pins(&self) -> serde_json::Value {
+        detection_pins_at(&self.bin_dir())
+    }
+
+    /// Contract §14.1, A38.2: no vendor CLI is reachable from this test
+    /// process outside a live fixture dir — neither on the process `PATH` nor
+    /// on the static detection ladder of the process `HOME` or of this tree's
+    /// home. Panics with what was found and how to run hermetically.
+    pub fn assert_no_vendor_cli_outside_fixtures(&self) {
+        let found = reachable_vendor_clis(&[self.home()]);
+        assert!(found.is_empty(), "{}", refusal(&found));
+    }
+}
+
+impl Default for Hermetic {
+    fn default() -> Self {
+        Hermetic::new()
+    }
+}
+
+impl Drop for Hermetic {
+    fn drop(&mut self) {
+        let bin = self.bin_dir();
+        LIVE_BIN_DIRS.lock().unwrap_or_else(|p| p.into_inner()).retain(|d| *d != bin);
+    }
+}
+
+/// Restores the process environment when dropped.
+pub struct HermeticGuard<'h> {
+    _pin: EnvPin,
+    _env: &'h Hermetic,
+}
+
+/// Process environment variables set under the harness lock and restored when
+/// dropped (also on a panic). [`Hermetic::enter`] is built on it; a rig whose
+/// lifetime is not one `enter` scope (`boot.rs`'s `Booted`) holds one itself.
+/// Every holder serializes with every other on the one lock.
+pub struct EnvPin {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    saved: Vec<(String, Option<std::ffi::OsString>)>,
+}
+
+impl EnvPin {
+    pub fn set(vars: &[(&str, &str)]) -> EnvPin {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut saved = Vec::new();
+        for (k, v) in vars {
+            saved.push(((*k).to_string(), std::env::var_os(k)));
+            // Every caller holds ENV_LOCK; tests that touch the process
+            // environment go through a pin (edition 2021: a safe call).
+            std::env::set_var(k, v);
+        }
+        EnvPin { _lock: lock, saved }
+    }
+}
+
+impl Drop for EnvPin {
+    fn drop(&mut self) {
+        for (k, v) in self.saved.drain(..).rev() {
+            // Still under ENV_LOCK (the lock field drops after this body).
+            match v {
+                Some(v) => std::env::set_var(&k, v),
+                None => std::env::remove_var(&k),
+            }
+        }
+    }
+}
+
+/// [`Hermetic::detection_pins`] for a fixture dir of the caller's choice
+/// (the smoke run's `--fake-bin`).
+pub fn detection_pins_at(bin: &Path) -> serde_json::Value {
+    let at = |name: &str| bin.join(name).to_string_lossy().into_owned();
+    serde_json::json!({
+        "agents": {
+            "pathOverride": bin.to_string_lossy(),
+            "binaries": {
+                "claude": at("claude"),
+                "codex": at("codex"),
+                "cursorAgent": at("cursor-agent"),
+                "agy": at("agy"),
+                "gemini": at("gemini"),
+            },
+        },
+        "terminal": { "shell": NO_SHELL },
+    })
+}
+
+/// Every vendor CLI ([`VENDOR_CLIS`]) this test process could reach outside a
+/// live fixture dir (A38.2): in each entry of the **process** `PATH` (what
+/// in-process code reads and every child inherits) and in the static
+/// detection ladder (`agents::path::static_candidates`, incl.
+/// `/opt/homebrew/bin` and `/usr/local/bin`) of the process `HOME` and of
+/// each of `homes`. Only `stat`s; nothing runs.
+pub fn reachable_vendor_clis(homes: &[PathBuf]) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    let mut all_homes: Vec<PathBuf> = std::env::var_os("HOME").map(PathBuf::from).into_iter().collect();
+    all_homes.extend(homes.iter().cloned());
+    for home in &all_homes {
+        dirs.extend(gilde_code_lib::agents::path::static_candidates(home));
+    }
+    vendor_clis_in(&dirs)
+}
+
+/// The vendor-named files (following symlinks) in `dirs`, skipping the live
+/// hermetic fixture dirs. An empty entry is the current directory, as for
+/// `exec`.
+pub fn vendor_clis_in(dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let live: Vec<PathBuf> = LIVE_BIN_DIRS.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let live: Vec<PathBuf> = live.iter().flat_map(|d| [d.clone(), canonical(d)]).collect();
+    let mut found: Vec<PathBuf> = Vec::new();
+    for dir in dirs {
+        if live.contains(dir) || live.contains(&canonical(dir)) {
+            continue;
+        }
+        for name in VENDOR_CLIS {
+            let candidate = dir.join(name);
+            if candidate.is_file() && !found.contains(&candidate) {
+                found.push(candidate);
+            }
+        }
+    }
+    found
+}
+
+fn refusal(found: &[PathBuf]) -> String {
+    let list: Vec<String> = found.iter().map(|p| format!("  {}", p.display())).collect();
+    format!(
+        "hermetic guard (contract §14.1, A38.2): this test process can reach a vendor CLI \
+         outside the fixture dirs, which agent detection or a login shell would run:\n{}\n\
+         Run cargo through scripts/gates/hermetic-cargo.sh (env -i, a temp HOME, \
+         PATH=<cargo bin>:/usr/bin:/bin:/usr/sbin:/sbin, SHELL=/nonexistent).",
+        list.join("\n")
+    )
+}
+
+/// Panic if any entry of `path` other than `allowed_dir` holds a vendor CLI.
+pub fn assert_no_vendor_cli_on_path(path: &str, allowed_dir: &Path) {
+    for entry in std::env::split_paths(path) {
+        if entry == allowed_dir {
+            continue;
+        }
+        for name in VENDOR_CLIS {
+            let candidate = entry.join(name);
+            assert!(
+                !candidate.exists(),
+                "hermetic PATH reaches a real vendor CLI: {} (contract §14.1)",
+                candidate.display()
+            );
+        }
+    }
+}
 
 /// Default patience for "the fixture should have said something by now".
 pub const READY_TIMEOUT: Duration = Duration::from_secs(10);

@@ -2,7 +2,8 @@
   "$comment": "Bundled defaults for agent-signatures.json (DESIGN §6-4). Seeded into <app-data>/agent-signatures.json on first run; your edits there are merged over these per agent key and hot-reloaded within ~2s. Patterns are Rust `regex` crate syntax, matched against one visible (ANSI-stripped) line of terminal output. A pattern that fails to compile is skipped with a warning and never disables the rest. Precedence is by CLASS, not by line: the whole visible tail is searched for a `waiting` match, then for `working`, then for `idle` (DESIGN §6-4), so a broad `idle` pattern that also matches a line still on screen during a turn is safe. Verified against captured streams in src-tauri/tests/fixtures/streams (claude 2.1.263, codex 0.145.0, 2026-09-07). A seeded copy that has never been edited is rewritten when this file changes (agents/signatures.rs SUPERSEDED_DEFAULT_DIGESTS); an edited copy is never touched.",
   "$comment_v2": "v2 (BACKLOG M1.5 #2, 2026-09-08): every one of these CLIs blocks on a selection menu whose only marker is its footer — claude 'Enter to select · ↑/↓ to navigate · Esc to cancel', codex 'Press enter to continue'. The v1 `waiting` sets only knew the yes/no wordings, so a menu read as `idle`. The menu-row patterns require the highlighted-row cursor (`❯`/`›`) before the ordinal so that a numbered list in ordinary output cannot pose as a prompt.",
   "$comment_v3": "v3 (BACKLOG M1.5 15b, 2026-09-09): claude's full-screen views (/help and the other alternate-screen panels) close on Esc and say so in their footer — 'Esc to close' was the one wording the v2 waiting set did not know. The engine no longer depends on that line alone: a quiet alternate screen with a low-CPU foreground group is WaitingForInput on the strength of those three observations (status/engine.rs, DESIGN §6-4), and this pattern is what gives that state a prompt worth quoting.",
-  "version": 3,
+  "$comment_v4": "v4 (Gilde 2, contract §6.2.4/§6.2.6, A5/A6): `readySignature.<vendor>` is the input row (and footer) that makes a settled grid Idle at 0.9 — claude and codex verified against captured screens (claude 2.1.263/2.1.307, codex 0.145.0), cursor and agy unverified (readiness then also accepts the 0.5 settled-grid fallback, so a wrong guess never keeps a session in Starting). `promptCard.<vendor>` is the numbered screen-prompt grammar (option, marker, continuation, description, divider, header, footer, amend, setupMarker, amendLabel); a vendor without an entry never gets a screen-prompt card. `trustDialog.<vendor>` recognises the folder-trust dialog, the only setup dialog Gilde ever sends keys to, and only on the user's click. The `waiting` buckets are kept for compatibility; the engine no longer infers WaitingForInput from them (§6.2.6: only a parsed prompt).",
+  "version": 4,
   "agents": {
     "claude": {
       "idleAfterMs": 1200,
@@ -130,5 +131,88 @@
       "(?i)python[0-9.]*\\s+-m\\s+mcp",
       "(?i)@modelcontextprotocol"
     ]
+  },
+  "readySignature": {
+    "claude": {
+      "verified": true,
+      "input": "^\\s*❯(\\s+[^\\d\\s]|\\s*$)",
+      "footer": "(⏸|⏵⏵|⏵) .*mode on|\\? for shortcuts"
+    },
+    "codex": {
+      "verified": true,
+      "input": "^\\s*›(\\s+[^\\d\\s]|\\s*$)"
+    },
+    "cursor": {
+      "verified": false,
+      "input": "^\\s*│?\\s*→\\s+[^\\d\\s]",
+      "footer": "(?i)/ for commands|@ for files"
+    },
+    "agy": {
+      "verified": false,
+      "input": "^\\s*>(\\s+[^\\d\\s]|\\s*$)",
+      "footer": "(?i)\\? for shortcuts"
+    }
+  },
+  "promptCard": {
+    "claude": {
+      "option": "^\\s*(?:[❯>›]\\s*)?(\\d)\\.\\s+(\\S.*)$",
+      "marker": "^\\s*[❯>›]",
+      "continuation": "^\\s+\\S",
+      "description": "^\\s{5,}\\S",
+      "divider": "^\\s*─{3,}\\s*$|^\\s*─{2,}.+─{2,}\\s*$",
+      "header": "^\\s*☐\\s+(\\S.*)$",
+      "footer": "(?i)esc to (cancel|close)|enter to (select|confirm|continue)|tab to amend|press enter",
+      "amend": "(?i)tab to amend",
+      "setupMarker": "^(\\s*)[❯›>]\\s+(\\S.*)$",
+      "amendLabel": "(?i)^yes, and tell \\S+ what to do next"
+    },
+    "codex": {
+      "option": "^\\s*(?:[❯>›]\\s*)?(\\d)\\.\\s+(\\S.*)$",
+      "marker": "^\\s*[❯>›]",
+      "continuation": "^\\s+\\S",
+      "description": "^\\s{5,}\\S",
+      "divider": "^\\s*─{3,}\\s*$|^\\s*─{2,}.+─{2,}\\s*$",
+      "header": "^\\s*☐\\s+(\\S.*)$",
+      "footer": "(?i)esc to (cancel|close)|enter to (select|confirm|continue)|tab to amend|press enter",
+      "amend": "(?i)tab to amend",
+      "setupMarker": "^(\\s*)[❯›>]\\s+(\\S.*)$",
+      "amendLabel": "(?i)^yes, and tell \\S+ what to do next"
+    },
+    "cursor": {
+      "option": "^\\s*(?:[❯>›]\\s*)?(\\d)\\.\\s+(\\S.*)$",
+      "marker": "^\\s*[❯>›]",
+      "continuation": "^\\s+\\S",
+      "description": "^\\s{5,}\\S",
+      "divider": "^\\s*─{3,}\\s*$|^\\s*─{2,}.+─{2,}\\s*$",
+      "header": "^\\s*☐\\s+(\\S.*)$",
+      "footer": "(?i)esc to (cancel|close)|enter to (select|confirm|continue)|tab to amend|press enter",
+      "amend": "(?i)tab to amend",
+      "setupMarker": "^(\\s*)[❯›>]\\s+(\\S.*)$",
+      "amendLabel": "(?i)^yes, and tell \\S+ what to do next"
+    },
+    "agy": {
+      "option": "^\\s*(?:[❯>›]\\s*)?(\\d)\\.\\s+(\\S.*)$",
+      "marker": "^\\s*[❯>›]",
+      "continuation": "^\\s+\\S",
+      "description": "^\\s{5,}\\S",
+      "divider": "^\\s*─{3,}\\s*$|^\\s*─{2,}.+─{2,}\\s*$",
+      "header": "^\\s*☐\\s+(\\S.*)$",
+      "footer": "(?i)esc to (cancel|close)|enter to (select|confirm|continue)|tab to amend|press enter",
+      "amend": "(?i)tab to amend",
+      "setupMarker": "^(\\s*)[❯›>]\\s+(\\S.*)$",
+      "amendLabel": "(?i)^yes, and tell \\S+ what to do next"
+    }
+  },
+  "trustDialog": {
+    "claude": {
+      "trust": [
+        "^Yes, I trust this folder$",
+        "^Yes, I trust\\b"
+      ],
+      "exit": [
+        "^No, exit$"
+      ],
+      "footer": "(?i)enter to confirm"
+    }
   }
 }

@@ -20,10 +20,50 @@ use gilde_code_lib::supervise::identity::{
     verify, verify_with, Fence, LiveProbe, MismatchReason, ProcProbe,
 };
 use gilde_code_lib::supervise::procscan::{ps_snapshot, Snapshot};
-use gilde_code_lib::supervise::registry::{SpawnGuard, SpawnPlan, Supervisor};
+use gilde_code_lib::supervise::registry::{SpawnGuard, Supervisor};
 use gilde_code_lib::supervise::spawn::is_alive;
 use std::os::unix::process::CommandExt as _;
 use std::sync::Arc;
+
+/// A fixture's spawn request on the one spawn path (`SupervisorApi`'s
+/// checks, A12.8/A22.3; the legacy `Supervisor::plan_spawn(SpawnPlan)` is
+/// gone): `headless` rows are the turn runs they became, and a sidecar or
+/// turn row belongs to `generation` (1 unless given).
+#[allow(dead_code)]
+fn fixture_request(
+    kind: ProcKind,
+    argv: &[String],
+    cwd: impl AsRef<std::path::Path>,
+    parent: Option<&str>,
+    generation: Option<i64>,
+) -> gilde_code_lib::contract::services::SpawnRequest {
+    use gilde_code_lib::contract::process::ProcKind as C;
+    let kind = match kind {
+        ProcKind::Pty => C::Pty,
+        ProcKind::Convo => C::Convo,
+        ProcKind::Pane => C::Pane,
+        ProcKind::Attach => C::Attach,
+        ProcKind::Turn | ProcKind::Headless => C::Turn,
+        ProcKind::Sidecar => C::Sidecar,
+        ProcKind::Probe => C::Probe,
+        ProcKind::Vendorcli => C::Vendorcli,
+        ProcKind::Git => C::Git,
+        ProcKind::Ide => C::Ide,
+        other => panic!("no fixture kind for {other:?}"),
+    };
+    let needs_generation = matches!(kind, C::Turn | C::Sidecar);
+    gilde_code_lib::contract::services::SpawnRequest {
+        kind,
+        argv0: gilde_code_lib::contract::common::AbsPath::parse(argv[0].clone()).expect("absolute argv[0]"),
+        args: argv[1..].to_vec(),
+        cwd: gilde_code_lib::contract::common::AbsPath::parse(cwd.as_ref().to_string_lossy().into_owned()).ok(),
+        env_keys: Vec::new(),
+        parent_uid: parent.map(|p| gilde_code_lib::contract::ids::SessionUid::parse(p).expect("uid")),
+        generation: generation.or(needs_generation.then_some(1)),
+        turn_id: (kind == C::Turn).then(|| "t-fixture".to_string()),
+    }
+}
+
 
 const SETTLE: Duration = Duration::from_secs(5);
 
@@ -163,6 +203,12 @@ fn argv_of(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|p| (*p).to_string()).collect()
 }
 
+/// The §9.3 allowlist admits only resolved binaries: a fixture is
+/// allowlisted for the kind it is planned as before it is planned (A12.8).
+fn allow(argv: &[String], kind: ProcKind) {
+    gilde_code_lib::supervise::spawn::allow_executable(std::path::Path::new(&argv[0]), &[kind]);
+}
+
 /// Plan a row, start the process it describes, and mark it running — the exact
 /// sequence DESIGN §8-3 prescribes.
 async fn register(
@@ -170,9 +216,10 @@ async fn register(
     argv: &[String],
     clear_env: bool,
 ) -> (SpawnGuard, Kid) {
+    allow(argv, ProcKind::Pty);
     let guard = h
         .supervisor
-        .plan_spawn(SpawnPlan::new(ProcKind::Pty, argv.to_vec(), "/tmp"))
+        .plan_guarded(fixture_request(ProcKind::Pty, argv, "/tmp", None, None))
         .await
         .expect("plan_spawn");
     let marker = if clear_env {
@@ -281,11 +328,10 @@ async fn a_child_with_a_wiped_environment_is_verified_by_its_argv() {
     let (guard, kid) = register(&h, &argv, true).await;
 
     let row = h.row(guard.spawn_id()).await;
-    assert_eq!(
-        gilde_code_lib::supervise::procscan::environ_of(kid.pid())
+    assert!(
+        !gilde_code_lib::supervise::procscan::environ_of(kid.pid())
             .map(|e| e.iter().any(|v| v.starts_with("GILDE_SPAWN_ID=")))
             .unwrap_or(false),
-        false,
         "this child deliberately carries no marker"
     );
     assert_eq!(
@@ -303,9 +349,10 @@ async fn a_child_with_a_wiped_environment_is_verified_by_its_argv() {
 async fn a_process_owned_by_another_user_is_a_uid_mismatch() {
     let h = harness().await;
     let argv = argv_of(&[&fake_agent().to_string_lossy(), "hang"]);
+    allow(&argv, ProcKind::Pty);
     let guard = h
         .supervisor
-        .plan_spawn(SpawnPlan::new(ProcKind::Pty, argv, "/tmp"))
+        .plan_guarded(fixture_request(ProcKind::Pty, &argv, "/tmp", None, None))
         .await
         .expect("plan_spawn");
 
@@ -388,9 +435,10 @@ async fn an_unreadable_environment_block_does_not_break_verification() {
 async fn a_planned_row_with_no_pid_is_a_mismatch_not_a_pass() {
     let h = harness().await;
     let argv = argv_of(&[&fake_agent().to_string_lossy(), "hang"]);
+    allow(&argv, ProcKind::Pty);
     let guard = h
         .supervisor
-        .plan_spawn(SpawnPlan::new(ProcKind::Pty, argv, "/tmp"))
+        .plan_guarded(fixture_request(ProcKind::Pty, &argv, "/tmp", None, None))
         .await
         .expect("plan_spawn");
 

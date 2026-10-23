@@ -1,23 +1,31 @@
 //! Typed errors for the whole crate.
 //!
+//! **Gilde 2 (contract §4.4, D11):** the one IPC error shape is
+//! [`IpcError`] (`crate::contract::error`); every command returns
+//! `Result<<Name>Res, IpcError>`. [`GildeError`] stays crate-internal and maps
+//! onto it with [`From<GildeError> for IpcError`]: `Io`-class failures collapse
+//! into `INTERNAL`, or `PERMISSION_DENIED` / `DISK_FULL` by errno; `detail`
+//! carries only stderr-like text (home paths as `~/…`, ≤ 4 KiB) or, for
+//! `INTERNAL`, a correlation id — never content [F-27].
+//!
+//! The pre-contract wire shape [`GildeErrorPayload`] / [`CmdResult`] remains
+//! only for the legacy command modules that are not registered any more (they
+//! are reworked or deleted by their owners in wave 1).
+//!
 //! Two rules from `docs/DESIGN.md` shape this module:
 //!
 //! 1. **Rust never returns prose to the UI** (§9-9). Every error that crosses the
-//!    IPC boundary is serialized as [`GildeErrorPayload`] — `{ code, key, params }` —
-//!    and the frontend `t()` renders it in the active locale. Changing a user
-//!    facing sentence must never require a Rust rebuild.
+//!    IPC boundary is `{ code, key, params, detail, retryable }` and the
+//!    frontend `t()` renders it in the active locale.
 //! 2. **Raw `git` / CLI stderr is not translated** — it travels verbatim in
 //!    `detail` and the UI shows it in a monospace block.
-//!
-//! Every `#[tauri::command]` returns `std::result::Result<T, GildeErrorPayload>`.
-//! Inside the crate, use [`Result<T>`] (= `Result<T, GildeError>`); the `?` operator
-//! converts to the payload at the command boundary through
-//! [`From<GildeError> for GildeErrorPayload`].
 
 use std::fmt::Display;
 
 use serde::Serialize;
 use serde_json::{Map, Value};
+
+pub use crate::contract::error::{ErrorCode, IpcError, VendorErrorClass};
 
 /// Crate-internal result type. Commands convert this into [`GildeErrorPayload`].
 pub type Result<T> = std::result::Result<T, GildeError>;
@@ -275,6 +283,67 @@ impl std::fmt::Display for GildeErrorPayload {
 
 impl std::error::Error for GildeErrorPayload {}
 
+// -- the contract mapping (§4.4) -------------------------------------------------
+
+/// Replace the user's home directory prefix with `~` (§4.4 `detail`, §9.7).
+pub fn home_to_tilde(text: &str) -> String {
+    match std::env::var("HOME") {
+        Ok(home) if home.len() > 1 => text.replace(home.trim_end_matches('/'), "~"),
+        _ => text.to_string(),
+    }
+}
+
+/// A fresh correlation id for `INTERNAL` (logged with the cause, shown in `detail`).
+fn correlation_id() -> String {
+    format!("corr-{}", &uuid::Uuid::new_v4().simple().to_string()[..12])
+}
+
+/// `NOT_FOUND.params.entity` must be an entity kind, never a value: keep a
+/// short ASCII token before the first `:` (`"session:abc"` → `"session"`).
+fn entity_kind(what: &str) -> String {
+    let head = what.split(':').next().unwrap_or_default();
+    if !head.is_empty() && head.len() <= 32 && head.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        head.to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+impl From<&GildeError> for IpcError {
+    fn from(e: &GildeError) -> IpcError {
+        match e {
+            GildeError::Io(io) => match io.raw_os_error() {
+                Some(libc::EACCES) | Some(libc::EPERM) => IpcError::permission_denied("file"),
+                Some(libc::ENOSPC) | Some(libc::EDQUOT) => IpcError::disk_full(),
+                _ => IpcError::internal(&correlation_id()),
+            },
+            GildeError::Db(_) | GildeError::Config(_) | GildeError::Internal(_) | GildeError::Pty(_) => {
+                IpcError::internal(&correlation_id())
+            }
+            GildeError::Git { stderr, .. } => {
+                let err = IpcError::git_failed();
+                let s = stderr.trim();
+                if s.is_empty() {
+                    err
+                } else {
+                    err.with_detail(home_to_tilde(s))
+                }
+            }
+            GildeError::Worktree(d) => IpcError::git_failed().with_detail(home_to_tilde(d)),
+            GildeError::Spawn(d) => IpcError::spawn_failed().with_detail(home_to_tilde(d)),
+            GildeError::SidecarDown | GildeError::SidecarRuntimeUnusable { .. } => IpcError::sidecar_down(),
+            GildeError::NotFound(what) => IpcError::not_found(&entity_kind(what)),
+            GildeError::Refused { reason } => IpcError::refused(reason),
+        }
+    }
+}
+
+impl From<GildeError> for IpcError {
+    fn from(e: GildeError) -> IpcError {
+        IpcError::from(&e)
+    }
+}
+
 // -- interop with the crates that show up in nearly every module --------------
 
 impl From<rusqlite::Error> for GildeError {
@@ -415,5 +484,24 @@ mod tests {
         let sql_err = rusqlite::Error::QueryReturnedNoRows;
         let e: GildeError = sql_err.into();
         assert_eq!(e.code(), "DB");
+    }
+
+    #[test]
+    fn gilde_errors_map_onto_the_contract_codes() {
+        let full = GildeError::Io(std::io::Error::from_raw_os_error(libc::ENOSPC));
+        assert_eq!(IpcError::from(&full).code, ErrorCode::DiskFull);
+        let denied = GildeError::Io(std::io::Error::from_raw_os_error(libc::EACCES));
+        assert_eq!(IpcError::from(&denied).code, ErrorCode::PermissionDenied);
+        let other = GildeError::Io(std::io::Error::other("boom"));
+        let mapped = IpcError::from(&other);
+        assert_eq!(mapped.code, ErrorCode::Internal);
+        assert!(mapped.detail.unwrap().starts_with("corr-"), "INTERNAL detail is a correlation id");
+        let nf = IpcError::from(GildeError::not_found("session:abc"));
+        assert_eq!(nf.params["entity"], Value::from("session"));
+        let git = IpcError::from(GildeError::Git { code: 128, stderr: "fatal: x\n".into() });
+        assert_eq!(git.code, ErrorCode::GitFailed);
+        assert_eq!(git.detail.as_deref(), Some("fatal: x"));
+        let internal = IpcError::from(GildeError::internal("secret prompt text"));
+        assert!(!internal.detail.unwrap().contains("secret"), "never content in detail");
     }
 }

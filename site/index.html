@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Gilde Code</title>
-  <meta name="description" content="Gilde Code is a read-only macOS cockpit for Claude Code Orchestrator's Teammate mode: every agent team on your Mac, its members, worktrees, task board, messages and worker accounts, with process and memory supervision.">
+  <meta name="description" content="Gilde Code is an agent-centred desktop IDE for macOS. It starts and supervises agent CLIs, shows the sessions you started elsewhere, and keeps one ranked list of what needs you. A preview: built from source, local only, no telemetry.">
   <meta name="color-scheme" content="dark light">
   <meta name="theme-color" content="#141414" media="(prefers-color-scheme: dark)">
   <meta name="theme-color" content="#fafafa" media="(prefers-color-scheme: light)">
@@ -64,44 +64,65 @@
       <div class="wrap hero-grid">
         <div class="hero-copy">
           <p class="chips">
-            <span class="pill"><span class="dot" aria-hidden="true"></span><span data-i18n="hero.chip.preview">Read-only preview</span></span>
+            <span class="pill"><span class="dot" data-status="working" data-pulse="true" aria-hidden="true"></span><span data-i18n="hero.chip.preview">Preview</span></span>
             <span class="pill" data-i18n="hero.chip.platform">macOS · Apple silicon</span>
             <span class="pill">Apache-2.0</span>
           </p>
-          <h1 id="hero-title" data-i18n="hero.title">See every agent team on your Mac, and what it leaves running.</h1>
-          <p class="lead" data-i18n="hero.lead">Gilde Code is a desktop cockpit for the Teammate mode of Claude Code Orchestrator. It shows every team on your Mac — members with their branches and worktrees, the task board, messages and worker accounts — and supervises the agent processes behind them, with alerts that tell you what to do.</p>
-          <p class="audience" data-i18n="hero.audience">For engineering teams that run several coding agents in parallel: Claude Code, Codex, Cursor and Antigravity.</p>
+          <h1 id="hero-title" data-i18n="hero.title">See and steer your coding agents from one window.</h1>
+          <p class="lead" data-i18n="hero.lead">Gilde is an agent-centred desktop IDE for macOS. It starts and supervises agent CLIs — <code>claude</code>, <code>codex</code>, <code>cursor-agent</code> and <code>agy</code> — shows the sessions you started elsewhere, and keeps one ranked list of what needs you: an approval, a question, an error, a reply.</p>
+          <p class="audience" data-i18n="hero.audience">For developers who run several coding agents across several projects at once. The orchestrator is optional.</p>
           <div class="cta">
             <a class="btn primary lg" href="#build" data-i18n="cta.build">Build from source</a>
             <a class="btn lg" href="https://github.com/Toragonite/gilde" data-link="repo" data-i18n="cta.github">View on GitHub</a>
           </div>
-          <p class="fine" data-i18n="hero.fine">Local only. No telemetry. Distributed as source.</p>
+          <p class="fine" data-i18n="hero.fine">A preview, distributed as source. Local only. No telemetry.</p>
         </div>
 
         <figure class="hero-figure">
           <div class="mock" aria-hidden="true">
-            <div class="mock-pop">
-              <div class="mock-head"><span class="strong grow" data-i18n="mock.title">Agent health</span><span class="mock-x">×</span></div>
-              <div class="mock-row"><span class="dot" data-status="stalled"></span><span data-i18n="mock.overall">Something needs a look.</span></div>
-              <div class="mock-alert" data-severity="attention">
-                <div class="mock-head"><span class="dot" data-status="stalled"></span><span class="strong grow" data-i18n="mock.alertTitle">A turn is stuck</span><span class="mock-x">×</span></div>
-                <span data-i18n="mock.alertBody">Member reviewer's turn has been running for 252 min — longer than any team allows — with no activity. Interrupt it from your lead session:</span>
-                <code class="mock-cmd">cco team_member reviewer --interrupt</code>
-                <div class="mock-actions"><span class="btn" data-i18n="mock.copy">Copy command</span></div>
-              </div>
-              <div class="mock-team">
-                <div class="mock-head"><span class="strong grow">payments-api</span><span class="gb">2.4 GB</span></div>
-                <div class="mock-member"><span class="dot" data-status="working"></span><span class="grow">implementer</span><span class="muted" data-i18n="mock.running">running</span><span class="gb">1.1 GB</span></div>
-                <div class="mock-member"><span class="dot" data-status="working"></span><span class="grow">reviewer</span><span class="muted" data-i18n="mock.running2">running</span><span class="gb">0.9 GB</span></div>
-                <div class="mock-member"><span class="dot" data-status="working"></span><span class="grow">docs</span><span class="muted" data-i18n="mock.running3">running</span><span class="gb">0.4 GB</span></div>
-              </div>
+            <div class="mock-bar">
+              <span class="strong grow" data-i18n="mock.home">Home</span>
+              <span class="mock-key"><span data-i18n="mock.search">Search</span><span class="kbd">⌘K</span></span>
             </div>
-            <div class="mock-statusbar">
-              <span class="mock-ind"><span class="dot" data-status="stalled"></span><span data-i18n="mock.indicator">Agents: 3 running · 2.4 GB</span><span class="mock-badge" data-i18n="mock.badge">Attention 1</span></span>
-              <span class="mock-conn"><span class="dot" data-status="ok"></span><span data-i18n="mock.connected">Connected</span></span>
+            <div class="mock-body">
+              <p class="mock-sum" data-i18n="mock.summary">2 need you · 12 running</p>
+              <div class="mock-focus">
+                <span class="muted">checkout-service ›</span>
+                <span class="strong">Fix the retry loop in the payment client</span>
+                <span class="muted">claude</span>
+                <span class="grow"></span>
+                <span class="mock-later"><span class="muted" data-i18n="mock.later">Later</span><span class="kbd">L</span></span>
+              </div>
+              <div class="mock-card">
+                <div class="mock-card-head">
+                  <svg class="glyph glyph-warn" viewBox="0 0 12 12" width="12" height="12"><path d="M6 1 L11 11 H1 Z"/></svg>
+                  <span class="mock-state" data-i18n="mock.needsApproval">Needs approval</span>
+                  <span class="grow"></span>
+                  <span class="mono muted" data-i18n="mock.waiting">waiting 4 min</span>
+                </div>
+                <p class="mock-what">Run the test suite</p>
+                <code class="mock-cmd">npm test -- --watch=false</code>
+                <div class="mock-actions">
+                  <span class="mbtn primary"><span class="kn">1</span><span data-i18n="mock.allowOnce">Allow once</span></span>
+                  <span class="mbtn"><span class="kn">2</span><span data-i18n="mock.allowSession">Always allow "npm test:*" in this session</span></span>
+                  <span class="mbtn"><span class="kn">3</span><span data-i18n="mock.deny">Deny</span></span>
+                </div>
+              </div>
+              <div class="mock-next-head"><span data-i18n="mock.next">Next 1</span><span class="grow"></span><span class="kbd">⌘J</span></div>
+              <div class="mock-next">
+                <span class="glyph glyph-q">?</span>
+                <span class="strong">Update the onboarding screens for tablets</span>
+                <span class="muted">infra-live</span>
+                <span class="grow"></span>
+                <span class="mono muted" data-i18n="mock.min5">5 min</span>
+              </div>
+              <div class="mock-also">
+                <span class="muted" data-i18n="mock.also">Also</span>
+                <span class="mock-chip"><svg class="glyph glyph-x" viewBox="0 0 12 12" width="12" height="12"><circle cx="6" cy="6" r="5"/><path d="M4 4 L8 8 M8 4 L4 8"/></svg><span data-i18n="mock.leftover">Leftover process 2</span></span>
+              </div>
             </div>
           </div>
-          <figcaption data-i18n="mock.caption">Example: the status-bar indicator and its popover, in the app's own words. Team and member names are illustrative.</figcaption>
+          <figcaption data-i18n="mock.caption">Example: the first card on Home, in the app's own words. Project and session names are illustrative.</figcaption>
         </figure>
       </div>
     </section>
@@ -110,19 +131,19 @@
     <section class="section" id="problem" aria-labelledby="problem-title">
       <div class="wrap">
         <p class="eyebrow" data-i18n="problem.eyebrow">The problem</p>
-        <h2 id="problem-title" data-i18n="problem.title">Many agents, many worktrees, and nobody watching the processes.</h2>
+        <h2 id="problem-title" data-i18n="problem.title">Many agents, many windows, and one of them is waiting for you.</h2>
         <div class="grid3">
           <article class="card pad">
-            <h3 data-i18n="problem.1.title">The work is spread out</h3>
-            <p data-i18n="problem.1.body">A team's lead runs in one checkout and every member in its own worktree and branch, on different vendors and accounts. Finding out who is doing what means opening each of them.</p>
+            <h3 data-i18n="problem.1.title">Sessions are everywhere</h3>
+            <p data-i18n="problem.1.body">Agents run in terminals, in editors and in the background, across projects and accounts. Finding out which one is doing what means opening each of them.</p>
           </article>
           <article class="card pad">
-            <h3 data-i18n="problem.2.title">Processes outlive their work</h3>
-            <p data-i18n="problem.2.body">A team that stopped, or a turn that ended badly, can leave agent CLIs running. They keep their memory, and nothing points at them.</p>
+            <h3 data-i18n="problem.2.title">Requests wait unseen</h3>
+            <p data-i18n="problem.2.body">An agent that asks for permission or asks a question stops until someone answers. While you work in one window, the request in another waits.</p>
           </article>
           <article class="card pad">
-            <h3 data-i18n="problem.3.title">Memory runs out quietly</h3>
-            <p data-i18n="problem.3.body">Several agents and the tools they start add up on one Mac. When memory gets short you need to know which agents are the largest, and how to stop them without breaking the team.</p>
+            <h3 data-i18n="problem.3.title">Processes outlive their work</h3>
+            <p data-i18n="problem.3.body">Ended sessions and teams can leave agent processes and tool servers running. They keep their memory, and nothing points at them.</p>
           </article>
         </div>
       </div>
@@ -132,75 +153,105 @@
     <section class="section" id="capabilities" aria-labelledby="cap-title">
       <div class="wrap">
         <p class="eyebrow" data-i18n="cap.eyebrow">Capabilities</p>
-        <h2 id="cap-title" data-i18n="cap.title">What Gilde shows you</h2>
+        <h2 id="cap-title" data-i18n="cap.title">What Gilde does</h2>
+
+        <article class="feature" id="home" aria-labelledby="f-home-title">
+          <div class="feature-copy">
+            <p class="feature-tag"><span class="kbd">⌘0</span><span data-i18n="f.home.tag">Home</span></p>
+            <h3 id="f-home-title" data-i18n="f.home.title">One list of what needs you</h3>
+            <p data-i18n="f.home.body">Home opens on the one thing that needs you most, then the next few, with counts for everything else. Answer it right there, put it off with Later, or go to the next one.</p>
+            <ul class="facts">
+              <li class="pills"><span class="pill" data-tone="warn"><span data-i18n="f.home.s.approval">Needs approval</span></span> <span class="pill" data-tone="warn"><span data-i18n="f.home.s.answer">Needs answer</span></span> <span class="pill" data-tone="error"><span data-i18n="f.home.s.error">Error</span></span> <span class="pill" data-tone="ok"><span data-i18n="f.home.s.reply">New reply</span></span> <span class="pill"><span data-i18n="f.home.s.noProgress">No progress</span></span></li>
+              <li data-i18n="f.home.keys"><span class="kbd">⌘J</span> goes to the next item from anywhere; <span class="kbd">L</span> puts the current one off.</li>
+              <li data-i18n="f.home.more">Usage limits, accounts that need a new sign-in, and leftover processes show up here too.</li>
+              <li data-i18n="f.home.notify">A notification can tell you when a session needs you. It carries no conversation text unless you turn on details.</li>
+            </ul>
+          </div>
+          <div class="shot" data-shot>
+            <div class="ph" aria-hidden="true"><div class="ph-bar"></div><div class="ph-body"><div class="ph-side"><i></i><i></i><i></i><i></i><i></i></div><div class="ph-main"><i></i><i></i></div></div><span class="ph-label" data-i18n="shot.label">Screenshot</span></div>
+            <img src="assets/shot-home.png" width="1280" height="800" loading="lazy" decoding="async" alt="Home: a summary of what needs you, the first card asking to approve a test run with Allow once, Always allow in this session and Deny, the next item, leftover processes and a team's progress." data-i18n-attr="alt:shot.home.alt">
+          </div>
+        </article>
+
+        <article class="feature" id="session" aria-labelledby="f-session-title">
+          <div class="feature-copy">
+            <p class="feature-tag"><span data-i18n="f.session.tag">Conversation · Terminal · Turn by turn</span></p>
+            <h3 id="f-session-title" data-i18n="f.session.title">Three ways to drive a session</h3>
+            <p data-i18n="f.session.body">Sessions that Gilde starts can be driven from the app. <strong>Conversation</strong> is a structured chat with approval cards, for <code>claude</code>. <strong>Terminal</strong> is the agent's own screen inside Gilde, with approval cards read from that screen. <strong>Turn by turn</strong> runs <code>codex</code>, <code>cursor-agent</code> or <code>agy</code> one run per turn.</p>
+            <ul class="facts">
+              <li data-i18n="f.session.card">An approval card offers Allow once, Deny, and Deny and say why — and, where the agent allows it, Always allow a command pattern in this session. Use the mouse or the number keys.</li>
+              <li data-i18n="f.session.worktree">A new session can start in its own git worktree and branch. The Changes view commits, merges or discards that worktree.</li>
+              <li data-i18n="f.session.ide">Open in IDE and Diff in IDE hand a session's folder or a change to your editor.</li>
+            </ul>
+          </div>
+          <div class="shot" data-shot>
+            <div class="ph" aria-hidden="true"><div class="ph-bar"></div><div class="ph-body"><div class="ph-side"><i></i><i></i><i></i><i></i></div><div class="ph-main"><i></i><i></i><i></i></div></div><span class="ph-label" data-i18n="shot.label2">Screenshot</span></div>
+            <img src="assets/shot-session.png" width="1280" height="800" loading="lazy" decoding="async" alt="A session in Conversation mode: the agent's plan and an edited file, then an approval card for running the test suite above the message box." data-i18n-attr="alt:shot.session.alt">
+          </div>
+        </article>
+
+        <article class="feature" id="split" aria-labelledby="f-split-title">
+          <div class="feature-copy">
+            <p class="feature-tag"><span class="kbd">⌘D</span><span data-i18n="f.split.tag">Add to split</span></p>
+            <h3 id="f-split-title" data-i18n="f.split.title">Up to six sessions side by side</h3>
+            <p data-i18n="f.split.body">Split puts two to six live sessions in tiles. <span class="kbd">⌘1</span>…<span class="kbd">⌘6</span> focus a tile, <span class="kbd">⌥⌘</span> with an arrow moves to the tile beside it, <span class="kbd">⇧⌘⏎</span> zooms one.</p>
+            <ul class="facts">
+              <li data-i18n="f.split.watching">Sessions started elsewhere — in a terminal, an editor or the background — are shown as <strong>Watching</strong>. Gilde says where they run and never types into them.</li>
+              <li data-i18n="f.split.quiet">Focus moves only when you ask.</li>
+            </ul>
+          </div>
+          <div class="shot" data-shot>
+            <div class="ph" aria-hidden="true"><div class="ph-bar"></div><div class="ph-body"><div class="ph-side"><i></i><i></i><i></i></div><div class="ph-main"><i></i><i></i></div></div><span class="ph-label" data-i18n="shot.label3">Screenshot</span></div>
+            <img src="assets/shot-split.png" width="1280" height="800" loading="lazy" decoding="async" alt="Split with four sessions in tiles: one waiting for approval, two working, and one that runs in another app and is only shown." data-i18n-attr="alt:shot.split.alt">
+          </div>
+        </article>
 
         <article class="feature" id="teams" aria-labelledby="f-team-title">
           <div class="feature-copy">
-            <p class="feature-tag"><span class="kbd">⌘1</span><span data-i18n="f.team.tag">Team</span></p>
-            <h3 id="f-team-title" data-i18n="f.team.title">Teams cockpit</h3>
-            <p data-i18n="f.team.body">Every team on this Mac, from all workspaces or only this one — found on its own, with no project folder to add. Each member shows its agent, branch and worktree and the engine's own state. Next to them: the team's task board and its messages.</p>
+            <p class="feature-tag"><span data-i18n="f.team.tag">Panes · Board · Floor</span></p>
+            <h3 id="f-team-title" data-i18n="f.team.title">Agent teams as panes, a board or a floor</h3>
+            <p data-i18n="f.team.body">A team's lead and members open as Panes, as a Board of tasks and messages, or as a Floor: a pixel-style plan with a room per project and a desk per agent, where shelves hold the work to do and the work done. The Floor screen shows every agent across your projects at once.</p>
             <ul class="facts">
-              <li><span class="pill"><span class="dot" data-status="working" data-pulse="true" aria-hidden="true"></span><span data-i18n="f.team.s.running">running</span></span> <span class="pill"><span class="dot" aria-hidden="true"></span><span data-i18n="f.team.s.idle">idle</span></span> <span class="pill"><span class="dot" data-status="waiting" aria-hidden="true"></span><span data-i18n="f.team.s.blocked">blocked</span></span> <span class="pill"><span class="dot" aria-hidden="true"></span><span data-i18n="f.team.s.paused">paused</span></span></li>
-              <li data-i18n="f.team.board">Task board: Open, Claimed, Blocked, Review, Done.</li>
-              <li data-i18n="f.team.scope">Scope: All workspaces or This workspace. Reveal a member's worktree in Finder.</li>
-              <li data-i18n="f.team.host">A team whose dispatch host is gone is still shown, read from its state files: its members say “was running”, never “running”.</li>
+              <li data-i18n="f.team.hosted">When Gilde starts a team, its teammates open as panes in Gilde, where you can answer and message them.</li>
+              <li data-i18n="f.team.bottleneck">The member the others wait on is marked as the bottleneck.</li>
+              <li data-i18n="f.team.orch">If Claude Code Orchestrator is installed, its teams appear read-only: they are run by the orchestrator and messaged from their lead.</li>
             </ul>
           </div>
           <div class="shot" data-shot>
-            <div class="ph" aria-hidden="true"><div class="ph-bar"></div><div class="ph-body"><div class="ph-rail"></div><div class="ph-side"><i></i><i></i><i></i><i></i><i></i></div><div class="ph-main"><i></i><i></i><i></i></div></div><span class="ph-label" data-i18n="shot.label">Screenshot</span></div>
-            <img src="assets/shot-team.png" width="1280" height="800" loading="lazy" decoding="async" alt="The Team view: teams grouped by repository in the sidebar; a team's members with their agents, branches and worktrees; the task board and messages." data-i18n-attr="alt:shot.team.alt">
+            <div class="ph" aria-hidden="true"><div class="ph-bar"></div><div class="ph-body"><div class="ph-side tall"><i></i><i class="in"></i><i class="in"></i><i></i><i class="in"></i></div><div class="ph-main"><i></i></div></div><span class="ph-label" data-i18n="shot.label4">Screenshot</span></div>
+            <img src="assets/shot-team.png" width="1280" height="800" loading="lazy" decoding="async" alt="A team as a Floor: six agents at their desks in one project room, one waiting for approval, shelves for to-do and done work, and the team's task flow below." data-i18n-attr="alt:shot.team.alt">
           </div>
         </article>
 
-        <article class="feature" id="accounts" aria-labelledby="f-workers-title">
+        <article class="feature" id="history" aria-labelledby="f-history-title">
           <div class="feature-copy">
-            <p class="feature-tag"><span class="kbd">⌘2</span><span data-i18n="f.workers.tag">Worker accounts</span></p>
-            <h3 id="f-workers-title" data-i18n="f.workers.title">Worker accounts</h3>
-            <p data-i18n="f.workers.body">The accounts your members run on, exactly as the orchestrator reports them: usage windows with their reset times, cooldowns, login state, and which account is this session's own. Gilde computes none of it and changes none of it — accounts are managed in VS Code.</p>
+            <p class="feature-tag"><span class="kbd">⇧⌘F</span><span data-i18n="f.history.tag">History</span></p>
+            <h3 id="f-history-title" data-i18n="f.history.title">Past sessions, searchable</h3>
+            <p data-i18n="f.history.body">History lists past sessions of the agents on this Mac, including the ones Gilde did not start. Search titles and first prompts, filter by project, agent, time, account and where a session ran, then read it, continue it in Gilde, or continue a copy.</p>
             <ul class="facts">
-              <li><span class="pill" data-tone="ok"><span class="dot" data-status="ok" aria-hidden="true"></span><span data-i18n="f.workers.s.ok">signed in</span></span> <span class="pill" data-tone="error"><span class="dot" data-status="error" aria-hidden="true"></span><span data-i18n="f.workers.s.out">logged out — sign in again</span></span> <span class="pill" data-tone="warn"><span class="dot" data-status="waiting" aria-hidden="true"></span><span data-i18n="f.workers.s.cool">cooling down</span></span></li>
-              <li data-i18n="f.workers.poll">The dispatch host is asked at most once a minute. A list that could not be refreshed stays on screen, marked stale with the time it was received.</li>
+              <li data-i18n="f.history.retention">Each agent's own retention applies: Gilde lists what is still on disk.</li>
             </ul>
           </div>
           <div class="shot" data-shot>
-            <div class="ph" aria-hidden="true"><div class="ph-bar"></div><div class="ph-body"><div class="ph-rail"></div><div class="ph-main wide"><i></i><i></i><i></i><i></i></div></div><span class="ph-label" data-i18n="shot.label2">Screenshot</span></div>
-            <img src="assets/shot-workers.png" width="1280" height="800" loading="lazy" decoding="async" alt="The Worker accounts view: each account with its usage windows, reset times, cooldown and login state." data-i18n-attr="alt:shot.workers.alt">
+            <div class="ph" aria-hidden="true"><div class="ph-bar"></div><div class="ph-body"><div class="ph-side"><i></i><i></i><i></i><i></i></div><div class="ph-main wide"><i></i><i></i><i></i><i></i></div></div><span class="ph-label" data-i18n="shot.label5">Screenshot</span></div>
+            <img src="assets/shot-history.png" width="1280" height="800" loading="lazy" decoding="async" alt="History: a search box with filters for project, agent, time, account and location, a list of past sessions by day, and the selected session with its first prompt, last reply and Continue in Gilde." data-i18n-attr="alt:shot.history.alt">
           </div>
         </article>
 
-        <article class="feature" id="health" aria-labelledby="f-health-title">
+        <article class="feature" id="accounts" aria-labelledby="f-accounts-title">
           <div class="feature-copy">
-            <p class="feature-tag"><span class="dot" data-status="ok" aria-hidden="true"></span><span data-i18n="f.health.tag">Status bar</span></p>
-            <h3 id="f-health-title" data-i18n="f.health.title">Health and alerts</h3>
-            <p data-i18n="f.health.body">A status-bar indicator counts the agents that are running and the memory they use, tools included. Its popover lists every team and member with its memory. When something is wrong, an alert says what happened and what to do next — often with the exact <code>cco</code> command to copy and run from your lead session.</p>
-            <ul class="alerts">
-              <li><span class="dot" data-status="error" aria-hidden="true"></span><div><strong data-i18n="f.health.a1.t">Leftover agent processes</strong><span data-i18n="f.health.a1.b">Agent processes still running after their team stopped. <em>Clean up</em> shows a dry run first and only ever covers processes the orchestrator marked as a team member's.</span></div></li>
-              <li><span class="dot" data-status="waiting" aria-hidden="true"></span><div><strong data-i18n="f.health.a2.t">An agent uses a lot of memory</strong><span data-i18n="f.health.a2.b">From 4 GB a look; from 8 GB, or a quarter of the Mac's memory if that is lower, an action. For a member:</span><code class="cmdline">cco team_member &lt;member&gt; --stop</code></div></li>
-              <li><span class="dot" data-status="waiting" aria-hidden="true"></span><div><strong data-i18n="f.health.a3.t">Memory is low</strong><span data-i18n="f.health.a3.b">Raised when macOS reports memory pressure, with the three agents that use the most.</span></div></li>
-              <li><span class="dot" data-status="error" aria-hidden="true"></span><div><strong data-i18n="f.health.a4.t">A team lost its dispatch host</strong><span data-i18n="f.health.a4.b">The host stopped while members were working. Resume it from a Claude Code session in that repository:</span><code class="cmdline">cco team_resume --team &lt;team&gt;</code></div></li>
-              <li><span class="dot" data-status="waiting" aria-hidden="true"></span><div><strong data-i18n="f.health.a5.t">A turn is stuck</strong><span data-i18n="f.health.a5.b">Running longer than any team allows (240 minutes) with no activity. Interrupt it from your lead session:</span><code class="cmdline">cco team_member &lt;member&gt; --interrupt</code></div></li>
-            </ul>
-            <p class="note" data-i18n="f.health.note">A dismissed alert stays quiet for ten minutes unless it gets worse.</p>
-          </div>
-          <div class="shot" data-shot>
-            <div class="ph" aria-hidden="true"><div class="ph-bar"></div><div class="ph-body"><div class="ph-rail"></div><div class="ph-side"><i></i><i></i><i></i></div><div class="ph-main"><i></i><i></i></div></div><div class="ph-pop"></div><span class="ph-label" data-i18n="shot.label3">Screenshot</span></div>
-            <img src="assets/shot-health.png" width="1280" height="800" loading="lazy" decoding="async" alt="The health popover above the status bar: teams and members with their memory, and an alert with its action." data-i18n-attr="alt:shot.health.alt">
-          </div>
-        </article>
-
-        <article class="feature" id="grouping" aria-labelledby="f-group-title">
-          <div class="feature-copy">
-            <p class="feature-tag"><span class="i-tree" aria-hidden="true"></span><span data-i18n="f.group.tag">Group by repository</span></p>
-            <h3 id="f-group-title" data-i18n="f.group.title">Worktree-aware grouping</h3>
-            <p data-i18n="f.group.body">Teams are grouped by repository the way git sees it. The main checkout and its subfolders, a lead running in a linked worktree and the members' worktrees share one git common directory, so they collapse into one repository. Separate clones of the same origin collapse too.</p>
+            <p class="feature-tag"><span class="kbd">⇧⌘A</span><span data-i18n="f.accounts.tag">Accounts and health</span></p>
+            <h3 id="f-accounts-title" data-i18n="f.accounts.title">Accounts, quota and leftover processes</h3>
+            <p data-i18n="f.accounts.body">Each account's usage windows with their reset times, the account new sessions use by default, the memory and running time of every session, and the processes ended sessions left behind — on one screen.</p>
             <ul class="facts">
-              <li data-i18n="f.group.by">Group by repository, workspace folder or status.</li>
-              <li data-i18n="f.group.git">Identity comes from read-only git queries, with optional locks off and a time limit on every call.</li>
+              <li data-i18n="f.accounts.add">Add another account by its configuration folder and choose the default per agent.</li>
+              <li data-i18n="f.accounts.cleanup">Clean-up stops leftover processes after you confirm. Gilde never stops a process it cannot identify, and never stops a background job on its own.</li>
+              <li data-i18n="f.accounts.orch">With the orchestrator installed, its accounts are listed here too.</li>
             </ul>
           </div>
           <div class="shot" data-shot>
-            <div class="ph" aria-hidden="true"><div class="ph-bar"></div><div class="ph-body"><div class="ph-rail"></div><div class="ph-side tall"><i></i><i class="in"></i><i class="in"></i><i></i><i class="in"></i></div><div class="ph-main"><i></i></div></div><span class="ph-label" data-i18n="shot.label4">Screenshot</span></div>
-            <img src="assets/shot-grouping.png" width="1280" height="800" loading="lazy" decoding="async" alt="The Team sidebar grouped by repository: a main checkout, a lead in a linked worktree and the member worktrees under one repository." data-i18n-attr="alt:shot.grouping.alt">
+            <div class="ph" aria-hidden="true"><div class="ph-bar"></div><div class="ph-body"><div class="ph-side"><i></i><i></i><i></i></div><div class="ph-main"><i></i><i></i></div></div><span class="ph-label" data-i18n="shot.label6">Screenshot</span></div>
+            <img src="assets/shot-accounts.png" width="1280" height="800" loading="lazy" decoding="async" alt="Accounts and health: accounts per agent with 5-hour and weekly usage and reset times, memory per session, and leftover processes with Stop and Clean up all." data-i18n-attr="alt:shot.accounts.alt">
           </div>
         </article>
       </div>
@@ -210,134 +261,156 @@
     <section class="section" id="how" aria-labelledby="how-title">
       <div class="wrap">
         <p class="eyebrow" data-i18n="how.eyebrow">How it works</p>
-        <h2 id="how-title" data-i18n="how.title">The orchestrator runs the team. Gilde watches.</h2>
+        <h2 id="how-title" data-i18n="how.title">One core holds every privilege. The window only renders.</h2>
 
         <figure class="diagram">
           <!-- wide layout -->
           <svg class="dg dg-wide" viewBox="0 0 960 480" role="img" aria-labelledby="dg-title dg-desc" focusable="false">
-            <title id="dg-title" data-i18n="dg.title">How Gilde fits next to Claude Code Orchestrator</title>
-            <desc id="dg-desc" data-i18n="dg.desc">A lead Claude Code session runs cco; the dispatch host of that session starts members, each a vendor CLI in its own worktree and branch. Gilde Code reads the host over its local socket, the team state files and the process table, and writes nothing.</desc>
+            <title id="dg-title" data-i18n="dg.title">How Gilde is put together</title>
+            <desc id="dg-desc" data-i18n="dg.desc">The Rust core starts and supervises the agent CLIs and the gilde-tmux shim for hosted teams; the WebView talks to it over IPC and only renders; the Node sidecar runs turn-by-turn agents and quota probes. The core reads the agents' files read-only and the process table, and writes only metadata to its state database.</desc>
             <defs>
               <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="dg-head" d="M0 0 L10 5 L0 10 z"/></marker>
               <marker id="ahd" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="dg-head-dim" d="M0 0 L10 5 L0 10 z"/></marker>
             </defs>
 
-            <!-- lead -->
-            <rect class="dg-box" x="24" y="56" width="220" height="96" rx="6"/>
-            <text class="dg-t" x="40" y="88" data-i18n="dg.lead">Lead session</text>
-            <text class="dg-s" x="40" y="110" data-i18n="dg.lead.s">Claude Code · Teammate mode</text>
-            <text class="dg-m" x="40" y="132" data-i18n="dg.lead.m">your repository</text>
+            <!-- agents Gilde starts -->
+            <rect class="dg-group" x="24" y="16" width="576" height="112" rx="6"/>
+            <text class="dg-k" x="40" y="38" data-i18n="dg.agents">Agent CLIs that Gilde starts</text>
+            <rect class="dg-box" x="40" y="50" width="130" height="36" rx="4"/>
+            <circle class="dg-dot-w" cx="56" cy="68" r="4"/>
+            <text class="dg-t2 dg-mono" x="68" y="73">claude</text>
+            <rect class="dg-box" x="180" y="50" width="130" height="36" rx="4"/>
+            <circle class="dg-dot-w" cx="196" cy="68" r="4"/>
+            <text class="dg-t2 dg-mono" x="208" y="73">codex</text>
+            <rect class="dg-box" x="320" y="50" width="130" height="36" rx="4"/>
+            <circle class="dg-dot-w" cx="336" cy="68" r="4"/>
+            <text class="dg-t2 dg-mono" x="348" y="73">cursor-agent</text>
+            <rect class="dg-box" x="460" y="50" width="124" height="36" rx="4"/>
+            <circle class="dg-dot-w" cx="476" cy="68" r="4"/>
+            <text class="dg-t2 dg-mono" x="488" y="73">agy</text>
+            <text class="dg-m" x="40" y="110" data-i18n="dg.modes">claude: conversation or terminal · the others: turn by turn or terminal</text>
 
-            <!-- lead → host -->
-            <line class="dg-line" x1="244" y1="104" x2="310" y2="104" marker-end="url(#ah)"/>
-            <text class="dg-m dg-mid" x="277" y="96">cco</text>
+            <!-- gilde-tmux -->
+            <rect class="dg-box" x="696" y="16" width="240" height="96" rx="6"/>
+            <text class="dg-t dg-mono" x="712" y="46">gilde-tmux</text>
+            <text class="dg-s" x="712" y="70" data-i18n="dg.tmux.s">hosted team panes</text>
+            <text class="dg-m" x="712" y="92" data-i18n="dg.tmux.m">a small shim, one per build</text>
 
-            <!-- host -->
-            <rect class="dg-box" x="312" y="56" width="240" height="96" rx="6"/>
-            <text class="dg-t" x="328" y="88" data-i18n="dg.host">Dispatch host</text>
-            <text class="dg-s" x="328" y="110" data-i18n="dg.host.s">one per lead session</text>
-            <text class="dg-m" x="328" y="132" data-i18n="dg.host.m">local Unix socket</text>
+            <!-- row 2: webview, core, sidecar -->
+            <rect class="dg-box" x="24" y="184" width="240" height="96" rx="6"/>
+            <text class="dg-t" x="40" y="214">WebView</text>
+            <text class="dg-s" x="40" y="238" data-i18n="dg.web.s">React and TypeScript</text>
+            <text class="dg-m" x="40" y="260" data-i18n="dg.web.m">renders only</text>
 
-            <!-- host → members -->
-            <line class="dg-line" x1="552" y1="104" x2="618" y2="104" marker-end="url(#ah)"/>
-            <text class="dg-m dg-mid" x="585" y="96" data-i18n="dg.starts">starts</text>
+            <rect class="dg-box dg-gilde" x="360" y="184" width="240" height="96" rx="6"/>
+            <image href="assets/gilde.svg" x="376" y="198" width="28" height="28"/>
+            <text class="dg-t" x="414" y="217" data-i18n="dg.core">Rust core</text>
+            <text class="dg-s" x="376" y="244" data-i18n="dg.core.s">holds every privilege</text>
+            <text class="dg-m" x="376" y="266" data-i18n="dg.core.m">supervise · discover · store</text>
 
-            <!-- members -->
-            <rect class="dg-group" x="620" y="24" width="316" height="268" rx="6"/>
-            <text class="dg-k" x="636" y="46" data-i18n="dg.members">Members — each in its own worktree and branch</text>
-            <g>
-              <rect class="dg-box" x="636" y="58" width="284" height="50" rx="4"/>
-              <circle class="dg-dot-w" cx="654" cy="78" r="4"/>
-              <text class="dg-t2" x="666" y="82">Claude Code</text>
-              <text class="dg-m" x="654" y="100">worktree · branch</text>
-              <rect class="dg-box" x="636" y="114" width="284" height="50" rx="4"/>
-              <circle class="dg-dot-w" cx="654" cy="134" r="4"/>
-              <text class="dg-t2" x="666" y="138">Codex</text>
-              <text class="dg-m" x="654" y="156">worktree · branch</text>
-              <rect class="dg-box" x="636" y="170" width="284" height="50" rx="4"/>
-              <circle class="dg-dot-w" cx="654" cy="190" r="4"/>
-              <text class="dg-t2" x="666" y="194">Cursor</text>
-              <text class="dg-m" x="654" y="212">worktree · branch</text>
-              <rect class="dg-box" x="636" y="226" width="284" height="50" rx="4"/>
-              <circle class="dg-dot-w" cx="654" cy="246" r="4"/>
-              <text class="dg-t2" x="666" y="250">Antigravity</text>
-              <text class="dg-m" x="654" y="268">worktree · branch</text>
-            </g>
+            <rect class="dg-box" x="696" y="184" width="240" height="96" rx="6"/>
+            <text class="dg-t" x="712" y="214" data-i18n="dg.sidecar">Node sidecar</text>
+            <text class="dg-s" x="712" y="238" data-i18n="dg.sidecar.s">turn-by-turn agents</text>
+            <text class="dg-m" x="712" y="260" data-i18n="dg.sidecar.m">quota · sign-in · models</text>
 
-            <!-- files -->
-            <rect class="dg-box" x="24" y="352" width="220" height="104" rx="6"/>
-            <text class="dg-t" x="40" y="384" data-i18n="dg.files">Team state files</text>
-            <text class="dg-m" x="40" y="406">team.json · state.json</text>
-            <text class="dg-s" x="40" y="430" data-i18n="dg.files.s">read when no host is live</text>
+            <!-- row 2 links -->
+            <line class="dg-line" x1="266" y1="232" x2="358" y2="232" marker-start="url(#ah)" marker-end="url(#ah)"/>
+            <text class="dg-m dg-mid" x="312" y="224">IPC</text>
+            <line class="dg-line" x1="602" y1="232" x2="694" y2="232" marker-start="url(#ah)" marker-end="url(#ah)"/>
+            <text class="dg-m dg-mid" x="648" y="224">stdio</text>
 
-            <!-- gilde -->
-            <rect class="dg-box dg-gilde" x="312" y="352" width="240" height="104" rx="6"/>
-            <image href="assets/gilde.svg" x="328" y="368" width="32" height="32"/>
-            <text class="dg-t" x="372" y="382">Gilde Code</text>
-            <text class="dg-s" x="372" y="400" data-i18n="dg.gilde.s">read-only observer</text>
-            <text class="dg-m" x="328" y="436" data-i18n="dg.gilde.m">no writes · no signals</text>
+            <!-- core starts the agents; the shim reaches the core -->
+            <line class="dg-line" x1="440" y1="182" x2="440" y2="130" marker-end="url(#ah)"/>
+            <text class="dg-m dg-end" x="430" y="162" data-i18n="dg.starts">starts · supervises</text>
+            <path class="dg-line" d="M780 112 V152 H540 V182" fill="none" marker-end="url(#ah)"/>
+            <text class="dg-m" x="560" y="146" data-i18n="dg.panes">team panes</text>
 
-            <!-- reads (dashed, toward Gilde) -->
-            <line class="dg-read" x1="432" y1="154" x2="432" y2="350" marker-end="url(#ahd)"/>
-            <text class="dg-m dg-end" x="422" y="244" data-i18n="dg.r.socket">team list · get · subscribe</text>
-            <text class="dg-m dg-end" x="422" y="262" data-i18n="dg.r.socket2">worker accounts</text>
-            <line class="dg-read" x1="244" y1="404" x2="310" y2="404" marker-end="url(#ahd)"/>
-            <path class="dg-read" d="M778 292 V404 H554" fill="none" marker-end="url(#ahd)"/>
-            <text class="dg-m" x="570" y="396" data-i18n="dg.r.ps">process snapshot every 5 s</text>
+            <!-- row 3: what the core reads and writes -->
+            <rect class="dg-box" x="24" y="360" width="240" height="96" rx="6"/>
+            <text class="dg-t" x="40" y="390" data-i18n="dg.files">Agent files</text>
+            <text class="dg-s" x="40" y="414" data-i18n="dg.files.s">transcripts, sessions, teams</text>
+            <text class="dg-m" x="40" y="436" data-i18n="dg.files.m">read-only, keys never opened</text>
+
+            <rect class="dg-box" x="360" y="360" width="240" height="96" rx="6"/>
+            <text class="dg-t" x="376" y="390" data-i18n="dg.ps">Process table</text>
+            <text class="dg-s" x="376" y="414" data-i18n="dg.ps.s">agent processes on this Mac</text>
+            <text class="dg-m" x="376" y="436" data-i18n="dg.ps.m">sessions started elsewhere</text>
+
+            <rect class="dg-box" x="696" y="360" width="240" height="96" rx="6"/>
+            <text class="dg-t" x="712" y="390" data-i18n="dg.db">State database</text>
+            <text class="dg-s" x="712" y="414" data-i18n="dg.db.s">metadata only</text>
+            <text class="dg-m" x="712" y="436" data-i18n="dg.db.m">ids · states · times · counts</text>
+
+            <path class="dg-read" d="M144 358 V320 H420 V284" fill="none" marker-end="url(#ahd)"/>
+            <line class="dg-read" x1="500" y1="358" x2="500" y2="284" marker-end="url(#ahd)"/>
+            <path class="dg-line" d="M816 358 V320 H560 V284" fill="none" marker-start="url(#ah)" marker-end="url(#ah)"/>
           </svg>
 
           <!-- narrow layout -->
           <svg class="dg dg-narrow" viewBox="0 0 360 820" role="img" aria-labelledby="dgn-title" focusable="false">
-            <title id="dgn-title" data-i18n="dg.title2">How Gilde fits next to Claude Code Orchestrator</title>
+            <title id="dgn-title" data-i18n="dg.title2">How Gilde is put together</title>
             <defs>
               <marker id="ahn" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="dg-head" d="M0 0 L10 5 L0 10 z"/></marker>
               <marker id="ahnd" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="dg-head-dim" d="M0 0 L10 5 L0 10 z"/></marker>
             </defs>
-            <rect class="dg-box" x="8" y="8" width="300" height="80" rx="6"/>
-            <text class="dg-t" x="24" y="36" data-i18n="dg.lead2">Lead session</text>
-            <text class="dg-s" x="24" y="56" data-i18n="dg.lead.s2">Claude Code · Teammate mode</text>
-            <text class="dg-m" x="24" y="76" data-i18n="dg.lead.m2">your repository</text>
-            <line class="dg-line" x1="158" y1="88" x2="158" y2="126" marker-end="url(#ahn)"/>
-            <text class="dg-m" x="168" y="112">cco</text>
-            <rect class="dg-box" x="8" y="128" width="300" height="80" rx="6"/>
-            <text class="dg-t" x="24" y="156" data-i18n="dg.host2">Dispatch host</text>
-            <text class="dg-s" x="24" y="176" data-i18n="dg.host.s2">one per lead session</text>
-            <text class="dg-m" x="24" y="196" data-i18n="dg.host.m2">local Unix socket</text>
-            <line class="dg-line" x1="158" y1="208" x2="158" y2="246" marker-end="url(#ahn)"/>
-            <text class="dg-m" x="168" y="232" data-i18n="dg.starts2">starts</text>
-            <rect class="dg-group" x="8" y="248" width="300" height="252" rx="6"/>
-            <text class="dg-k" x="20" y="270" data-i18n="dg.members2">Members — own worktree and branch</text>
-            <rect class="dg-box" x="20" y="282" width="276" height="48" rx="4"/><circle class="dg-dot-w" cx="36" cy="301" r="4"/><text class="dg-t2" x="48" y="305">Claude Code</text><text class="dg-m" x="36" y="322">worktree · branch</text>
-            <rect class="dg-box" x="20" y="336" width="276" height="48" rx="4"/><circle class="dg-dot-w" cx="36" cy="355" r="4"/><text class="dg-t2" x="48" y="359">Codex</text><text class="dg-m" x="36" y="376">worktree · branch</text>
-            <rect class="dg-box" x="20" y="390" width="276" height="48" rx="4"/><circle class="dg-dot-w" cx="36" cy="409" r="4"/><text class="dg-t2" x="48" y="413">Cursor</text><text class="dg-m" x="36" y="430">worktree · branch</text>
-            <rect class="dg-box" x="20" y="444" width="276" height="48" rx="4"/><circle class="dg-dot-w" cx="36" cy="463" r="4"/><text class="dg-t2" x="48" y="467">Antigravity</text><text class="dg-m" x="36" y="484">worktree · branch</text>
-            <!-- reads -->
-            <path class="dg-read" d="M308 168 H340 V640 H258" fill="none" marker-end="url(#ahnd)"/>
-            <line class="dg-read" x1="120" y1="500" x2="120" y2="594" marker-end="url(#ahnd)"/>
-            <text class="dg-m" x="130" y="540" data-i18n="dg.r.ps2">process snapshot</text>
-            <text class="dg-m" x="130" y="556" data-i18n="dg.r.ps3">every 5 s</text>
-            <rect class="dg-box dg-gilde" x="8" y="596" width="248" height="96" rx="6"/>
-            <image href="assets/gilde.svg" x="24" y="612" width="28" height="28"/>
-            <text class="dg-t" x="62" y="626">Gilde Code</text>
-            <text class="dg-s" x="62" y="644" data-i18n="dg.gilde.s2">read-only observer</text>
-            <text class="dg-m" x="24" y="676" data-i18n="dg.gilde.m2">writes nothing</text>
-            <line class="dg-read" x1="120" y1="738" x2="120" y2="694" marker-end="url(#ahnd)"/>
-            <rect class="dg-box" x="8" y="740" width="248" height="72" rx="6"/>
-            <text class="dg-t" x="24" y="766" data-i18n="dg.files2">Team state files</text>
-            <text class="dg-m" x="24" y="788">team.json · state.json</text>
+            <rect class="dg-group" x="24" y="8" width="312" height="132" rx="6"/>
+            <text class="dg-k" x="36" y="30" data-i18n="dg.agents2">Agent CLIs that Gilde starts</text>
+            <rect class="dg-box" x="36" y="42" width="140" height="36" rx="4"/><circle class="dg-dot-w" cx="50" cy="60" r="4"/><text class="dg-t2 dg-mono" x="62" y="65">claude</text>
+            <rect class="dg-box" x="184" y="42" width="140" height="36" rx="4"/><circle class="dg-dot-w" cx="198" cy="60" r="4"/><text class="dg-t2 dg-mono" x="210" y="65">codex</text>
+            <rect class="dg-box" x="36" y="86" width="140" height="36" rx="4"/><circle class="dg-dot-w" cx="50" cy="104" r="4"/><text class="dg-t2 dg-mono" x="62" y="109">cursor-agent</text>
+            <rect class="dg-box" x="184" y="86" width="140" height="36" rx="4"/><circle class="dg-dot-w" cx="198" cy="104" r="4"/><text class="dg-t2 dg-mono" x="210" y="109">agy</text>
+
+            <rect class="dg-box" x="184" y="168" width="152" height="64" rx="6"/>
+            <text class="dg-t2 dg-mono" x="196" y="194">gilde-tmux</text>
+            <text class="dg-m" x="196" y="216" data-i18n="dg.tmux.s2">team panes</text>
+
+            <line class="dg-line" x1="100" y1="262" x2="100" y2="142" marker-end="url(#ahn)"/>
+            <text class="dg-m" x="110" y="200" data-i18n="dg.starts2">starts</text>
+            <line class="dg-line" x1="260" y1="234" x2="260" y2="262" marker-end="url(#ahn)"/>
+
+            <rect class="dg-box dg-gilde" x="24" y="264" width="312" height="80" rx="6"/>
+            <image href="assets/gilde.svg" x="36" y="278" width="24" height="24"/>
+            <text class="dg-t" x="70" y="296" data-i18n="dg.core2">Rust core</text>
+            <text class="dg-s" x="36" y="326" data-i18n="dg.core.s2">holds every privilege</text>
+
+            <line class="dg-line" x1="100" y1="346" x2="100" y2="390" marker-start="url(#ahn)" marker-end="url(#ahn)"/>
+            <text class="dg-m" x="110" y="372">IPC</text>
+            <line class="dg-line" x1="260" y1="346" x2="260" y2="390" marker-start="url(#ahn)" marker-end="url(#ahn)"/>
+            <text class="dg-m" x="270" y="372">stdio</text>
+
+            <rect class="dg-box" x="24" y="392" width="152" height="76" rx="6"/>
+            <text class="dg-t2" x="36" y="418">WebView</text>
+            <text class="dg-m" x="36" y="442" data-i18n="dg.web.m2">renders only</text>
+            <rect class="dg-box" x="184" y="392" width="152" height="76" rx="6"/>
+            <text class="dg-t2" x="196" y="418" data-i18n="dg.sidecar2">Node sidecar</text>
+            <text class="dg-m" x="196" y="442" data-i18n="dg.sidecar.m2">turns · quota</text>
+
+            <rect class="dg-box" x="24" y="528" width="312" height="72" rx="6"/>
+            <text class="dg-t2" x="36" y="554" data-i18n="dg.files2">Agent files</text>
+            <text class="dg-m" x="36" y="578" data-i18n="dg.files.m2">read-only, keys never opened</text>
+            <rect class="dg-box" x="24" y="624" width="312" height="72" rx="6"/>
+            <text class="dg-t2" x="36" y="650" data-i18n="dg.ps2">Process table</text>
+            <text class="dg-m" x="36" y="674" data-i18n="dg.ps.m2">sessions started elsewhere</text>
+            <rect class="dg-box" x="24" y="720" width="312" height="72" rx="6"/>
+            <text class="dg-t2" x="36" y="746" data-i18n="dg.db2">State database</text>
+            <text class="dg-m" x="36" y="770" data-i18n="dg.db.m2">metadata only</text>
+
+            <path class="dg-read" d="M336 564 H350 V304 H338" fill="none" marker-end="url(#ahnd)"/>
+            <path class="dg-read" d="M336 660 H350 V564" fill="none"/>
+            <path class="dg-line" d="M24 756 H10 V304 H22" fill="none" marker-start="url(#ahn)" marker-end="url(#ahn)"/>
           </svg>
 
           <figcaption class="legend">
-            <span><svg width="28" height="8" aria-hidden="true"><line class="dg-line" x1="0" y1="4" x2="28" y2="4"/></svg><span data-i18n="dg.legend.run">what the orchestrator runs</span></span>
-            <span><svg width="28" height="8" aria-hidden="true"><line class="dg-read" x1="0" y1="4" x2="28" y2="4"/></svg><span data-i18n="dg.legend.read">what Gilde reads</span></span>
+            <span><svg width="28" height="8" aria-hidden="true"><line class="dg-line" x1="0" y1="4" x2="28" y2="4"/></svg><span data-i18n="dg.legend.run">what Gilde runs or writes</span></span>
+            <span><svg width="28" height="8" aria-hidden="true"><line class="dg-read" x1="0" y1="4" x2="28" y2="4"/></svg><span data-i18n="dg.legend.read">what Gilde only reads</span></span>
           </figcaption>
         </figure>
 
         <ol class="steps">
-          <li><strong data-i18n="how.1.t">You lead a team from a Claude Code session.</strong> <span data-i18n="how.1.b">The session runs <code>cco</code>, and the orchestrator's dispatch host for that session starts the members.</span></li>
-          <li><strong data-i18n="how.2.t">Each member works apart.</strong> <span data-i18n="how.2.b">A member is a vendor CLI — Claude Code, Codex, Cursor or Antigravity — running under a worker account in its own git worktree and branch.</span></li>
-          <li><strong data-i18n="how.3.t">Gilde connects as an observer.</strong> <span data-i18n="how.3.b">Over the dispatch host's local socket it asks for the team list, a team's state, its activity and the worker accounts — read methods only. For a team with no live host it reads the team's state files.</span></li>
-          <li><strong data-i18n="how.4.t">Gilde watches the processes.</strong> <span data-i18n="how.4.b">Every 5 seconds it takes one process snapshot of the Mac and matches agent processes to teams and members. The memory figures and the alerts come from there.</span></li>
+          <li><strong data-i18n="how.1.t">Gilde finds your sessions.</strong> <span data-i18n="how.1.b">It reads the agents' own session files without writing them and looks at the process table, so sessions you started in a terminal, an editor or the background appear as Watching.</span></li>
+          <li><strong data-i18n="how.2.t">You start a session from Gilde.</strong> <span data-i18n="how.2.b">Pick a project, an agent and an account, or take the defaults. Gilde starts the CLI in a terminal it supervises, as a structured conversation, or turn by turn — in its own worktree if you want one.</span></li>
+          <li><strong data-i18n="how.3.t">Requests come to you.</strong> <span data-i18n="how.3.b">Approvals, questions, plans, errors and new replies join one ranked list. Answer on Home or in the session; a notification can point you there.</span></li>
+          <li><strong data-i18n="how.4.t">Processes stay accounted for.</strong> <span data-i18n="how.4.b">Every process Gilde starts is registered before it runs, and Gilde stops what it started when you stop the session or quit the app. What ended sessions leave behind is listed as leftovers until you clean it up.</span></li>
         </ol>
       </div>
     </section>
@@ -346,30 +419,30 @@
     <section class="section" id="security" aria-labelledby="sec-title">
       <div class="wrap">
         <p class="eyebrow" data-i18n="sec.eyebrow">Security and privacy</p>
-        <h2 id="sec-title" data-i18n="sec.title">It reads. It does not act behind your back.</h2>
+        <h2 id="sec-title" data-i18n="sec.title">Your work stays on your Mac.</h2>
         <div class="grid2">
           <article class="card pad">
-            <h3><span class="dot" data-status="ok" aria-hidden="true"></span><span data-i18n="sec.ro.t">Read-only preview</span></h3>
-            <p data-i18n="sec.ro.b">Gilde uses the dispatch host's read methods only, reads team files without writing them and asks git read-only questions. It does not create teams, post messages, change accounts or touch your repositories.</p>
-          </article>
-          <article class="card pad">
             <h3><span class="dot" data-status="ok" aria-hidden="true"></span><span data-i18n="sec.local.t">Local only</span></h3>
-            <p data-i18n="sec.local.b">Everything it reads is on this Mac: files in your home folder, the orchestrator's local socket, git and the process table. The code has no telemetry, no analytics and no update check.</p>
+            <p data-i18n="sec.local.b">Gilde sends your data nowhere. It has no telemetry, no analytics, no update check and no network client of its own; the only network traffic is what the agent CLIs you run produce.</p>
           </article>
           <article class="card pad">
-            <h3><span class="dot" data-status="ok" aria-hidden="true"></span><span data-i18n="sec.kill.t">It never stops a team member</span></h3>
-            <p data-i18n="sec.kill.b">A member that uses too much memory, or a stuck turn, is reported with the <code>cco</code> command that stops it from your lead session. Gilde does not signal it: that would break the team's turn behind the engine's back.</p>
+            <h3><span class="dot" data-status="ok" aria-hidden="true"></span><span data-i18n="sec.text.t">No conversation text on disk</span></h3>
+            <p data-i18n="sec.text.b">Messages, tool input and output, titles and prompts live in memory only. The state database holds metadata — ids, states, timestamps, counts — and a schema test fails on any column that could hold content.</p>
           </article>
           <article class="card pad">
-            <h3><span class="dot" data-status="ok" aria-hidden="true"></span><span data-i18n="sec.clean.t">Clean up is narrow</span></h3>
-            <p data-i18n="sec.clean.b">Only leftovers are offered: agent processes that carry the orchestrator's team-member marker, whose team or turn is gone, seen on two checks in a row. You see a dry run first, and nothing is signalled unless the process's start time and its command line or marker still match.</p>
+            <h3><span class="dot" data-status="ok" aria-hidden="true"></span><span data-i18n="sec.cred.t">Credentials are never opened</span></h3>
+            <p data-i18n="sec.cred.b">The agents' folders are read-only to Gilde, and a path filter refuses key files, lock files, token and OAuth files before any open. Gilde never signs in for you and does not read other processes' environment values.</p>
+          </article>
+          <article class="card pad">
+            <h3><span class="dot" data-status="ok" aria-hidden="true"></span><span data-i18n="sec.watch.t">Watching means hands off</span></h3>
+            <p data-i18n="sec.watch.b">A session started elsewhere is shown, never typed into. Clean-up stops only leftover processes it can identify, after you confirm.</p>
           </article>
         </div>
         <aside class="callout" aria-labelledby="limit-title">
           <span class="dot" data-status="waiting" aria-hidden="true"></span>
           <div>
-            <h3 id="limit-title" data-i18n="sec.limit.t">The limit of Teammate mode itself</h3>
-            <p data-i18n="sec.limit.b">Members run as your macOS user. Worktrees keep their work apart and protect against accidents; they are not a security boundary. A member that can run shell commands can read your user's files and talk to the dispatch host's socket. Do not run a team on a repository whose content you do not trust.</p>
+            <h3 id="limit-title" data-i18n="sec.limit.t">The limit of any coding agent</h3>
+            <p data-i18n="sec.limit.b">Agents run as your macOS user. A worktree keeps work apart and protects against accidents; it is not a security boundary. An agent that can run shell commands can read your user's files, so read an approval card before you allow it, and do not run agents on a repository whose content you do not trust.</p>
           </div>
         </aside>
         <p class="muted sec-report" data-i18n="sec.report">Found a vulnerability? Report it privately: on GitHub, <a href="https://github.com/Toragonite/gilde/security/advisories/new">Security → Report a vulnerability</a>, or by e-mail to <a href="mailto:toragonite@gmail.com">toragonite@gmail.com</a>. Please do not open a public issue for it.</p>
@@ -386,8 +459,8 @@
             <h3 data-i18n="req.run.t">To run it</h3>
             <dl class="kv">
               <dt data-i18n="req.run.os.k">Mac</dt><dd data-i18n="req.run.os.v">Apple silicon (M1 or later), macOS 11 or later — verified on macOS 14.6</dd>
-              <dt data-i18n="req.run.cco.k">Orchestrator</dt><dd data-i18n="req.run.cco.v">Claude Code Orchestrator 2.0 for VS Code, with Teammate mode turned on (experimental in the orchestrator)</dd>
-              <dt data-i18n="req.run.agents.k">Agents</dt><dd data-i18n="req.run.agents.v">the CLIs your teams use: Claude Code, Codex, Cursor, Antigravity</dd>
+              <dt data-i18n="req.run.agents.k">Agents</dt><dd data-i18n="req.run.agents.v">at least one agent CLI, installed and signed in: <code>claude</code>, <code>codex</code>, <code>cursor-agent</code> or <code>agy</code>. Conversation mode needs <code>claude</code> 2.1.268 or newer; older versions run in Terminal mode.</dd>
+              <dt data-i18n="req.run.opt.k">Optional</dt><dd data-i18n="req.run.opt.v"><code>git</code> for worktrees and the Changes view, an IDE for Open in IDE, and Claude Code Orchestrator for its teams and accounts</dd>
             </dl>
           </div>
           <div class="card pad">
@@ -397,7 +470,7 @@
               <dt>Rust</dt><dd data-i18n="req.build.rust">stable 1.95 or newer, from rustup (verified with 1.96.1)</dd>
               <dt>Node.js</dt><dd data-i18n="req.build.node">20.19+ or 22.12+, with npm 10 or newer</dd>
               <dt data-i18n="req.build.net.k">Network</dt><dd data-i18n="req.build.net.v">for the first build: npm packages, Rust crates and the pinned Node runtime from nodejs.org</dd>
-              <dt data-i18n="req.build.disk.k">Disk</dt><dd data-i18n="req.build.disk.v">about 3 GB free for the Rust build directory</dd>
+              <dt data-i18n="req.build.disk.k">Disk</dt><dd data-i18n="req.build.disk.v">a few GB free for the Rust build directory</dd>
             </dl>
           </div>
         </div>
@@ -416,8 +489,8 @@
         <ol class="build-steps">
           <li>
             <h3 data-i18n="build.1.t">Get the source</h3>
-            <div class="cmd"><pre><code>git clone <span data-link-text="repoGit">https://github.com/Toragonite/gilde.git</span> gilde-code
-cd gilde-code</code></pre><button type="button" class="btn copy" hidden data-i18n="copy">Copy</button></div>
+            <div class="cmd"><pre><code>git clone <span data-link-text="repoGit">https://github.com/Toragonite/gilde.git</span> gilde
+cd gilde</code></pre><button type="button" class="btn copy" hidden data-i18n="copy">Copy</button></div>
           </li>
           <li>
             <h3 data-i18n="build.2.t">Install the dependencies</h3>
@@ -438,7 +511,7 @@ cd gilde-code</code></pre><button type="button" class="btn copy" hidden data-i18
           <li>
             <h3 data-i18n="build.5.t">Build the app</h3>
             <div class="cmd"><pre><code>npm run tauri build</code></pre><button type="button" class="btn copy" hidden data-i18n="copy5">Copy</button></div>
-            <p data-i18n="build.5.b">Runs steps 3 and 4 again first (they do nothing when their output is current), builds the frontend, compiles the app in release mode and ad-hoc signs the bundle. The first build takes several minutes. Add <code>-- --bundles dmg</code> for a disk image as well.</p>
+            <p data-i18n="build.5.b">Checks that every manifest carries the same version, runs steps 3 and 4 again (they do nothing when their output is current), builds the frontend, compiles the app in release mode and ad-hoc signs the bundle. The first build takes several minutes. Add <code>-- --bundles dmg</code> for a disk image as well.</p>
           </li>
         </ol>
         <div class="result">
@@ -446,30 +519,30 @@ cd gilde-code</code></pre><button type="button" class="btn copy" hidden data-i18
           <code>src-tauri/target/release/bundle/macos/Gilde Code.app</code>
           <span class="muted" data-i18n="build.result.v">Drag it to Applications. An app you build yourself carries no quarantine attribute, so it opens without a Gatekeeper prompt.</span>
         </div>
-        <p class="note" data-i18n="build.dev">For development: <code>npm run tauri dev</code>. The full guide, with tests and troubleshooting, is <code>BUILDING.md</code> in the repository.</p>
+        <p class="note" data-i18n="build.dev">For development: <code>npm run tauri dev</code>, or <code>VITE_GILDE_SHOWCASE=1 npx vite</code> for the UI on demo data in a plain browser. The full guide, with tests and troubleshooting, is <code>BUILDING.md</code> in the repository.</p>
       </div>
     </section>
 
     <!-- =============================================================== stack -->
     <section class="section" id="stack" aria-labelledby="stack-title">
       <div class="wrap">
-        <p class="eyebrow" data-i18n="stack.eyebrow">Part of the stack</p>
-        <h2 id="stack-title" data-i18n="stack.title">Three parts, released together</h2>
+        <p class="eyebrow" data-i18n="stack.eyebrow">Related projects</p>
+        <h2 id="stack-title" data-i18n="stack.title">What Gilde builds on, and what it works with</h2>
         <div class="grid3">
-          <article class="card pad stack-card">
-            <h3>Claude Code Orchestrator 2.0</h3>
-            <p data-i18n="stack.cco.b">The VS Code extension and the <code>cco</code> command. Its Teammate mode lets a lead Claude Code session lead members across vendors and accounts, each in its own git worktree and branch.</p>
-            <p class="meta"><span class="badge">MIT</span> <a href="https://github.com/Toragonite/claude-code-orchestrator" data-link="orchestrator" data-i18n="stack.cco.link">Claude Code Orchestrator</a></p>
+          <article class="card pad stack-card this">
+            <h3>Gilde Code</h3>
+            <p data-i18n="stack.gilde.b">The desktop app: sessions, approvals, teams, history, accounts and the health of the agent processes on your Mac.</p>
+            <p class="meta"><span class="badge">Apache-2.0</span> <a href="https://github.com/Toragonite/gilde" data-link="repo" data-i18n="stack.gilde.link">Source</a></p>
           </article>
           <article class="card pad stack-card">
             <h3>agent-mesh</h3>
-            <p data-i18n="stack.mesh.b">A library with one adapter per agent CLI — Claude Code, Codex, Cursor and Antigravity — for structured runs: stream, resume, quota, cancel. Gilde's sidecar is built on it.</p>
+            <p data-i18n="stack.mesh.b">A library with one adapter per agent CLI for structured runs: stream, resume, quota, cancel. Gilde's sidecar runs the turn-by-turn agents and the quota and sign-in checks through it.</p>
             <p class="meta"><span class="badge">MIT</span> <a href="https://www.npmjs.com/package/@toragonite/agent-mesh" data-link="agentMesh" data-i18n="stack.mesh.link">agent-mesh</a></p>
           </article>
-          <article class="card pad stack-card this">
-            <h3>Gilde Code</h3>
-            <p data-i18n="stack.gilde.b">The desktop cockpit: teams, worker accounts, and the health of the agent processes on your Mac. Read-only in this preview.</p>
-            <p class="meta"><span class="badge">Apache-2.0</span> <a href="https://github.com/Toragonite/gilde" data-link="repo" data-i18n="stack.gilde.link">Source</a></p>
+          <article class="card pad stack-card">
+            <h3>Claude Code Orchestrator</h3>
+            <p data-i18n="stack.cco.b">Optional. An extension and the <code>cco</code> command, whose Teammate mode runs teams across agent CLIs and accounts. When it is installed, Gilde shows its teams and accounts read-only; without it, nothing about it appears.</p>
+            <p class="meta"><span class="badge">MIT</span> <a href="https://github.com/Toragonite/claude-code-orchestrator" data-link="orchestrator" data-i18n="stack.cco.link">Claude Code Orchestrator</a></p>
           </article>
         </div>
       </div>
@@ -483,27 +556,27 @@ cd gilde-code</code></pre><button type="button" class="btn copy" hidden data-i18
         <div class="faq">
           <details>
             <summary data-i18n="faq.1.q">Does it need Claude Code Orchestrator?</summary>
-            <p data-i18n="faq.1.a">Yes. Gilde shows what the orchestrator's Teammate mode runs, so it needs Claude Code Orchestrator 2.0. Without a team the Team view is empty, and Worker accounts asks you to start a Claude Code session with the orchestrator. An older dispatch host cannot send the account list, and Gilde says so.</p>
+            <p data-i18n="faq.1.a">No. Gilde works on its own with the agent CLIs you have. When the orchestrator is installed, its teams and accounts appear read-only; without it, nothing about it renders.</p>
           </details>
           <details>
-            <summary data-i18n="faq.2.q">Does it change my repository?</summary>
-            <p data-i18n="faq.2.a">No. It asks git read-only questions with optional locks turned off, and it never writes team files. Gilde keeps its own settings and state in <code>~/Library/Application Support/com.toragonite.gildecode</code>.</p>
+            <summary data-i18n="faq.2.q">Which agents does it work with?</summary>
+            <p data-i18n="faq.2.a"><code>claude</code>, <code>codex</code>, <code>cursor-agent</code> and <code>agy</code>. <code>claude</code> runs in Conversation mode (2.1.268 or newer) or Terminal mode; the other three run turn by turn or in Terminal mode.</p>
           </details>
           <details>
-            <summary data-i18n="faq.3.q">Can it stop agents?</summary>
-            <p data-i18n="faq.3.a">Not team members: for those it gives you the <code>cco</code> command to run from your lead session, or you use the Team view in VS Code. The one thing it can end is a leftover process after its team is gone — after a dry run, with your confirmation, and only if the process is still the one that was checked.</p>
+            <summary data-i18n="faq.3.q">Can it answer a session I started in a terminal?</summary>
+            <p data-i18n="faq.3.a">No. A session started elsewhere is Watching: Gilde shows it and says where it runs, but never types into it. From History you can continue a past session in Gilde, or continue a copy.</p>
           </details>
           <details>
-            <summary data-i18n="faq.4.q">Which agents does it work with?</summary>
-            <p data-i18n="faq.4.a">The ones Teammate mode runs members on: Claude Code, Codex, Cursor and Antigravity. Gilde shows the vendor and account of each member.</p>
+            <summary data-i18n="faq.4.q">Does it change my repository?</summary>
+            <p data-i18n="faq.4.a">The agents you start change files as they work, as they would in a terminal. Gilde itself writes to git only when you ask: a new worktree for a session, or a commit, merge or discard in the Changes view. Its own settings and state live in <code>~/Library/Application Support/com.toragonite.gildecode</code>.</p>
           </details>
           <details>
-            <summary data-i18n="faq.5.q">Does it run on Linux or Windows?</summary>
-            <p data-i18n="faq.5.a">Not in this build. It is built and tested on macOS on Apple silicon; the bundled Node runtime is pinned to that platform and the process supervision uses macOS interfaces.</p>
+            <summary data-i18n="faq.5.q">Does it send telemetry?</summary>
+            <p data-i18n="faq.5.a">No. The code has no telemetry, no analytics and no update check. Building it downloads packages and the pinned Node runtime once.</p>
           </details>
           <details>
-            <summary data-i18n="faq.6.q">Does it send telemetry?</summary>
-            <p data-i18n="faq.6.a">No. The code has no telemetry, no analytics and no update check, and the preview reads only local state and the orchestrator's local socket. Building it downloads packages and the pinned Node runtime once.</p>
+            <summary data-i18n="faq.6.q">Does it run on Linux or Windows?</summary>
+            <p data-i18n="faq.6.a">Not in this build. It is built and tested on macOS on Apple silicon; the bundled Node runtime is pinned to that platform and the process supervision uses macOS interfaces.</p>
           </details>
           <details>
             <summary data-i18n="faq.7.q">Why is there no download?</summary>
@@ -511,7 +584,7 @@ cd gilde-code</code></pre><button type="button" class="btn copy" hidden data-i18
           </details>
           <details>
             <summary data-i18n="faq.8.q">What is the license?</summary>
-            <p data-i18n="faq.8.a">Gilde Code is licensed under Apache-2.0. Claude Code Orchestrator and agent-mesh are MIT.</p>
+            <p data-i18n="faq.8.a">Gilde Code is licensed under Apache-2.0. agent-mesh and Claude Code Orchestrator are MIT.</p>
           </details>
         </div>
       </div>
@@ -532,7 +605,7 @@ cd gilde-code</code></pre><button type="button" class="btn copy" hidden data-i18
         <a href="#faq" data-i18n="nav.faq2">FAQ</a>
         <a href="https://github.com/Toragonite/gilde" data-link="repo">GitHub</a>
       </nav>
-      <p class="footer-note" data-i18n="footer.note">Claude Code, Codex, Cursor and Antigravity are trademarks of their respective owners. Gilde Code is an independent project, not affiliated with or endorsed by them.</p>
+      <p class="footer-note" data-i18n="footer.note">The agent CLIs named on this page belong to their respective owners. Gilde Code is an independent project, not affiliated with or endorsed by them.</p>
     </div>
   </footer>
   <div class="sr-only" aria-live="polite" id="live"></div>

@@ -13,8 +13,10 @@
  *      next newline, so a runaway peer cannot make us allocate without bound.
  *   3. Writes are drain-aware. The outbound queue is capped at
  *      {@link MAX_OUTBOUND_QUEUE}; when it overflows, notifications whose method
- *      is contractually lossy (`mesh.event`) are dropped oldest-first.
- *      **Responses and requests are never dropped.**
+ *      is contractually lossy (`orch.snapshot`, `host.log`) are dropped
+ *      oldest-first. **Responses, requests and `turn.event` are never dropped**
+ *      (contract §4.5: no silent loss of a turn's events; the text is already
+ *      coalesced at 50 ms / 16 KiB, so the volume is bounded at the source).
  *   4. Every wait is bounded and every loop has a terminal exit (INT-C). A host
  *      that died leaves a pipe that accepts no byte and emits no `drain`; the
  *      pump declares the writer dead rather than retrying, and `flush()` carries
@@ -48,25 +50,22 @@ export const DEFAULT_CALL_TIMEOUT_MS = 30_000;
 export const FLUSH_TIMEOUT_MS = 500;
 
 /**
- * Methods whose delivery is lossy by contract (DESIGN §5-1, §5-8). Only these are
- * ever discarded under backpressure; the terminal state of a run always also
- * reaches the host through the `mesh.run`/`mesh.stream` response and the disk
- * artifacts, so a dropped `mesh.event` costs a UI refresh, never a result.
+ * Methods whose delivery is lossy by contract. Only these are ever discarded
+ * under backpressure. `turn.event` is NOT one of them (contract §4.5: `Done` /
+ * `Error` are never dropped, and a dropped `Text` would be silent loss).
  */
-export const LOSSY_METHODS: ReadonlySet<string> = new Set(['mesh.event', 'host.log', 'cco.team.snapshot']);
+export const LOSSY_METHODS: ReadonlySet<string> = new Set(['orch.snapshot', 'host.log']);
 
 /**
- * Drop order under backpressure, lowest rank first. `mesh.event` goes first
- * (DESIGN §5-1 names it explicitly), then `host.log`. Everything else — every
- * response, and every request such as `host.registerSpawn` — is rank 0 and is
- * never dropped.
+ * Drop order under backpressure, lowest rank first. Everything else — every
+ * response, every request such as `host.registerSpawn`, every `turn.event` — is
+ * rank 0 and is never dropped.
  */
 const DROP_RANK: Readonly<Record<string, number>> = {
-  'mesh.event': 1,
-  // Team contract v2 §8.2: a team view is a whole snapshot, latest wins, so it takes
-  // `mesh.event`'s rank — a dropped one only delays the UI, and the next
-  // `cco.team.list` (which carries each team's latest rev) re-reads what was lost.
-  'cco.team.snapshot': 1,
+  // A team view is a whole snapshot, latest wins (`(generation, rev)`): a dropped
+  // one only delays the UI, and the next `orch.team.list` (which carries each
+  // team's latest rev) re-reads what was lost.
+  'orch.snapshot': 1,
   'host.log': 2,
 };
 
@@ -105,6 +104,12 @@ export interface Rpc {
   notify(method: string, params: unknown): void;
   /** Register a handler for an inbound method (request or notification). */
   on(method: string, h: (params: any) => Promise<any> | any): void;
+  /**
+   * Unregister a method: from then on a request for it is `-32601 unknown method`
+   * (how the orchestrator methods disappear while the orchestrator is absent,
+   * contract §4.5). Idempotent.
+   */
+  off(method: string): void;
   /** Begin consuming the input stream. Idempotent. */
   start(): void;
 }
@@ -478,8 +483,9 @@ export function createRpc(
 
   function enqueue(item: Outbound): void {
     if (queue.length >= maxOutboundQueue) {
-      // Drop the OLDEST `mesh.event` entries first, then `host.log`. Newer events
-      // describe more current state; responses and requests are structurally exempt.
+      // Drop the OLDEST `orch.snapshot` entries first, then `host.log`. Newer views
+      // describe more current state; responses, requests and turn events are
+      // structurally exempt.
       const need = queue.length - maxOutboundQueue + 1;
       let dropped = dropRankFromQueue(1, need);
       if (dropped < need) dropped += dropRankFromQueue(2, need - dropped);
@@ -546,7 +552,7 @@ export function createRpc(
     } finally {
       // SYNCHRONOUSLY, inside the async body — not in a `.finally()` on the
       // promise, which would land a microtask later. `enqueue` is called in tight
-      // synchronous bursts (`mesh.stream` fan-out, 20k events at a time); a pump
+      // synchronous bursts (a turn's event fan-out, thousands at a time); a pump
       // that is still flagged busy after it stopped swallows every one of them
       // and the channel silently stalls with a full queue.
       pumping = false;
@@ -602,6 +608,10 @@ export function createRpc(
 
     on(method: string, h: (params: any) => Promise<any> | any): void {
       handlers.set(method, h);
+    },
+
+    off(method: string): void {
+      handlers.delete(method);
     },
 
     start(): void {

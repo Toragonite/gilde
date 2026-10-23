@@ -1,0 +1,194 @@
+/* Session → Changes (ux-ia §3.13). Tokens only. */
+
+.g-changes {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 12px 24px;
+  min-height: 0;
+  overflow: auto;
+  flex: 1;
+}
+
+.g-changes-head {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  position: relative;
+}
+
+.g-changes-refresh {
+  position: absolute;
+  right: 0;
+  top: 0;
+}
+
+.g-changes-meta,
+.g-changes-note,
+.g-changes-status {
+  margin: 0;
+  font-size: var(--fs-sub);
+  color: var(--n9);
+}
+
+.g-changes-note {
+  color: var(--n8);
+}
+
+.g-changes-detail {
+  color: var(--n8);
+  overflow-wrap: anywhere;
+}
+
+.g-changes-h {
+  margin: 0 0 4px;
+  font-size: var(--fs-sub);
+  font-weight: 600;
+  color: var(--n8);
+}
+
+.g-changes-files,
+.g-changes-commits ul,
+.g-changes-checks {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.g-changes-file {
+  display: grid;
+  grid-template-columns: 16px minmax(120px, 2fr) 96px minmax(80px, 1.2fr) minmax(80px, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  min-height: 28px;
+  padding: 0 6px;
+  border-radius: var(--r-sm);
+  font-size: var(--fs-sub);
+}
+
+.g-changes-file:hover,
+.g-changes-file:focus-visible {
+  background: var(--n2);
+}
+
+.g-changes-file:focus-visible {
+  outline: 1px solid var(--accent);
+}
+
+.g-changes-mark {
+  color: var(--n8);
+}
+
+.g-changes-path {
+  color: var(--n11);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.g-changes-stat {
+  color: var(--n9);
+  font-variant-numeric: tabular-nums;
+}
+
+.g-changes-parts,
+.g-changes-by {
+  color: var(--n8);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.g-changes-fileacts {
+  display: flex;
+  gap: 2px;
+}
+
+.g-changes-fileacts .g-cbtn {
+  height: 22px;
+}
+
+.g-changes-commits li {
+  display: flex;
+  gap: 12px;
+  min-height: 24px;
+  align-items: center;
+  font-size: var(--fs-sub);
+}
+
+.g-changes-subject {
+  color: var(--n10);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.g-changes-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  padding: 8px;
+}
+
+.g-changes-spacer {
+  flex: 1;
+}
+
+.g-cbtn-danger {
+  color: var(--error);
+}
+
+.g-linkbtn {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--n10);
+  font: inherit;
+  text-decoration: underline;
+  text-decoration-color: var(--n6);
+}
+
+.g-linkbtn:focus-visible {
+  outline: 1px solid var(--accent);
+}
+
+.g-changes-label {
+  display: block;
+  font-size: var(--fs-sub);
+  color: var(--n9);
+  margin-bottom: 4px;
+}
+
+.g-changes-message {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--n0);
+  color: var(--n11);
+  font: inherit;
+  padding: 6px 8px;
+  resize: vertical;
+}
+
+.g-changes-checks li label {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  min-height: 24px;
+  font-size: var(--fs-sub);
+}
+
+@media (max-width: 1100px) {
+  .g-changes-file {
+    grid-template-columns: 16px minmax(120px, 1fr) 96px auto;
+  }
+  .g-changes-parts,
+  .g-changes-by {
+    grid-column: 2 / -1;
+  }
+}

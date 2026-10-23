@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "provenance": "Per-build app features (contract §3.10, the 'app flag' rows of §1.3). A flag is set only after its probe passed on this build; absent = fallback. None of the four probes was in R6's brief, so every flag is pending and this build ships every fallback.",
+  "features": {},
+  "evidence": {},
+  "pending": {
+    "vscodeWindowFocus": "§1.3 P30 open: LP-24 not run (R6 §7)",
+    "notificationCenter": "§1.3 P34 open: LP-28 not run (R6 §7)",
+    "dockMenu": "§1.3 P35 open: LP-29 not run (R6 §7)",
+    "ideGotoWindow": "§1.3 P37 open: LP-36 / A-P6 not run (R6 §7)",
+    "worktreesInRepo": "§1.3 P41 open: LP-40 not run (A6, A17.2)"
+  }
+}

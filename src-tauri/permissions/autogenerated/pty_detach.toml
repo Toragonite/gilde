@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-pty-detach"
+description = "Enables the pty_detach command without any pre-configured scope."
+commands.allow = ["pty_detach"]
+
+[[permission]]
+identifier = "deny-pty-detach"
+description = "Denies the pty_detach command without any pre-configured scope."
+commands.deny = ["pty_detach"]

@@ -41,6 +41,12 @@
 //! because half of §35's bug was a decaying CPU average and a byte-only replay
 //! cannot reproduce it.
 //!
+//! ## Builds
+//!
+//! Only builds with the `probe-log` feature record anything (Gilde 2 §9.7:
+//! no terminal content is persisted by a release build); elsewhere
+//! [`enabled`] is always `false`.
+//!
 //! ## Cost when it is off
 //!
 //! One [`OnceLock`] read and a null check. The environment is read once, the
@@ -76,6 +82,11 @@ pub const MAGIC: &[u8] = b"GCAP1\n";
 fn dump_dir() -> Option<&'static PathBuf> {
     static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
     DIR.get_or_init(|| {
+        // Gilde 2 privacy (§9.7): a recording of terminal content is a
+        // diagnostic for `probe-log` builds only, never a release behaviour.
+        if !cfg!(feature = "probe-log") {
+            return None;
+        }
         let value = std::env::var(DUMP_ENV).ok()?;
         let trimmed = value.trim();
         if trimmed.is_empty() {

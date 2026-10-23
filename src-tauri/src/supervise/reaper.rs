@@ -50,7 +50,6 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 use crate::events::{
     self, ProcRegistryEvent, RecoveryPendingEvent, ToastEvent, ToastLevel, PROC_REGISTRY,
@@ -95,6 +94,11 @@ pub mod note {
     pub const HEADLESS_LIFETIME: &str = "past maxHeadlessLifetimeMinutes";
     pub const KEPT: &str = "kept by the user";
     pub const SHUTDOWN: &str = "host shutdown";
+    /// A Gilde session's process left by a crashed instance (contract §10.3):
+    /// fenced SIGTERM after the undo window, never SIGKILL for a vendor CLI.
+    pub const CRASH_LEFTOVER: &str = "crash leftover";
+    /// A vendor process that outlived the quit bound (contract §10.2 step 6).
+    pub const QUIT_SURVIVOR: &str = crate::lifecycle::quit::NOTE_QUIT_SURVIVOR;
 }
 
 /// Toast keys this module emits. Mirrored in `src/i18n/{ko,en}.ts`.
@@ -184,7 +188,13 @@ pub struct SweepReport {
     /// Dry-run reports of the kills scheduled behind a 10 s undo window.
     pub auto_terminated: Vec<KillReport>,
     /// Rows the user must decide about — the Recovered Sessions sheet.
+    /// A29.3: each is also published as Leftover `GildeCrashLeftover`.
     pub pending: Vec<RecoveredProc>,
+    /// A29.3: the window of the stops this sweep scheduled, when it armed
+    /// them itself ([`sweep_startup_with`]); `None` from
+    /// [`sweep_startup_into`], whose caller arms the group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<crate::contract::store::RecoveryWindow>,
 }
 
 impl SweepReport {
@@ -286,9 +296,14 @@ pub fn clear_pending() {
 // the undo table
 // ---------------------------------------------------------------------------
 
+/// One undo token: a single scheduled kill, or (A29.3) a group of them.
 struct ScheduledKill {
-    spawn_id: String,
+    /// The spawn ids the token would stop (one for a single kill).
+    targets: Vec<String>,
+    group: bool,
     cancelled: Arc<AtomicBool>,
+    /// Runs once when the undo lands in time (a group's window closes).
+    on_cancel: Option<Box<dyn FnOnce() + Send>>,
 }
 
 fn undo_table() -> &'static Mutex<HashMap<String, ScheduledKill>> {
@@ -296,35 +311,200 @@ fn undo_table() -> &'static Mutex<HashMap<String, ScheduledKill>> {
     UNDO.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Cancel a scheduled kill inside its undo window.
+/// Cancel a scheduled kill — or every still-pending stop of a group
+/// (A29.3: one token, many stops) — inside its undo window.
 ///
 /// Returns `false` for a token that never existed, already fired or was already
 /// cancelled — the frontend renders that as "too late", never as an error.
 pub fn undo_cancel(token: &str) -> bool {
-    let Some(entry) = undo_table().lock().remove(token) else {
+    let Some(mut entry) = undo_table().lock().remove(token) else {
         return false;
     };
     entry.cancelled.store(true, Ordering::SeqCst);
-    tracing::info!(
-        target: "supervise",
-        token,
-        spawn_id = %entry.spawn_id,
-        "scheduled termination cancelled by the user"
-    );
+    if entry.group {
+        tracing::info!(
+            target: "supervise",
+            token,
+            stops = entry.targets.len(),
+            "scheduled group of terminations cancelled by the user"
+        );
+    } else {
+        tracing::info!(
+            target: "supervise",
+            token,
+            spawn_id = %entry.targets.first().map(String::as_str).unwrap_or_default(),
+            "scheduled termination cancelled by the user"
+        );
+    }
+    // Outside the table lock: the hook publishes to the store.
+    if let Some(hook) = entry.on_cancel.take() {
+        hook();
+    }
     true
 }
 
-/// Whether `token` still names a kill that has not fired.
+/// Whether `token` still names a kill (or a group) that has not fired.
 pub fn undo_is_pending(token: &str) -> bool {
     undo_table().lock().contains_key(token)
 }
 
-/// The `spawn_id` a still-open undo token would kill.
+/// The `spawn_id` a still-open single-kill undo token would kill (`None`
+/// for a group token: see [`undo_targets`]).
 pub fn undo_target(token: &str) -> Option<String> {
     undo_table()
         .lock()
         .get(token)
-        .map(|e| e.spawn_id.clone())
+        .filter(|e| !e.group)
+        .and_then(|e| e.targets.first().cloned())
+}
+
+/// Every `spawn_id` a still-open undo token would stop (a single kill's one,
+/// or a group's members); empty once it fired or was cancelled.
+pub fn undo_targets(token: &str) -> Vec<String> {
+    undo_table()
+        .lock()
+        .get(token)
+        .map(|e| e.targets.clone())
+        .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// the boot sweep's stop group (A29.3)
+// ---------------------------------------------------------------------------
+
+/// Hears the window of an armed [`StopGroup`] (the boot wiring publishes it
+/// as `BootStatus.recovery`).
+pub trait StopGroupObserver: Send + Sync {
+    /// The window opened. Called before the token can fire or be cancelled.
+    fn started(&self, window: &crate::contract::store::RecoveryWindow);
+    /// The window ended: the stops fired (`fired`), or the undo cancelled
+    /// every stop still pending (`!fired`). Called once.
+    fn ended(&self, token: &crate::contract::ids::UndoToken, fired: bool);
+}
+
+/// The stops one boot sweep schedules, collected so that they share **one**
+/// undo token and one window (A29.3): a crashed instance's session children
+/// (§10.3) and the previous instance's quit survivors (§10.2 step 6). The
+/// headless-lifetime kill is not a member (it keeps its own toast and token).
+///
+/// Nothing is signalled until [`StopGroup::arm`] has run and its window has
+/// passed without an undo; every stop is identity-fenced at execution by
+/// `kill_tree`, and a vendor CLI is never escalated to SIGKILL.
+#[derive(Debug, Default)]
+pub struct StopGroup {
+    stops: Vec<(String, KillOpts)>,
+}
+
+impl StopGroup {
+    pub fn new() -> StopGroup {
+        StopGroup::default()
+    }
+
+    /// Add one stop (a spawn id already in the group is not added twice).
+    pub fn push(&mut self, spawn_id: impl Into<String>, opts: KillOpts) {
+        let spawn_id = spawn_id.into();
+        if !self.stops.iter().any(|(id, _)| *id == spawn_id) {
+            self.stops.push((spawn_id, opts));
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.stops.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.stops.is_empty()
+    }
+
+    /// The spawn ids collected so far, in order.
+    pub fn spawn_ids(&self) -> Vec<String> {
+        self.stops.iter().map(|(id, _)| id.clone()).collect()
+    }
+
+    /// Arm the group: one token, one timer for every stop. `None` (and
+    /// nothing armed) for an empty group. The window's `until` is wall
+    /// clock. `observer` hears `started` before the token exists in the undo
+    /// table, then exactly one `ended`: when the window passes (the stops
+    /// fire right after) or when `undo_cancel` takes the token in time — in
+    /// which case no stop of the group is ever signalled.
+    pub fn arm(
+        self,
+        sup: Arc<Supervisor>,
+        window: Duration,
+        observer: Option<Arc<dyn StopGroupObserver>>,
+    ) -> Option<crate::contract::store::RecoveryWindow> {
+        if self.stops.is_empty() {
+            return None;
+        }
+        let undo = crate::contract::ids::UndoToken::mint();
+        let token = undo.as_str().to_string();
+        let recovery = crate::contract::store::RecoveryWindow {
+            stopping: self.stops.len() as u32,
+            undo_token: undo.clone(),
+            until: now_ms() + window.as_millis() as i64,
+        };
+        if let Some(o) = &observer {
+            o.started(&recovery);
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let on_cancel: Option<Box<dyn FnOnce() + Send>> = observer.clone().map(|o| {
+            let undo = undo.clone();
+            Box::new(move || o.ended(&undo, false)) as Box<dyn FnOnce() + Send>
+        });
+        undo_table().lock().insert(
+            token.clone(),
+            ScheduledKill {
+                targets: self.spawn_ids(),
+                group: true,
+                cancelled: cancelled.clone(),
+                on_cancel,
+            },
+        );
+        tracing::info!(
+            target: "supervise",
+            stops = self.stops.len(),
+            window_ms = window.as_millis() as u64,
+            "boot sweep stops scheduled behind one undo window"
+        );
+
+        let stops = self.stops;
+        spawn_task(async move {
+            tokio::time::sleep(window).await;
+            // Same two guards as a single kill: the entry must still be in the
+            // table (an undo removes it under the lock) *and* not flagged.
+            let still_armed = {
+                let mut table = undo_table().lock();
+                match table.remove(&token) {
+                    Some(entry) => !entry.cancelled.load(Ordering::SeqCst),
+                    None => false,
+                }
+            };
+            if !still_armed || cancelled.load(Ordering::SeqCst) {
+                return;
+            }
+            // The window ended: the dialog closes as the stops start.
+            if let Some(o) = &observer {
+                o.ended(&undo, true);
+            }
+            for (spawn_id, opts) in stops {
+                let sup = sup.clone();
+                spawn_task(async move {
+                    let report = kill_tree(&sup, &spawn_id, opts).await;
+                    tracing::info!(
+                        target: "supervise",
+                        spawn_id = %spawn_id,
+                        requested = report.requested.len(),
+                        survivors = report.survivors.len(),
+                        refused = ?report.refused_reason,
+                        "grouped scheduled termination fired"
+                    );
+                    resolve_pending(&spawn_id);
+                    emit_registry_change(&sup, std::slice::from_ref(&spawn_id));
+                });
+            }
+        });
+        Some(recovery)
+    }
 }
 
 /// Spawn `task` on whichever runtime is available (an ambient tokio one during
@@ -354,13 +534,16 @@ pub fn schedule_kill(
     opts: KillOpts,
 ) -> String {
     let spawn_id = spawn_id.into();
-    let token = Uuid::now_v7().to_string();
+    // The contract's `UndoToken` shape (`u_<32 hex>`, §3.2).
+    let token = crate::contract::ids::UndoToken::mint().into_string();
     let cancelled = Arc::new(AtomicBool::new(false));
     undo_table().lock().insert(
         token.clone(),
         ScheduledKill {
-            spawn_id: spawn_id.clone(),
+            targets: vec![spawn_id.clone()],
+            group: false,
             cancelled: cancelled.clone(),
+            on_cancel: None,
         },
     );
 
@@ -389,7 +572,7 @@ pub fn schedule_kill(
             "scheduled termination fired"
         );
         resolve_pending(&spawn_id);
-        emit_registry_change(&sup, &[spawn_id.clone()]);
+        emit_registry_change(&sup, std::slice::from_ref(&spawn_id));
     });
 
     token
@@ -572,8 +755,21 @@ pub async fn sweep_startup(sup: &Arc<Supervisor>) -> SweepReport {
     sweep_startup_with(sup, SweepOpts::default()).await
 }
 
-/// [`sweep_startup`] with the undo window and kill grace made explicit.
+/// [`sweep_startup`] with the undo window and kill grace made explicit. The
+/// session stops it schedules form one group under one undo token, armed
+/// here ([`SweepReport::recovery`]).
 pub async fn sweep_startup_with(sup: &Arc<Supervisor>, opts: SweepOpts) -> SweepReport {
+    let mut group = StopGroup::new();
+    let mut report = sweep_startup_into(sup, opts, &mut group).await;
+    report.recovery = group.arm(sup.clone(), opts.undo_window, None);
+    report
+}
+
+/// The boot sweep, adding every session stop it schedules to `group`
+/// instead of arming it (A29.3: the caller adds the quit survivors and arms
+/// one window for all). The headless-lifetime kill is armed here, with its
+/// own toast and token, as before.
+pub async fn sweep_startup_into(sup: &Arc<Supervisor>, opts: SweepOpts, group: &mut StopGroup) -> SweepReport {
     let mut report = SweepReport::default();
     let me = sup.app_instance_id().to_string();
     let current_boot = sup.current_boot_id().to_string();
@@ -673,6 +869,11 @@ pub async fn sweep_startup_with(sup: &Arc<Supervisor>, opts: SweepOpts) -> Sweep
 
     // ---- steps 3 and 4, per crashed instance.
     let mut candidates: Vec<ProcRow> = Vec::new();
+    // A41.3: processes found only by a dead instance's marker. Listed, never
+    // stopped automatically.
+    let mut orphans: Vec<ProcRow> = Vec::new();
+    // Rows that belong to a Gilde session (`parent_uid`, contract §3.8).
+    let mut with_parent: HashMap<String, String> = HashMap::new();
     for inst in &crashed {
         let instance_id = inst.id.clone();
         let rows = match sup
@@ -691,6 +892,15 @@ pub async fn sweep_startup_with(sup: &Arc<Supervisor>, opts: SweepOpts) -> Sweep
                 continue;
             }
         };
+
+        let instance_id = inst.id.clone();
+        if let Ok(parents) = sup
+            .db()
+            .read(move |conn| dao::proc::parents_of_instance(conn, &instance_id))
+            .await
+        {
+            with_parent.extend(parents);
+        }
 
         for row in rows.into_iter().filter(|r| r.state.is_live()) {
             match row.state {
@@ -730,7 +940,7 @@ pub async fn sweep_startup_with(sup: &Arc<Supervisor>, opts: SweepOpts) -> Sweep
         }
 
         // ---- step 4: untracked orphans of this dead instance (best-effort).
-        candidates.extend(untracked_orphans(sup, &inst.id, &snap).await);
+        orphans.extend(untracked_orphans(sup, &inst.id, &snap).await);
     }
 
     // ---- the policy for verified live orphans (DESIGN §8-5).
@@ -798,8 +1008,41 @@ pub async fn sweep_startup_with(sup: &Arc<Supervisor>, opts: SweepOpts) -> Sweep
             continue;
         }
 
+        let is_session = row.session_id.as_deref().is_some_and(|s| !s.is_empty())
+            || with_parent.contains_key(&row.spawn_id);
+        if row.kind.is_session_kind() && is_session {
+            // Contract §10.3: a crashed instance's Conversation child has lost
+            // its stdin, a PTY child its master; neither is adopted as live.
+            // Fenced SIGTERM (SIGHUP first for terminals) after the undo
+            // window; a vendor CLI is never escalated to SIGKILL, and one that
+            // survives becomes a `GildeCrashLeftover` for the Clean-up sheet.
+            let hup = matches!(row.kind, ProcKind::Pty | ProcKind::Pane | ProcKind::Attach);
+            let kopts = kill_opts.hup_first(hup).grace(Duration::from_millis(1_500));
+            let dry = kill_tree(sup, &row.spawn_id, kopts.dry_run(true)).await;
+            // A29.3: one group, one token — armed by the caller.
+            group.push(row.spawn_id.clone(), kopts);
+            mark_state(sup, &row.spawn_id, row.state, note::CRASH_LEFTOVER).await;
+            note_crash_leftover(&row, with_parent.get(&row.spawn_id));
+            report.auto_terminated.push(dry);
+            continue;
+        }
+
+        note_crash_leftover(&row, with_parent.get(&row.spawn_id));
         report.pending.push(RecoveredProc::of(&row, &snap, now));
     }
+
+    // A41.3: an orphan found only by the dead instance's marker is a Leftover
+    // `GildeCrashLeftover` (the Recovered sheet, then Clean-up) — never a
+    // stop of its own, not even past the headless lifetime: Gilde did not
+    // start it as anything it can name.
+    for row in orphans {
+        note_crash_leftover(&row, None);
+        report.pending.push(RecoveredProc::of(&row, &snap, now));
+    }
+
+    // A29.3: a row the sweep neither stops nor adopts is never dropped
+    // silently — it is a `GildeCrashLeftover` for the Clean-up sheet (A43.1:
+    // from the first scan, `note_crash_leftover` above).
 
     // ---- step 5: close the crashed instances.
     for inst in &crashed {
@@ -835,6 +1078,175 @@ pub async fn sweep_startup_with(sup: &Arc<Supervisor>, opts: SweepOpts) -> Sweep
 
     publish(sup, &report);
     report
+}
+
+static CRASH_LEFTOVERS: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+static QUIT_SURVIVORS: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+
+fn leftover_set(
+    cell: &'static OnceLock<Mutex<std::collections::HashSet<String>>>,
+) -> &'static Mutex<std::collections::HashSet<String>> {
+    cell.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Spawn ids of session processes a crashed instance left behind (this run's
+/// boot sweep scheduled their termination; contract §10.3).
+pub fn crash_leftover_spawn_ids() -> std::collections::HashSet<String> {
+    leftover_set(&CRASH_LEFTOVERS).lock().clone()
+}
+
+/// A43.1: one crash leftover the boot sweep proved, by identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrashLeftover {
+    pub spawn_id: String,
+    pub pid: i32,
+    pub start_sec: Option<i64>,
+    /// The Gilde session that owned the row (`parent_uid`, else `session_id`).
+    pub session_uid: Option<String>,
+}
+
+static CRASH_LEFTOVER_IDS: OnceLock<Mutex<HashMap<String, CrashLeftover>>> = OnceLock::new();
+
+fn crash_leftover_ids() -> &'static Mutex<HashMap<String, CrashLeftover>> {
+    CRASH_LEFTOVER_IDS.get_or_init(Default::default)
+}
+
+/// Record a row the boot sweep proved to be a crash leftover (A29.3, A43.1).
+fn note_crash_leftover(row: &ProcRow, parent_uid: Option<&String>) {
+    leftover_set(&CRASH_LEFTOVERS).lock().insert(row.spawn_id.clone());
+    let Some(pid) = row.pid.map(|p| p as i32).filter(|p| *p > 0) else { return };
+    let session_uid = parent_uid.cloned().or_else(|| row.session_id.clone()).filter(|s| !s.is_empty());
+    record_crash_leftover(CrashLeftover { spawn_id: row.spawn_id.clone(), pid, start_sec: row.proc_start_ts, session_uid });
+}
+
+/// Record a proven crash leftover (the boot sweep; tests that model a sweep
+/// that already ran).
+pub fn record_crash_leftover(leftover: CrashLeftover) {
+    leftover_set(&CRASH_LEFTOVERS).lock().insert(leftover.spawn_id.clone());
+    crash_leftover_ids().lock().insert(leftover.spawn_id.clone(), leftover);
+}
+
+/// A43.1: whether `(pid, start_sec)` is a crash leftover the boot sweep proved
+/// for the Gilde session `uid` — known from the sweep at once, before any
+/// health scan published it.
+pub fn is_own_crash_leftover(uid: &str, pid: i32, start_sec: i64) -> bool {
+    crash_leftover_ids().lock().values().any(|c| {
+        c.pid == pid
+            && c.session_uid.as_deref() == Some(uid)
+            && c.start_sec.is_none_or(|s| (s - start_sec).abs() <= 1)
+    })
+}
+
+/// Spawn ids of the previous instance's quit survivors (§10.2 step 6).
+pub fn quit_survivor_spawn_ids() -> std::collections::HashSet<String> {
+    leftover_set(&QUIT_SURVIVORS).lock().clone()
+}
+
+static LEAD_GONE_SURVIVORS: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+
+/// A40.3: record a hosted pane whose processes survived its lead's exit
+/// (PaneHost `lead_gone`, HUP then TERM, never KILL). The health scan shows
+/// its row as Leftover `TeammateOfGoneLead` instead of a live process of this
+/// instance.
+pub fn note_lead_gone_survivor(spawn_id: &str) {
+    leftover_set(&LEAD_GONE_SURVIVORS).lock().insert(spawn_id.to_string());
+}
+
+/// Spawn ids recorded by [`note_lead_gone_survivor`] this run.
+pub fn lead_gone_survivor_spawn_ids() -> std::collections::HashSet<String> {
+    leftover_set(&LEAD_GONE_SURVIVORS).lock().clone()
+}
+
+/// The counters of a [`SweepReport`], for logs and the boot report.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SweepCounts {
+    pub reboot_lost: u32,
+    pub adopted: u32,
+    pub exited: u32,
+    pub lost: u32,
+    pub auto_terminated: u32,
+    pub pending: u32,
+}
+
+impl SweepCounts {
+    pub fn of(report: &SweepReport) -> SweepCounts {
+        SweepCounts {
+            reboot_lost: report.reboot_lost,
+            adopted: report.adopted,
+            exited: report.exited,
+            lost: report.lost,
+            auto_terminated: report.auto_terminated.len() as u32,
+            pending: report.pending.len() as u32,
+        }
+    }
+}
+
+/// Contract §10.2 step 6: the vendor processes an earlier instance recorded as
+/// quit survivors (rows left `running` with [`note::QUIT_SURVIVOR`] under an
+/// ended instance) are identity-fenced; a live one gets a fenced SIGTERM after
+/// the undo window — never SIGKILL — and one that still survives stays visible
+/// as Leftover `QuitSurvivor`. Returns how many terminations were scheduled
+/// (one group under one undo token, armed here).
+pub async fn sweep_quit_survivors(sup: &Arc<Supervisor>, window: Duration) -> u32 {
+    let mut group = StopGroup::new();
+    let n = sweep_quit_survivors_into(sup, &mut group).await;
+    group.arm(sup.clone(), window, None);
+    n
+}
+
+/// [`sweep_quit_survivors`], adding each stop to `group` instead of arming
+/// it (A29.3: the boot sweep arms one window for every stop it schedules).
+pub async fn sweep_quit_survivors_into(sup: &Arc<Supervisor>, group: &mut StopGroup) -> u32 {
+    let me = sup.app_instance_id().to_string();
+    let rows = match sup
+        .db()
+        .read(move |conn| {
+            let mut out = Vec::new();
+            for inst in dao::app_instance::list_all(conn)? {
+                if inst.id == me || inst.ended_at.is_none() {
+                    continue;
+                }
+                for row in dao::proc::rows_of_instance(conn, &inst.id)? {
+                    if row.state.is_live() && row.note.as_deref() == Some(note::QUIT_SURVIVOR) {
+                        out.push(row);
+                    }
+                }
+            }
+            Ok(out)
+        })
+        .await
+    {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!(target: "supervise", error = %err, "could not read quit survivors");
+            return 0;
+        }
+    };
+    if rows.is_empty() {
+        return 0;
+    }
+    let Ok(snap) = ps_snapshot() else {
+        return 0;
+    };
+    let mut scheduled = 0u32;
+    for row in rows {
+        match verify(&row, &snap) {
+            Fence::Gone => mark_reaped(sup, &row.spawn_id).await,
+            Fence::Mismatch(reason) => {
+                mark_state(sup, &row.spawn_id, ProcState::Lost, reason.as_str()).await
+            }
+            Fence::Verified => {
+                let hup = matches!(row.kind, ProcKind::Pty | ProcKind::Pane | ProcKind::Attach);
+                let opts = KillOpts::default()
+                    .grace(Duration::from_millis(1_500))
+                    .hup_first(hup);
+                group.push(row.spawn_id.clone(), opts);
+                leftover_set(&QUIT_SURVIVORS).lock().insert(row.spawn_id.clone());
+                scheduled += 1;
+            }
+        }
+    }
+    scheduled
 }
 
 /// Store the pending set and announce it. Always runs, even for an empty sweep:
@@ -880,6 +1292,7 @@ fn is_live_sibling(inst: &AppInstanceRow) -> bool {
 // 3. planned-row adoption
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::large_enum_variant)]
 enum PlannedOutcome {
     Adopted(ProcRow),
     Lost,
@@ -1044,7 +1457,8 @@ async fn untracked_orphans(sup: &Supervisor, dead_instance: &str, snap: &Snapsho
         let Some(cwd) = procscan::cwd_of(pid) else { continue };
 
         let plan = SpawnPlan::new(ProcKind::Headless, argv, cwd);
-        let guard = match sup.plan_spawn(plan).await {
+        // Already running: registered, not launched (no allowlist check).
+        let guard = match sup.plan_existing(plan).await {
             Ok(guard) => guard,
             Err(err) => {
                 tracing::warn!(target: "supervise", pid, error = %err, "could not register an untracked orphan");
@@ -1449,6 +1863,8 @@ pub async fn resolve(sup: &Supervisor, decisions: &[RecoveryDecision]) -> Vec<Ki
             RecoveryAction::Terminate => kill_tree(sup, &spawn_id, opts).await,
             RecoveryAction::Keep | RecoveryAction::Adopt => {
                 let keep = decision.action() == RecoveryAction::Keep;
+                // The user decided: kept or adopted is no longer a leftover.
+                leftover_set(&CRASH_LEFTOVERS).lock().remove(&spawn_id);
                 let row = sup.row(&spawn_id).await.ok().flatten();
                 match row {
                     Some(row) => {
@@ -1517,6 +1933,21 @@ pub async fn resolve(sup: &Supervisor, decisions: &[RecoveryDecision]) -> Vec<Ki
 ///     The sidecar is taken down deliberately by `RunEvent::Exit`, which runs
 ///     immediately after this sweep on the way out.
 pub async fn shutdown_sweep(sup: &Supervisor) -> Vec<KillReport> {
+    shutdown_sweep_within(sup, SHUTDOWN_SWEEP_BUDGET).await
+}
+
+/// [`shutdown_sweep`] inside `budget` (A40.1, A40.2).
+///
+/// * A row the quit coordinator handed over to the next boot (live, note
+///   [`note::QUIT_SURVIVOR`]) is **left as is**: signalling it again would
+///   rewrite it to `kill_incomplete`, and the next boot's
+///   [`sweep_quit_survivors_into`] would never find it (§10.2 step 6).
+/// * Every other row is signalled **concurrently**, so the sweep takes about
+///   one kill however many rows there are; a kill still running when the
+///   budget ends is abandoned (its signals are sent; the next boot owns the
+///   rest) and the sweep returns, so the caller can close the instance.
+pub async fn shutdown_sweep_within(sup: &Supervisor, budget: Duration) -> Vec<KillReport> {
+    let deadline = tokio::time::Instant::now() + budget;
     let me = sup.app_instance_id().to_string();
     let rows = match sup
         .db()
@@ -1530,20 +1961,64 @@ pub async fn shutdown_sweep(sup: &Supervisor) -> Vec<KillReport> {
         }
     };
 
-    let opts = KillOpts::from_config(&sup.config().get().supervision)
-        .grace(Duration::from_millis(1_500));
-    let mut reports = Vec::new();
+    // About a third of the budget per wait (TERM grace, then the KILL check).
+    let grace = Duration::from_millis(1_500).min(budget / 3);
+    let opts = KillOpts::from_config(&sup.config().get().supervision).grace(grace);
+    let mut targets = Vec::new();
     for row in rows {
         if !row.state.is_live() || row.keep_alive || row.kind == ProcKind::Sidecar {
+            continue;
+        }
+        if is_handed_over_quit_survivor(&row) {
             continue;
         }
         if row.state == ProcState::Planned {
             mark_state(sup, &row.spawn_id, ProcState::Lost, note::SHUTDOWN).await;
             continue;
         }
-        reports.push(kill_tree(sup, &row.spawn_id, opts).await);
+        targets.push(row.spawn_id);
+    }
+    let kills = targets.iter().map(|id| kill_tree(sup, id, opts)).collect();
+    let (reports, unfinished) = join_until(kills, deadline).await;
+    if unfinished > 0 {
+        tracing::warn!(target: "supervise", unfinished, "shutdown sweep reached its budget; the next boot owns the rest");
     }
     reports
+}
+
+/// A40.1: a row the quit coordinator left `running` with the quit-survivor
+/// note for the next boot's sweep.
+pub fn is_handed_over_quit_survivor(row: &ProcRow) -> bool {
+    row.state.is_live() && row.note.as_deref() == Some(note::QUIT_SURVIVOR)
+}
+
+/// Drive `futs` concurrently until all are done or `deadline` passes. Returns
+/// the finished outputs (in completion order) and how many were abandoned.
+async fn join_until<F: std::future::Future>(futs: Vec<F>, deadline: tokio::time::Instant) -> (Vec<F::Output>, usize) {
+    use std::future::Future as _;
+    use std::task::Poll;
+    let mut pending: Vec<Option<std::pin::Pin<Box<F>>>> = futs.into_iter().map(|f| Some(Box::pin(f))).collect();
+    let mut done = Vec::with_capacity(pending.len());
+    let timer = tokio::time::sleep_until(deadline);
+    tokio::pin!(timer);
+    std::future::poll_fn(|cx| {
+        for slot in pending.iter_mut() {
+            if let Some(fut) = slot {
+                if let Poll::Ready(out) = fut.as_mut().poll(cx) {
+                    done.push(out);
+                    *slot = None;
+                }
+            }
+        }
+        if pending.iter().all(Option::is_none) || timer.as_mut().poll(cx).is_ready() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
+    let unfinished = pending.iter().filter(|f| f.is_some()).count();
+    (done, unfinished)
 }
 
 /// Install `SIGTERM` / `SIGINT` handling for the host process.
@@ -1584,23 +2059,14 @@ pub fn install_signal_handlers(app: &tauri::AppHandle, sup: Arc<Supervisor>) {
             std::process::exit(130);
         });
 
-        match tokio::time::timeout(SHUTDOWN_SWEEP_BUDGET, shutdown_sweep(&sup)).await {
-            Ok(reports) => tracing::info!(
-                target: "supervise",
-                killed = reports.len(),
-                "shutdown sweep complete"
-            ),
-            Err(_) => tracing::warn!(
-                target: "supervise",
-                "shutdown sweep did not finish in time; the next boot's reaper owns the rest"
-            ),
-        }
-        if let Err(err) = sup.close_instance().await {
-            tracing::warn!(target: "supervise", error = %err, "could not close the app instance row");
-        }
-
-        hard.abort();
+        // A signal is a request to quit: the exit path runs the quit of
+        // contract §10.2 (record first, bounded stop, never SIGKILL a vendor
+        // CLI, then `ended_at`), so nothing is swept here.
+        let _ = &sup;
+        crate::lifecycle::quit::authorize_exit();
         app.exit(0);
+        // Keep the second-signal guard alive until the process is gone.
+        let _ = hard.await;
     });
 }
 
@@ -1759,16 +2225,54 @@ mod tests {
         undo_table().lock().insert(
             token.to_string(),
             ScheduledKill {
-                spawn_id: "sp-1".into(),
+                targets: vec!["sp-1".into()],
+                group: false,
                 cancelled: Arc::new(AtomicBool::new(false)),
+                on_cancel: None,
             },
         );
         assert!(undo_is_pending(token));
         assert_eq!(undo_target(token).as_deref(), Some("sp-1"));
+        assert_eq!(undo_targets(token), vec!["sp-1".to_string()]);
         assert!(undo_cancel(token));
         assert!(!undo_is_pending(token));
         assert!(!undo_cancel(token), "a token may only be spent once");
         assert!(!undo_cancel("never-existed"));
+    }
+
+    #[test]
+    fn a_group_token_names_every_member_and_its_hook_runs_once_on_the_undo() {
+        let token = "tok-test-group";
+        let hits = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let h = hits.clone();
+        undo_table().lock().insert(
+            token.to_string(),
+            ScheduledKill {
+                targets: vec!["sp-a".into(), "sp-b".into()],
+                group: true,
+                cancelled: Arc::new(AtomicBool::new(false)),
+                on_cancel: Some(Box::new(move || {
+                    h.fetch_add(1, Ordering::SeqCst);
+                })),
+            },
+        );
+        assert_eq!(undo_target(token), None, "a group has no single target");
+        assert_eq!(undo_targets(token), vec!["sp-a".to_string(), "sp-b".to_string()]);
+        assert!(undo_cancel(token));
+        assert!(!undo_cancel(token));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert!(undo_targets(token).is_empty());
+    }
+
+    #[test]
+    fn a_stop_group_keeps_each_spawn_id_once_in_order() {
+        let mut g = StopGroup::new();
+        assert!(g.is_empty());
+        g.push("sp-1", KillOpts::default());
+        g.push("sp-2", KillOpts::default());
+        g.push("sp-1", KillOpts::default().grace(Duration::from_millis(5)));
+        assert_eq!(g.len(), 2);
+        assert_eq!(g.spawn_ids(), vec!["sp-1".to_string(), "sp-2".to_string()]);
     }
 
     #[test]

@@ -1,4 +1,13 @@
-//! Read-only import of `~/.claude-code-orchestrator/registry.json` (DESIGN §10-5).
+//! Read-only reader of `~/.claude-code-orchestrator/registry.json` — in Gilde 2
+//! an optional ORCHESTRATOR ACCOUNT SOURCE (contract §2.2.1 "demote", §3.4.3
+//! `AccountSource::Orchestrator`, R1 §6): `accounts::AccountsService` reads it,
+//! read-only, when it computes the account list.
+//!
+//! **No credential file is ever opened** (C6): login detection is the EXISTENCE
+//! of `.credentials.json` / `.claude.json`, by `stat` (`Path::exists`) only — the
+//! authoritative sign-in comes from agent-mesh `authStatus` through the sidecar.
+//! `cco_import_opens_no_credential_file` proves it against a fixture home whose
+//! credential files are FIFOs (an `open` would block forever).
 //!
 //! **This module never writes to that directory — not one byte.** The directory
 //! is actively owned by a VS Code extension and N dispatch-server processes that
@@ -48,7 +57,7 @@ pub const GILDE_ACCOUNT_NAMESPACE: Uuid = Uuid::from_u128(0x6f1e_0e6c_9d2a_5f7b_
 pub const AMBIENT_ACCOUNT_NAME: &str = "ambient:claude";
 
 /// Login probe filenames — cco's `dirHasLogin` heuristic, so our badge agrees
-/// with theirs.
+/// with theirs. Checked by EXISTENCE only: these files are never opened (C6).
 const LOGIN_MARKERS: [&str; 2] = [".credentials.json", ".claude.json"];
 
 // ---------------------------------------------------------------------------
@@ -247,11 +256,13 @@ pub fn account_id_for_config_dir(canonical_dir: &str) -> String {
 /// Whether `config_dir` holds a Claude Code login.
 ///
 /// Same heuristic as cco's `dirHasLogin` (`.credentials.json` or `.claude.json`),
-/// so our badge and theirs always agree. Any I/O error reads as "no login".
+/// so our badge and theirs always agree. EXISTENCE ONLY — `symlink_metadata`
+/// (an `lstat`), never an `open`: the files hold credentials (C6), and a symlink
+/// is not followed. Any I/O error reads as "no login".
 pub fn dir_has_login(config_dir: &Path) -> bool {
     LOGIN_MARKERS
         .iter()
-        .any(|marker| config_dir.join(marker).exists())
+        .any(|marker| std::fs::symlink_metadata(config_dir.join(marker)).is_ok())
 }
 
 /// Absolute, lexically normalized form of a `configDir`.
@@ -408,11 +419,121 @@ fn uuid_v5(namespace: Uuid, name: &str) -> Uuid {
     Uuid::new_v5(&namespace, name.as_bytes())
 }
 
+/// Test fixture homes under `src-tauri/tests/fixtures/cco/` (T08), shared with
+/// the accounts tests: copied into a temp dir, with credential files created as
+/// FIFOs (an `open` of one blocks until a writer appears).
+#[cfg(test)]
+pub(crate) mod fixture_home {
+    use std::path::{Path, PathBuf};
+
+    /// Copy `tests/fixtures/cco/<name>` into a fresh temp dir; returns it and its
+    /// canonical path.
+    pub(crate) fn copy(name: &str) -> (tempfile::TempDir, PathBuf) {
+        let src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("cco")
+            .join(name);
+        let dir = tempfile::tempdir().expect("tempdir");
+        copy_tree(&src, dir.path());
+        let canonical = std::fs::canonicalize(dir.path()).expect("canonical");
+        (dir, canonical)
+    }
+
+    fn copy_tree(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).expect("mkdir");
+        for entry in std::fs::read_dir(from).expect("read fixture dir") {
+            let entry = entry.expect("entry");
+            let target = to.join(entry.file_name());
+            if entry.file_type().expect("type").is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).expect("copy");
+            }
+        }
+    }
+
+    /// Create a FIFO at `path`.
+    pub(crate) fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt as _;
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("c path");
+        // SAFETY: a valid NUL-terminated path and a mode; no memory is shared.
+        let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo {}", path.display());
+    }
+
+    /// Every credential file of the fixture home, as a FIFO: `~/.claude.json`,
+    /// and `.claude.json` + `.credentials.json` / `auth.json` in each config dir
+    /// (and `.claude-extra`, which makes it a Discovered sibling).
+    pub(crate) fn plant_credential_fifos(home: &Path) {
+        mkfifo(&home.join(".claude.json"));
+        for dir in [".claude", ".claude-work", ".claude-personal", ".claude-extra"] {
+            mkfifo(&home.join(dir).join(".claude.json"));
+            mkfifo(&home.join(dir).join(".credentials.json"));
+        }
+        for dir in [".codex", ".codex-work"] {
+            mkfifo(&home.join(dir).join("auth.json"));
+        }
+    }
+
+    /// Run `f` on another thread and fail when it does not finish in 15 s —
+    /// which is what an `open` of a planted FIFO would do.
+    pub(crate) fn must_finish<T: Send + 'static>(what: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(15))
+            .unwrap_or_else(|_| panic!("{what} did not finish: it opened a credential FIFO (C6)"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    /// Acceptance (§15.2 T08): `cco_import` opens no credential file. Every
+    /// credential file of the fixture home is a FIFO; the scan, the import, the
+    /// ambient slot and every login probe must still finish (an `open` would
+    /// block), and still see the logins by existence.
+    #[test]
+    fn cco_import_opens_no_credential_file() {
+        let (_dir, home) = fixture_home::copy("home-basic");
+        fixture_home::plant_credential_fifos(&home);
+        let paths = AppPaths::for_home(&home);
+        let report = fixture_home::must_finish("the registry import", move || {
+            let scan = scan_cco_registry(&paths);
+            let report = import_cco_registry(&paths);
+            let ambient = ambient_account(paths.home_dir());
+            (scan, report, ambient)
+        });
+        let (scan, report, ambient) = report;
+        assert!(scan.found);
+        assert_eq!(report.imported, 2);
+        let labels: Vec<&str> = report.accounts.iter().map(|a| a.label.as_str()).collect();
+        assert_eq!(labels, vec!["work", "personal", "ambient"]);
+        assert!(report.accounts.iter().all(|a| a.logged_in), "existence by stat sees the logins");
+        assert!(ambient.logged_in);
+        let personal = report.accounts.iter().find(|a| a.label == "personal").expect("personal");
+        assert_eq!(
+            personal.config_dir.as_deref(),
+            Some(home.join(".claude-personal").to_str().expect("utf8")),
+            "the trailing / of the registry entry is normalized"
+        );
+    }
+
+    /// A symlinked marker is seen by `lstat` and never followed into its target.
+    #[test]
+    fn a_login_marker_is_never_followed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("elsewhere");
+        fixture_home::mkfifo(&target);
+        std::os::unix::fs::symlink(&target, dir.path().join(".credentials.json")).expect("symlink");
+        let path = dir.path().to_path_buf();
+        assert!(fixture_home::must_finish("dir_has_login", move || dir_has_login(&path)));
+    }
 
     /// Verbatim copy of this machine's registry (DESIGN §10-5), used so the
     /// expectations hold even on a machine that has never run cco.
@@ -791,6 +912,8 @@ mod tests {
             .expect("source before the test module");
 
         for forbidden in [
+            "read_to_string(&marker",
+            "File::open",
             "fs::write",
             "fs::remove",
             "fs::rename",

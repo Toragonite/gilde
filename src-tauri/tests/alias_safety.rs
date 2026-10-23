@@ -16,8 +16,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, OnceLock};
 
-use gilde_code_lib::events::bus::{EventBus, RecordingSink};
-use gilde_code_lib::model::graph::GraphState;
 use gilde_code_lib::paths::AppPaths;
 use gilde_code_lib::store::models::{AliasKind, ProjectRow, WorktreeOrigin};
 use gilde_code_lib::store::{dao, now_ms, Db};
@@ -91,11 +89,9 @@ fn shared() -> &'static Shared {
         paths.ensure_all().unwrap();
 
         let db = Db::open_in_memory().unwrap();
-        let bus = EventBus::with_sink(
-            Arc::new(RecordingSink::default()),
-            Arc::new(parking_lot::RwLock::new(GraphState::new())),
-        );
-        let manager = WorktreeManager::new(db.clone(), paths.clone(), Some(bus));
+        // No event sink: these tests read the filesystem and git, not events
+        // (and the legacy bus would drag in `model::graph`, A7.9).
+        let manager = WorktreeManager::new(db.clone(), paths.clone(), None);
         let layer = gilde_code_lib::worktree::alias::install(db.clone(), Some(paths));
 
         Shared {
@@ -200,7 +196,7 @@ fn worktree_sources_never_name_a_tracked_ignore_file() {
             let trimmed = line.trim_start();
             let is_comment = trimmed.starts_with("//") || trimmed.starts_with("*");
             assert!(
-                !(line.contains(&needle) && !is_comment),
+                !line.contains(&needle) || is_comment,
                 "{}:{} names a tracked ignore file outside a comment: {line}",
                 path.display(),
                 n + 1
@@ -269,7 +265,7 @@ async fn conventions_point_at_the_canonical_central_path() {
 
     // Rule 4, the part that matters: the user's repository is untouched.
     assert_eq!(porcelain(&repo.path), "", "alias creation dirtied the repo");
-    assert!(!repo.path.join(&tracked_ignore_name()).exists());
+    assert!(!repo.path.join(tracked_ignore_name()).exists());
 
     let exclude = repo.path.join(".git").join("info").join("exclude");
     let text = std::fs::read_to_string(&exclude).unwrap();
@@ -281,7 +277,7 @@ async fn conventions_point_at_the_canonical_central_path() {
 async fn user_ignore_file_is_never_touched() {
     let repo = new_repo("keeps-gitignore").await;
     // A tracked ignore file with content the user cares about.
-    let tracked = repo.path.join(&tracked_ignore_name());
+    let tracked = repo.path.join(tracked_ignore_name());
     std::fs::write(&tracked, b"node_modules/\n").unwrap();
     git_ok(&repo.path, &["add", "-A"]);
     git_ok(&repo.path, &["commit", "-qm", "ignore"]);

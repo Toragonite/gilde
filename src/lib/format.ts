@@ -9,7 +9,7 @@
  * prints and the numbers macOS itself reports.
  */
 
-import type { Locale } from './ipc';
+import type { Locale } from './gen/Locale';
 
 // ---------------------------------------------------------------------------
 // Formatter cache — constructing an Intl formatter is expensive and these run
@@ -82,6 +82,22 @@ export function formatCostUsd(value: number, locale: Locale): string {
     currency: 'USD',
     maximumFractionDigits: value < 1 ? 3 : 2,
   }).format(value);
+}
+
+/**
+ * Today's spend from `UsageToday.costMicros` (integer micro-USD). "Unknown" is
+ * a legitimate value and is never shown as 0 (ux-ia §3.15, T-ui-unknownSpend):
+ * `null` comes back as `null`, and the caller shows the "unknown" word.
+ */
+export function formatCostMicros(costMicros: number | null | undefined, locale: Locale): string | null {
+  if (costMicros === null || costMicros === undefined || !Number.isFinite(costMicros) || costMicros < 0) return null;
+  return formatCostUsd(costMicros / 1_000_000, locale);
+}
+
+/** A token count that may be unknown: `null` stays `null`, never "0". */
+export function formatTokens(tokens: number | null | undefined, locale: Locale): string | null {
+  if (tokens === null || tokens === undefined || !Number.isFinite(tokens) || tokens < 0) return null;
+  return numberFormat(locale, { notation: tokens >= 10_000 ? 'compact' : 'standard', maximumFractionDigits: 1 }).format(tokens);
 }
 
 // ---------------------------------------------------------------------------

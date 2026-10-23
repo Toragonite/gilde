@@ -1,328 +1,548 @@
 /**
- * Global keyboard layer (DESIGN §9-8).
+ * The keyboard layer (ux-ia §7, contract §8.6).
  *
- * Two rules make this coexist with four live terminals:
+ * One capture-phase `keydown` listener on `window` serves every binding, so a
+ * ⌘ chord is seen before a terminal swallows it while every other key reaches
+ * the terminal untouched. Rules, each one tested:
  *
- *  1. Bindings are matched on `event.code`, not `event.key`. With Option held
- *     macOS rewrites `key` (⌘⌥B arrives as `∫`), and a Korean layout rewrites it
- *     too; `code` is the physical key and survives both.
- *  2. The listener runs in the **capture** phase on `window`, so it sees the
- *     ⌘-combos before xterm swallows the event, while every non-⌘ key still
- *     reaches the terminal untouched.
+ *  - Bindings match `event.code` (the physical key), not `event.key`, so they
+ *    work with ⌥ held and on the Korean layout.
+ *  - `mod` is ⌘ only. Ctrl is never claimed: agent TUIs keep every Ctrl key.
+ *  - During IME composition (`isComposing`, keyCode 229) nothing fires: `⏎`
+ *    finishes a Korean syllable and never sends, digits never answer (T-ui-ime).
+ *  - `event.repeat` never fires a binding unless it opts in (navigation only;
+ *    answering never does).
+ *  - In a text entry only ⌘ chords, Escape and function keys fire; plain
+ *    letters and digits type (ux-ia §7.1).
  *
- * Focus guard: a hotkey never fires while a text entry has focus. A terminal
- * host opts back in by marking its container `data-gilde-hotkeys="allow"` — xterm's
- * helper textarea is a text entry, but ⌘-codes must still work over a terminal.
+ * Scopes (ux-ia §7.2): G global, S session, T split/team, L lists, C a focused
+ * card, N the New-session sheet, H history, X any sheet, F the Floor, plus A
+ * for the narrow Accounts & health screen. A registration of L, C or F (or any
+ * registration with `requireFocus`) fires only while focus is inside its
+ * element: digits answer a card only while that card has focus [M7]. Other
+ * registrations are live while mounted. While a sheet is open (`useHotkeyScope('X', …)`,
+ * pushed by `Sheet`) only bindings registered inside the top sheet fire — the
+ * sheet traps focus and keys alike.
  */
 
-import { useEffect, useMemo, useRef } from 'react';
-
-import { experimentalLanes } from '../features';
-import { useAppStore } from '../store/useAppStore';
-import type { SplitCount } from '../store/uiSlice';
-
-export interface HotkeyBinding {
-  id: string;
-  /** `mod`(⌘) `alt`(⌥) `shift` + a key name, e.g. `mod+shift+backslash`. */
-  combo: string;
-  run: (event: KeyboardEvent) => void;
-  /** Set for bindings that must fire even inside a text entry (Escape). */
-  allowInTextEntry?: boolean;
-  /**
-   * Extra condition. A binding whose predicate is false is not matched at all,
-   * so the key is never swallowed — `Escape` must still reach a TUI unless an
-   * overlay is actually open.
-   */
-  when?: () => boolean;
-}
+import { useEffect, useRef } from 'react';
+import type { RefObject } from 'react';
 
 // ---------------------------------------------------------------------------
-// Combo parsing
+// Combos
 // ---------------------------------------------------------------------------
 
-interface ParsedCombo {
+export type HotkeyScope = 'G' | 'S' | 'T' | 'L' | 'C' | 'N' | 'H' | 'X' | 'F' | 'A';
+
+export interface ParsedCombo {
   mod: boolean;
   alt: boolean;
   shift: boolean;
+  /** A `KeyboardEvent.code`, e.g. `KeyJ`, `Digit1`, `Enter`, `F6`. */
   code: string;
+  /** True when the combo names Ctrl, which this app never claims (always unmatched). */
+  ctrl: boolean;
 }
 
-const CODE_ALIASES: Record<string, string> = {
+const CODE_ALIASES: Readonly<Record<string, string>> = {
   backslash: 'Backslash',
   slash: 'Slash',
   comma: 'Comma',
   period: 'Period',
+  semicolon: 'Semicolon',
+  quote: 'Quote',
+  backquote: 'Backquote',
+  bracketleft: 'BracketLeft',
+  bracketright: 'BracketRight',
+  equal: 'Equal',
+  minus: 'Minus',
   escape: 'Escape',
+  esc: 'Escape',
   enter: 'Enter',
+  return: 'Enter',
   space: 'Space',
+  tab: 'Tab',
+  backspace: 'Backspace',
+  delete: 'Delete',
+  home: 'Home',
+  end: 'End',
+  pageup: 'PageUp',
+  pagedown: 'PageDown',
   arrowleft: 'ArrowLeft',
   arrowright: 'ArrowRight',
   arrowup: 'ArrowUp',
   arrowdown: 'ArrowDown',
+  left: 'ArrowLeft',
+  right: 'ArrowRight',
+  up: 'ArrowUp',
+  down: 'ArrowDown',
 };
 
+/** A display key name (`j`, `1`, `enter`, `f6`) → its `KeyboardEvent.code`. */
 export function codeFor(key: string): string {
   const lower = key.toLowerCase();
-  if (CODE_ALIASES[lower]) return CODE_ALIASES[lower];
+  const alias = CODE_ALIASES[lower];
+  if (alias) return alias;
   if (/^[a-z]$/.test(lower)) return `Key${lower.toUpperCase()}`;
   if (/^[0-9]$/.test(lower)) return `Digit${lower}`;
+  if (/^f([1-9]|1[0-9])$/.test(lower)) return lower.toUpperCase();
   return key;
 }
 
+/** `mod+shift+j` → modifiers and a code. Unknown words are kept as a code. */
 export function parseCombo(combo: string): ParsedCombo {
-  const parts = combo.split('+').map((p) => p.trim().toLowerCase());
-  const parsed: ParsedCombo = { mod: false, alt: false, shift: false, code: '' };
+  const parts = combo.split('+').map((p) => p.trim().toLowerCase()).filter((p) => p !== '');
+  const parsed: ParsedCombo = { mod: false, alt: false, shift: false, code: '', ctrl: false };
   for (const part of parts) {
     if (part === 'mod' || part === 'cmd' || part === 'meta') parsed.mod = true;
-    else if (part === 'alt' || part === 'opt') parsed.alt = true;
+    else if (part === 'alt' || part === 'opt' || part === 'option') parsed.alt = true;
     else if (part === 'shift') parsed.shift = true;
+    else if (part === 'ctrl' || part === 'control') parsed.ctrl = true;
     else parsed.code = codeFor(part);
   }
   return parsed;
 }
 
-/**
- * `mod` is ⌘ only, never Ctrl: this is a macOS app and Ctrl-chords belong to the
- * terminal (Ctrl+B, Ctrl+W, Ctrl+C are all live keys inside an agent TUI).
- */
-export function matchesCombo(event: KeyboardEvent, combo: string): boolean {
-  const want = parseCombo(combo);
+/** Exact match on code and modifiers. Any event with Ctrl held never matches. */
+export function matchesCombo(event: Pick<KeyboardEvent, 'code' | 'metaKey' | 'ctrlKey' | 'altKey' | 'shiftKey'>, combo: string | ParsedCombo): boolean {
+  const want = typeof combo === 'string' ? parseCombo(combo) : combo;
+  if (want.ctrl || want.code === '') return false;
+  if (event.ctrlKey) return false;
   if (event.code !== want.code) return false;
   if (event.metaKey !== want.mod) return false;
-  if (event.ctrlKey) return false;
   if (event.altKey !== want.alt) return false;
   if (event.shiftKey !== want.shift) return false;
   return true;
 }
 
+const KEY_SYMBOLS: Readonly<Record<string, string>> = {
+  Enter: '⏎',
+  Backspace: '⌫',
+  Delete: '⌦',
+  Escape: 'Esc',
+  Tab: '⇥',
+  Space: 'Space',
+  ArrowUp: '↑',
+  ArrowDown: '↓',
+  ArrowLeft: '←',
+  ArrowRight: '→',
+  Period: '.',
+  Comma: ',',
+  Slash: '/',
+  Backslash: '\\',
+  BracketLeft: '[',
+  BracketRight: ']',
+  Equal: '+',
+  Minus: '−',
+  Semicolon: ';',
+  Quote: "'",
+  Backquote: '`',
+  Home: 'Home',
+  End: 'End',
+  PageUp: 'PgUp',
+  PageDown: 'PgDn',
+};
+
+function keyLabel(code: string): string {
+  if (KEY_SYMBOLS[code]) return KEY_SYMBOLS[code] as string;
+  if (code.startsWith('Key')) return code.slice(3);
+  if (code.startsWith('Digit')) return code.slice(5);
+  return code;
+}
+
+/** The macOS spelling of a combo for menus, hints and the help sheet: `⇧⌘J`, `⌥⌘1`, `⌘⏎`. */
+export function formatCombo(combo: string): string {
+  const p = parseCombo(combo);
+  return `${p.alt ? '⌥' : ''}${p.shift ? '⇧' : ''}${p.mod ? '⌘' : ''}${keyLabel(p.code)}`;
+}
+
+const ARIA_KEYS: Readonly<Record<string, string>> = {
+  Space: 'Space',
+  Period: '.',
+  Comma: ',',
+  Slash: '/',
+  Backslash: '\\',
+  BracketLeft: '[',
+  BracketRight: ']',
+  Equal: '=',
+  Minus: '-',
+};
+
+/** The `aria-keyshortcuts` spelling: `Meta+Shift+J`, `Meta+Enter`, `1`. */
+export function ariaKeyshortcuts(combo: string): string {
+  const p = parseCombo(combo);
+  let key = ARIA_KEYS[p.code] ?? p.code;
+  if (p.code.startsWith('Key')) key = p.code.slice(3);
+  else if (p.code.startsWith('Digit')) key = p.code.slice(5);
+  return [p.alt ? 'Alt' : '', p.shift ? 'Shift' : '', p.mod ? 'Meta' : '', key].filter(Boolean).join('+');
+}
+
 // ---------------------------------------------------------------------------
-// Focus guard
+// Event guards
 // ---------------------------------------------------------------------------
 
+/** True while an input method is composing (Korean syllables): nothing may fire. */
+export function isImeComposing(event: Pick<KeyboardEvent, 'isComposing' | 'keyCode'>): boolean {
+  return event.isComposing === true || event.keyCode === 229;
+}
+
+/**
+ * Whether the key goes into a text entry (input, textarea, select,
+ * contenteditable). A terminal host marks its container
+ * `data-gilde-hotkeys="allow"`: xterm's helper textarea is not treated as one.
+ */
 export function isTextEntryTarget(target: EventTarget | null): boolean {
-  if (!(target instanceof HTMLElement)) return false;
+  if (typeof HTMLElement === 'undefined' || !(target instanceof HTMLElement)) return false;
   if (target.closest('[data-gilde-hotkeys="allow"]')) return false;
-  if (target.isContentEditable) return true;
+  if (target.isContentEditable || target.getAttribute('contenteditable') === 'true') return true;
   const tag = target.tagName;
-  if (tag === 'TEXTAREA') return true;
-  if (tag === 'SELECT') return true;
+  if (tag === 'TEXTAREA' || tag === 'SELECT') return true;
   if (tag === 'INPUT') {
     const type = (target as HTMLInputElement).type;
-    return !['button', 'checkbox', 'radio', 'range', 'submit', 'reset', 'color'].includes(type);
+    return !['button', 'checkbox', 'radio', 'range', 'submit', 'reset', 'color', 'file'].includes(type);
   }
   return false;
 }
 
 // ---------------------------------------------------------------------------
-// Hook
+// Bindings and the registry
 // ---------------------------------------------------------------------------
 
-export function useHotkeys(bindings: HotkeyBinding[], enabled = true): void {
-  const ref = useRef(bindings);
-  ref.current = bindings;
+export interface HotkeyBinding {
+  id: string;
+  /** One combo or several (`['mod+equal', 'mod+shift+equal']`). */
+  combo: string | readonly string[];
+  run: (event: KeyboardEvent) => void;
+  /** Fire on auto-repeat too (navigation only; answering never). */
+  allowRepeat?: boolean;
+  /**
+   * Fire inside a text entry. Default: ⌘ chords, Escape and function keys do,
+   * everything else types.
+   */
+  allowInTextEntry?: boolean;
+  /** Extra condition; a false predicate leaves the key to whatever has focus. */
+  when?: (event: KeyboardEvent) => boolean;
+}
 
-  useEffect(() => {
-    if (!enabled) return;
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.repeat) return;
-      const inText = isTextEntryTarget(event.target);
-      for (const binding of ref.current) {
-        if (inText && !binding.allowInTextEntry) continue;
-        if (binding.when && !binding.when()) continue;
-        if (!matchesCombo(event, binding.combo)) continue;
+export interface HotkeyOptions {
+  /** Default `G`. */
+  scope?: HotkeyScope;
+  /** The element the bindings belong to (a list, a card, a sheet, the Floor). */
+  element?: RefObject<HTMLElement | null>;
+  /** Fire only while focus is inside `element`. Default true for L, C and F. */
+  requireFocus?: boolean;
+  /** Default true. */
+  enabled?: boolean;
+}
+
+interface Registration {
+  seq: number;
+  scope: HotkeyScope;
+  bindings: () => readonly HotkeyBinding[];
+  element: () => HTMLElement | null;
+  requireFocus: boolean;
+}
+
+interface ScopeEntry {
+  seq: number;
+  scope: HotkeyScope;
+  element: () => HTMLElement | null;
+}
+
+const registrations = new Set<Registration>();
+const scopeStack: ScopeEntry[] = [];
+let seqCounter = 0;
+let listening = false;
+
+const FOCUS_SCOPES: ReadonlySet<HotkeyScope> = new Set<HotkeyScope>(['L', 'C', 'F']);
+
+/** Higher runs first among registrations that can take the key. */
+const SCOPE_RANK: Readonly<Record<HotkeyScope, number>> = {
+  X: 6,
+  N: 5,
+  C: 4,
+  L: 3,
+  F: 3,
+  S: 2,
+  T: 2,
+  H: 2,
+  A: 2,
+  G: 0,
+};
+
+/** Whether a scope is pushed right now (e.g. a binding of G that must stay off in T). */
+export function isScopeActive(scope: HotkeyScope): boolean {
+  return scopeStack.some((e) => e.scope === scope);
+}
+
+/** The element of the top open sheet, or null when no sheet is open. */
+function topSheet(): ScopeEntry | null {
+  for (let i = scopeStack.length - 1; i >= 0; i--) {
+    const entry = scopeStack[i] as ScopeEntry;
+    if (entry.scope === 'X') return entry;
+  }
+  return null;
+}
+
+function depth(el: Node): number {
+  let d = 0;
+  for (let n: Node | null = el; n; n = n.parentNode) d++;
+  return d;
+}
+
+function contains(container: HTMLElement | null, node: EventTarget | null): boolean {
+  return container !== null && node instanceof Node && container.contains(node);
+}
+
+function liveRegistrations(target: EventTarget | null): Registration[] {
+  const sheet = topSheet();
+  const sheetEl = sheet ? sheet.element() : null;
+  const live: { reg: Registration; rank: number; depth: number }[] = [];
+  for (const reg of registrations) {
+    const el = reg.element();
+    if (reg.requireFocus && !contains(el, target)) continue;
+    if (sheet) {
+      // A sheet traps keys: only what lives inside the top sheet may fire.
+      const inside = el !== null && sheetEl !== null && (sheetEl === el || sheetEl.contains(el));
+      if (!inside && !(reg.scope === 'X' && el === null)) continue;
+    }
+    live.push({ reg, rank: SCOPE_RANK[reg.scope], depth: el && contains(el, target) ? depth(el) : 0 });
+  }
+  // Focus-owning elements first (deepest wins), then scope rank, then the newest.
+  live.sort((a, b) => b.depth - a.depth || b.rank - a.rank || b.reg.seq - a.reg.seq);
+  return live.map((x) => x.reg);
+}
+
+function defaultAllowedInText(p: ParsedCombo): boolean {
+  return p.mod || p.code === 'Escape' || /^F\d+$/.test(p.code);
+}
+
+/** The one keydown handler (exported for tests that drive it directly). */
+export function handleHotkey(event: KeyboardEvent): boolean {
+  if (isImeComposing(event)) return false;
+  if (event.ctrlKey) return false;
+  const inText = isTextEntryTarget(event.target);
+  for (const reg of liveRegistrations(event.target)) {
+    for (const binding of reg.bindings()) {
+      const combos = typeof binding.combo === 'string' ? [binding.combo] : binding.combo;
+      for (const combo of combos) {
+        const parsed = parseCombo(combo);
+        if (!matchesCombo(event, parsed)) continue;
+        if (event.repeat && !binding.allowRepeat) continue;
+        if (inText && !(binding.allowInTextEntry ?? defaultAllowedInText(parsed))) continue;
+        if (binding.when && !binding.when(event)) continue;
         event.preventDefault();
         event.stopPropagation();
         binding.run(event);
-        return;
+        return true;
       }
-    };
-    window.addEventListener('keydown', onKeyDown, { capture: true });
-    return () => window.removeEventListener('keydown', onKeyDown, { capture: true });
-  }, [enabled]);
+    }
+  }
+  return false;
 }
 
-// ---------------------------------------------------------------------------
-// Intents — actions whose implementation lands in a later wave
-// ---------------------------------------------------------------------------
+function onWindowKeyDown(event: KeyboardEvent): void {
+  handleHotkey(event);
+}
 
-export type IntentId =
-  | 'newSession'
-  | 'newWorktree'
-  | 'newDispatch'
-  | 'saveTranscript'
-  | 'reloadSignatures';
+function ensureListening(): void {
+  if (listening || typeof window === 'undefined') return;
+  window.addEventListener('keydown', onWindowKeyDown, { capture: true });
+  listening = true;
+}
 
-const intents = new Map<IntentId, () => void>();
+function stopListeningIfIdle(): void {
+  if (!listening || registrations.size > 0 || scopeStack.length > 0) return;
+  window.removeEventListener('keydown', onWindowKeyDown, { capture: true });
+  listening = false;
+}
 
-/** Register the real implementation; returns the unregister function. */
-export function registerIntent(id: IntentId, run: () => void): () => void {
-  intents.set(id, run);
+/** Register bindings outside React (tests, imperative islands). Returns the unregister function. */
+export function registerHotkeys(bindings: () => readonly HotkeyBinding[], options: HotkeyOptions = {}): () => void {
+  const scope = options.scope ?? 'G';
+  const elementRef = options.element;
+  const reg: Registration = {
+    seq: ++seqCounter,
+    scope,
+    bindings,
+    element: () => elementRef?.current ?? null,
+    requireFocus: options.requireFocus ?? FOCUS_SCOPES.has(scope),
+  };
+  registrations.add(reg);
+  ensureListening();
   return () => {
-    if (intents.get(id) === run) intents.delete(id);
+    registrations.delete(reg);
+    stopListeningIfIdle();
   };
 }
 
-export function runIntent(id: IntentId): boolean {
-  const run = intents.get(id);
-  if (!run) return false;
-  run();
-  return true;
+/**
+ * Bind keys for as long as the component is mounted. The latest `bindings`
+ * array is read at key time, so it may be rebuilt on every render.
+ */
+export function useHotkeys(bindings: readonly HotkeyBinding[], options: HotkeyOptions = {}): void {
+  const ref = useRef(bindings);
+  ref.current = bindings;
+  const { scope = 'G', element, requireFocus, enabled = true } = options;
+  useEffect(() => {
+    if (!enabled) return;
+    return registerHotkeys(() => ref.current, { scope, element, requireFocus });
+  }, [enabled, scope, element, requireFocus]);
+}
+
+/** Push a scope while `active` (a sheet pushes `X` with its element). Returns the pop function. */
+export function pushHotkeyScope(scope: HotkeyScope, element?: RefObject<HTMLElement | null>): () => void {
+  const entry: ScopeEntry = { seq: ++seqCounter, scope, element: () => element?.current ?? null };
+  scopeStack.push(entry);
+  ensureListening();
+  return () => {
+    const i = scopeStack.indexOf(entry);
+    if (i >= 0) scopeStack.splice(i, 1);
+    stopListeningIfIdle();
+  };
+}
+
+export function useHotkeyScope(scope: HotkeyScope, active: boolean, element?: RefObject<HTMLElement | null>): void {
+  useEffect(() => {
+    if (!active) return;
+    return pushHotkeyScope(scope, element);
+  }, [scope, active, element]);
+}
+
+/** Tests only: drop every registration and scope. */
+export function resetHotkeysForTests(): void {
+  registrations.clear();
+  scopeStack.length = 0;
+  stopListeningIfIdle();
 }
 
 // ---------------------------------------------------------------------------
-// The shell's own bindings
+// The keymap (ux-ia §7.2) — the data the generated help sheet (⌘/) renders
 // ---------------------------------------------------------------------------
 
-/** Canonical combo per action, also rendered by the help sheet (`⌘/`). */
-export const SHELL_HOTKEYS = {
-  palette: 'mod+k',
-  viewTeam: 'mod+1',
-  viewWorkers: 'mod+2',
-  switcher: 'mod+p',
-  newSession: 'mod+t',
-  closePane: 'mod+w',
-  splitRight: 'mod+backslash',
-  splitDown: 'mod+shift+backslash',
-  toggleSidebar: 'mod+b',
-  toggleInspector: 'mod+alt+b',
-  toggleDrawer: 'mod+j',
-  viewGraph: 'mod+shift+g',
-  viewMonitor: 'mod+shift+m',
-  viewDispatch: 'mod+shift+d',
-  settings: 'mod+comma',
-  help: 'mod+slash',
-  prevTab: 'mod+alt+arrowleft',
-  nextTab: 'mod+alt+arrowright',
-  closeOverlay: 'escape',
-} as const;
-
-export type ShellHotkeyId = keyof typeof SHELL_HOTKEYS;
-
-/**
- * Bindings that belong to the experimental lanes (`src/features.ts`). In the
- * preview build none of them is claimed, so the key reaches whatever has focus.
- */
-export const EXPERIMENTAL_HOTKEYS: ReadonlySet<ShellHotkeyId> = new Set<ShellHotkeyId>([
-  'switcher',
-  'newSession',
-  'splitRight',
-  'splitDown',
-  'toggleInspector',
-  'toggleDrawer',
-  'viewGraph',
-  'viewMonitor',
-  'viewDispatch',
-]);
-
-/** The shell bindings the current build claims, in `SHELL_HOTKEYS` order. */
-export function activeHotkeyIds(): ShellHotkeyId[] {
-  const lanes = experimentalLanes();
-  return (Object.keys(SHELL_HOTKEYS) as ShellHotkeyId[]).filter(
-    (id) => lanes || !EXPERIMENTAL_HOTKEYS.has(id),
-  );
+export interface KeymapEntry {
+  /** Stable id; the help sheet maps it to its label. */
+  id: string;
+  combos: readonly string[];
+  scopes: readonly HotkeyScope[];
+  /**
+   * Where inside the scope the binding lives when it is narrower than the
+   * scope ("composer", "question", "queueRows", …). Two entries collide only
+   * when they share a scope and a context.
+   */
+  context?: string;
+  /** Scopes in which this binding is deliberately off (G ⌥⌘↑/↓ is off in T). */
+  notIn?: readonly HotkeyScope[];
 }
 
-/**
- * Focus a tab by its number — experimental lanes only, where terminal tabs pile
- * up. ⌘1/⌘2 are the Team and Worker accounts views, so the range lives on ⌘⌥.
- */
-export function focusTabCombo(n: number): string {
-  return `mod+alt+${n}`;
-}
+const digits = (from: number, to: number, prefix = ''): string[] => {
+  const out: string[] = [];
+  for (let n = from; n <= to; n++) out.push(`${prefix}${n}`);
+  return out;
+};
 
-/**
- * Mounted once by `AppShell`. Every action here is a store action or an intent,
- * so the palette (T27) can trigger the exact same code paths.
- */
-export function useShellHotkeys(): void {
-  const store = useAppStore;
+export const KEYMAP: readonly KeymapEntry[] = [
+  // G — global
+  { id: 'palette', combos: ['mod+k'], scopes: ['G'] },
+  { id: 'needsYou.next', combos: ['mod+j'], scopes: ['G'] },
+  { id: 'needsYou.previous', combos: ['mod+shift+j'], scopes: ['G'] },
+  { id: 'nav.home', combos: ['mod+0'], scopes: ['G'] },
+  { id: 'nav.history', combos: ['mod+shift+f'], scopes: ['G'] },
+  { id: 'nav.accountsHealth', combos: ['mod+shift+a'], scopes: ['G'] },
+  { id: 'newSession', combos: ['mod+n'], scopes: ['G'] },
+  { id: 'sidebar.toggle', combos: ['mod+b'], scopes: ['G'] },
+  { id: 'nav.back', combos: ['mod+bracketleft'], scopes: ['G'] },
+  { id: 'nav.forward', combos: ['mod+bracketright'], scopes: ['G'] },
+  { id: 'session.previous', combos: ['mod+alt+arrowup'], scopes: ['G'], notIn: ['T'] },
+  { id: 'session.next', combos: ['mod+alt+arrowdown'], scopes: ['G'], notIn: ['T'] },
+  { id: 'region.next', combos: ['f6'], scopes: ['G'] },
+  { id: 'region.previous', combos: ['shift+f6'], scopes: ['G'] },
+  { id: 'close', combos: ['mod+w'], scopes: ['G'] },
+  { id: 'stop', combos: ['mod+shift+backspace'], scopes: ['G'] },
+  { id: 'settings', combos: ['mod+comma'], scopes: ['G'] },
+  { id: 'help', combos: ['mod+slash'], scopes: ['G'] },
+  { id: 'zoom.in', combos: ['mod+equal', 'mod+shift+equal'], scopes: ['G'] },
+  { id: 'zoom.out', combos: ['mod+minus'], scopes: ['G'] },
+  { id: 'zoom.reset', combos: ['mod+alt+0'], scopes: ['G'] },
+  { id: 'contextMenu', combos: ['shift+f10'], scopes: ['G'] },
+  { id: 'quit', combos: ['mod+q'], scopes: ['G'] },
+  // S — Session screen and focused tile
+  { id: 'session.view.conversation', combos: ['mod+alt+1'], scopes: ['S'] },
+  { id: 'session.view.changes', combos: ['mod+alt+2'], scopes: ['S'] },
+  { id: 'session.view.terminal', combos: ['mod+alt+3'], scopes: ['S'] },
+  { id: 'session.flipView', combos: ['mod+shift+t'], scopes: ['S', 'T'] },
+  { id: 'composer.send', combos: ['enter'], scopes: ['S'], context: 'composer' },
+  { id: 'composer.newline', combos: ['shift+enter'], scopes: ['S'], context: 'composer' },
+  { id: 'composer.sendNow', combos: ['alt+enter'], scopes: ['S'], context: 'composer' },
+  { id: 'turn.stop', combos: ['mod+period'], scopes: ['S'] },
+  { id: 'answer.primary', combos: ['mod+enter'], scopes: ['S'] },
+  { id: 'answer.deny', combos: ['mod+backspace'], scopes: ['S', 'C', 'L'] },
+  { id: 'model.menu', combos: ['mod+shift+m'], scopes: ['S'] },
+  { id: 'ide.open', combos: ['mod+o'], scopes: ['S'] },
+  { id: 'ide.diff', combos: ['mod+shift+o'], scopes: ['S'] },
+  { id: 'split.add', combos: ['mod+d'], scopes: ['S', 'L'] },
+  { id: 'find', combos: ['mod+f'], scopes: ['S'] },
+  // T — Split and Team
+  { id: 'team.view.panes', combos: ['mod+alt+1'], scopes: ['T'] },
+  { id: 'team.view.board', combos: ['mod+alt+2'], scopes: ['T'] },
+  { id: 'team.view.floor', combos: ['mod+alt+3'], scopes: ['T'] },
+  { id: 'tile.focus', combos: digits(1, 6, 'mod+'), scopes: ['T'] },
+  { id: 'tile.move', combos: ['mod+alt+arrowleft', 'mod+alt+arrowright', 'mod+alt+arrowup', 'mod+alt+arrowdown'], scopes: ['T'] },
+  { id: 'tile.zoom', combos: ['mod+shift+enter'], scopes: ['T'] },
+  // A — Accounts & health below 1200 px
+  { id: 'accounts.section.accounts', combos: ['mod+alt+1'], scopes: ['A'] },
+  { id: 'accounts.section.health', combos: ['mod+alt+2'], scopes: ['A'] },
+  // C — a focused card
+  { id: 'card.allowOnce', combos: ['1'], scopes: ['C'] },
+  { id: 'card.allowAlways', combos: ['2'], scopes: ['C'] },
+  { id: 'card.deny', combos: ['3'], scopes: ['C'] },
+  { id: 'card.pickOption', combos: digits(1, 9), scopes: ['C'], context: 'question' },
+  { id: 'card.denyWhy', combos: ['tab'], scopes: ['C'] },
+  { id: 'card.leave', combos: ['escape'], scopes: ['C'] },
+  // L — lists
+  { id: 'list.move', combos: ['arrowup', 'arrowdown'], scopes: ['L'] },
+  { id: 'list.open', combos: ['enter'], scopes: ['L'] },
+  { id: 'list.expandCollapse', combos: ['arrowright', 'arrowleft'], scopes: ['L'] },
+  { id: 'list.toggle', combos: ['space'], scopes: ['L'] },
+  { id: 'list.later', combos: ['l'], scopes: ['L'], context: 'queueRows' },
+  { id: 'list.markSeen', combos: ['backspace'], scopes: ['L'], context: 'newReplyRows' },
+  { id: 'list.message', combos: ['m'], scopes: ['L'], context: 'boardMemberRows' },
+  { id: 'list.moveProject', combos: ['alt+shift+arrowup', 'alt+shift+arrowdown'], scopes: ['L'], context: 'projectHeaders' },
+  // H — History
+  { id: 'history.continue', combos: ['enter'], scopes: ['H'], context: 'results' },
+  { id: 'history.read', combos: ['mod+arrowdown'], scopes: ['H'], context: 'results' },
+  // N — New session sheet
+  { id: 'newSession.start', combos: ['enter'], scopes: ['N'], context: 'prompt' },
+  { id: 'newSession.newline', combos: ['shift+enter'], scopes: ['N'], context: 'prompt' },
+  { id: 'newSession.chip', combos: digits(1, 8, 'alt+'), scopes: ['N'] },
+  // X — any sheet
+  { id: 'sheet.cancel', combos: ['escape', 'mod+period'], scopes: ['X'] },
+  { id: 'sheet.confirm', combos: ['mod+enter'], scopes: ['X'], context: 'nonDestructive' },
+  // F — the Floor
+  { id: 'floor.move', combos: ['arrowup', 'arrowdown', 'arrowleft', 'arrowright'], scopes: ['F'] },
+  { id: 'floor.nextCharacter', combos: ['tab'], scopes: ['F'] },
+  { id: 'floor.previousCharacter', combos: ['shift+tab'], scopes: ['F'] },
+  { id: 'floor.open', combos: ['enter'], scopes: ['F'] },
+  { id: 'floor.addToSplit', combos: ['mod+d'], scopes: ['F'] },
+  { id: 'floor.nameCard', combos: ['space'], scopes: ['F'] },
+  { id: 'floor.nextTicket', combos: ['j'], scopes: ['F'] },
+  { id: 'floor.followTeam', combos: ['f'], scopes: ['F'] },
+  { id: 'floor.zoomIn', combos: ['equal', 'shift+equal'], scopes: ['F'] },
+  { id: 'floor.zoomOut', combos: ['minus'], scopes: ['F'] },
+  { id: 'floor.zoomReset', combos: ['0'], scopes: ['F'] },
+  { id: 'floor.trafficLines', combos: ['m'], scopes: ['F'] },
+  { id: 'floor.accounts', combos: ['a'], scopes: ['F'] },
+  { id: 'floor.tidy', combos: ['t'], scopes: ['F'] },
+  { id: 'floor.pause', combos: ['period'], scopes: ['F'] },
+  { id: 'floor.legend', combos: ['l'], scopes: ['F'] },
+  // pixel-office §6.2 additions (A23.4): replay the last 10 minutes at 6×, step it 30 s back / forward
+  { id: 'floor.replay', combos: ['r'], scopes: ['F'] },
+  { id: 'floor.stepBack', combos: ['bracketleft'], scopes: ['F'] },
+  { id: 'floor.stepForward', combos: ['bracketright'], scopes: ['F'] },
+  { id: 'floor.stepOut', combos: ['escape'], scopes: ['F'] },
+];
 
-  const bindings = useMemo<HotkeyBinding[]>(() => {
-    const s = () => store.getState();
-
-    const all: HotkeyBinding[] = [
-      { id: 'palette', combo: SHELL_HOTKEYS.palette, run: () => s().setPaletteOpen(true) },
-      { id: 'viewTeam', combo: SHELL_HOTKEYS.viewTeam, run: () => s().setActiveView('team') },
-      {
-        id: 'viewWorkers',
-        combo: SHELL_HOTKEYS.viewWorkers,
-        run: () => s().setActiveView('workers'),
-      },
-      { id: 'switcher', combo: SHELL_HOTKEYS.switcher, run: () => s().setSwitcherOpen(true) },
-      {
-        id: 'newSession',
-        combo: SHELL_HOTKEYS.newSession,
-        run: () => {
-          runIntent('newSession');
-        },
-      },
-      { id: 'closePane', combo: SHELL_HOTKEYS.closePane, run: () => s().closeActivePane() },
-      {
-        id: 'splitRight',
-        combo: SHELL_HOTKEYS.splitRight,
-        run: () => {
-          const split = s().ui.panes.split;
-          s().setSplit((split >= 3 ? 1 : split + 1) as SplitCount);
-        },
-      },
-      {
-        id: 'splitDown',
-        combo: SHELL_HOTKEYS.splitDown,
-        run: () => s().setSplit(s().ui.panes.split === 4 ? 2 : 4),
-      },
-      { id: 'toggleSidebar', combo: SHELL_HOTKEYS.toggleSidebar, run: () => s().toggleSidebar() },
-      {
-        id: 'toggleInspector',
-        combo: SHELL_HOTKEYS.toggleInspector,
-        run: () => s().toggleInspector(),
-      },
-      { id: 'toggleDrawer', combo: SHELL_HOTKEYS.toggleDrawer, run: () => s().toggleDrawer() },
-      { id: 'viewGraph', combo: SHELL_HOTKEYS.viewGraph, run: () => s().setActiveView('graph') },
-      {
-        id: 'viewMonitor',
-        combo: SHELL_HOTKEYS.viewMonitor,
-        run: () => s().setActiveView('monitor'),
-      },
-      {
-        id: 'viewDispatch',
-        combo: SHELL_HOTKEYS.viewDispatch,
-        run: () => {
-          s().setActiveView('dispatch');
-          runIntent('newDispatch');
-        },
-      },
-      { id: 'settings', combo: SHELL_HOTKEYS.settings, run: () => s().setSettingsOpen(true) },
-      { id: 'help', combo: SHELL_HOTKEYS.help, run: () => s().setHelpOpen(true) },
-      { id: 'prevTab', combo: SHELL_HOTKEYS.prevTab, run: () => s().cycleTab(-1) },
-      { id: 'nextTab', combo: SHELL_HOTKEYS.nextTab, run: () => s().cycleTab(1) },
-      {
-        id: 'closeOverlay',
-        combo: SHELL_HOTKEYS.closeOverlay,
-        allowInTextEntry: true,
-        // Only claim Escape while something is actually open.
-        when: () => {
-          const { paletteOpen, switcherOpen, helpOpen, settingsOpen } = s().ui;
-          return paletteOpen || switcherOpen || helpOpen || settingsOpen;
-        },
-        run: () => s().closeOverlays(),
-      },
-    ];
-
-    const active = new Set<string>(activeHotkeyIds());
-    const list = all.filter((binding) => active.has(binding.id));
-
-    if (experimentalLanes()) {
-      for (let i = 1; i <= 9; i++) {
-        list.push({
-          id: `focusTab${i}`,
-          combo: focusTabCombo(i),
-          run: () => s().focusTabIndex(i - 1),
-        });
-      }
-    }
-
-    return list;
-  }, [store]);
-
-  useHotkeys(bindings);
+/** The keymap entry of an id (for a help line or an `aria-keyshortcuts`). */
+export function keymapEntry(id: string): KeymapEntry | undefined {
+  return KEYMAP.find((e) => e.id === id);
 }

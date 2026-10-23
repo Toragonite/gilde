@@ -1,0 +1,22 @@
+{
+  "$comment": "The 20-session idle fixture of contract §11.1 (10 watched Claude, 5 Conversation, 3 Terminal, 2 turn-based). The harness materializes the 10 watched sessions itself: idle stand-in processes with registry rows and transcripts in a temp HOME; two of them carry the F-03 hostile argv and the env-value canary (scripts/gates/fixtures/hostile-argv.json), so the same run feeds T-priv-argv / T-priv-3 (canary-scan over GILDE_HOME afterwards). The 10 Gilde-owned sessions are started in the app against the fake vendor binaries (fake_claude, fake_agent from `cargo build --features test-fixtures`) on PATH.",
+  "watched": [
+    { "name": "w01", "project": "checkout-service", "origin": "terminal" },
+    { "name": "w02", "project": "checkout-service", "origin": "terminal", "hostileArgv": 0 },
+    { "name": "w03", "project": "infra-live", "origin": "vsCode" },
+    { "name": "w04", "project": "infra-live", "origin": "terminal" },
+    { "name": "w05", "project": "mobile-app", "origin": "terminal", "hostileArgv": 1 },
+    { "name": "w06", "project": "mobile-app", "origin": "vsCode" },
+    { "name": "w07", "project": "docs-site", "origin": "terminal" },
+    { "name": "w08", "project": "docs-site", "origin": "terminal" },
+    { "name": "w09", "project": "checkout-service", "origin": "background" },
+    { "name": "w10", "project": "infra-live", "origin": "terminal" }
+  ],
+  "inGilde": [
+    { "mode": "conversation", "vendor": "claude", "count": 5, "fake": "fake_claude", "scenario": "idle after one turn" },
+    { "mode": "terminal", "vendor": "claude", "count": 3, "fake": "fake_agent", "agentMode": "tui-idle-ready" },
+    { "mode": "turnBased", "vendor": "codex", "count": 2, "fake": "fake codex (sidecar exec seam)" }
+  ],
+  "window": { "visible": true, "floorOpen": false },
+  "sampleSeconds": 60
+}

@@ -9,18 +9,27 @@
  * cannot do: the host learns about the child BEFORE it exists.
  *
  * Every spawn here therefore:
- *   1. awaits `host.registerSpawn` (a durable `state='planned'` row, §8-3),
+ *   1. awaits `host.registerSpawn` (contract §4.5 `RegisterSpawnParams`: a durable
+ *      `planned` row, and an ALLOWLIST — the host refuses an argv[0] that is not a
+ *      configured vendor binary or the bundled node, and a refusal means we never
+ *      spawn),
  *   2. stamps `GILDE_SPAWN_ID` / `GILDE_APP_INSTANCE` on the child so the identity
- *      fences (§8-4) can recognize it later,
+ *      fences can recognize it later,
  *   3. reports `host.spawned` immediately after spawn and `host.exited` when it
  *      settles — both as REQUESTS, so a lost report is detectable.
  *
  * `ExecRequest.env` semantics are honoured exactly: when present it IS the child
  * env and is NOT merged over `process.env` (§5-6). Only the two markers are added,
- * so an adapter's account isolation (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `AGY_HOME`)
- * survives intact.
+ * so an adapter's account isolation (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`) survives.
  *
  * Env VALUES never leave this process: only `envKeys` is reported.
+ *
+ * SIGNALS (contract §9.8, C5): every child here is a vendor CLI, and a vendor CLI
+ * is NEVER sent SIGKILL — not on a timeout, not on an abandoned stream, not when a
+ * caller asks for it. {@link killProcessGroup} is the single place a signal leaves
+ * this module and it turns any SIGKILL into SIGTERM; a child that survives its
+ * SIGTERM gets one more SIGTERM after the grace and is then the host's to report
+ * as a survivor.
  *
  * This file and `duplex.ts` are the only modules of ours allowed to call
  * `spawn(` — `scripts/check-seam.mjs` fails the build otherwise.
@@ -37,6 +46,10 @@ import { PassThrough } from 'node:stream';
 import type { ExecFn, ExecRequest, ExecResult, LineStreamFn } from '@toragonite/agent-mesh-claude';
 import type { SpawnFn, SpawnedChild } from '@toragonite/agent-mesh-codex';
 
+import type { RegisterSpawnParams } from './gen/RegisterSpawnParams';
+import { noteSpawnFailure, noteTimeout } from './methods/never-open';
+import type { SidecarSpawnKind } from './gen/SidecarSpawnKind';
+import type { Vendor } from './gen/Vendor';
 import type { Rpc } from './rpc';
 
 /**
@@ -47,24 +60,31 @@ import type { Rpc } from './rpc';
  */
 export type StreamEndMeta = Parameters<NonNullable<Parameters<LineStreamFn>[1]>>[0];
 
-/** Grace between SIGTERM and SIGKILL on a wall-clock timeout. Matches the vendor default. */
+/** Grace between the first SIGTERM and the repeated one on a wall-clock timeout. */
 export const KILL_GRACE_MS = 5_000;
 /** Upper bound on the stderr we keep, so a chatty child can never fill its pipe. */
 export const STDERR_TAIL_CAP = 4096;
-/** `runId` used for probes that are not part of a dispatch run (§5-6). */
-export const INTROSPECT_RUN_ID = 'introspect';
 
 /**
  * Per-call context for the seam. `ExecFn` is `(req) => Promise<ExecResult>` with no
- * slot for a run id, and we want ONE adapter instance per vendor (Cursor memoizes
- * its model catalog on the instance), so the run id travels through
- * `AsyncLocalStorage` from the `adapter.run(task)` call site down to the spawn.
+ * slot for a turn id, and we want ONE adapter instance per vendor (Cursor memoizes
+ * its model catalog on the instance), so the attribution travels through
+ * `AsyncLocalStorage` from the `adapter.stream(task)` call site down to the spawn.
+ *
+ * `turnId` is `null` for probes (auth status, models, quota); `kind` is the
+ * registry kind the host records (contract §3.8: `turn` | `probe`).
  *
  * Documented fallback (DESIGN §5-6): if a future adapter version breaks async
- * context propagation, fall back to per-run adapter instances — the only cost is
+ * context propagation, fall back to per-turn adapter instances — the only cost is
  * Cursor's memoized model list.
  */
-export const runCtx = new AsyncLocalStorage<{ runId: string; vendor: string }>();
+export interface SpawnCtx {
+  turnId: string | null;
+  vendor: Vendor | null;
+  kind: SidecarSpawnKind;
+}
+
+export const runCtx = new AsyncLocalStorage<SpawnCtx>();
 
 /** What the host returns from `host.registerSpawn`. */
 export interface RegisterSpawnResult {
@@ -73,17 +93,15 @@ export interface RegisterSpawnResult {
   envMarker?: string;
 }
 
-/** Registry `kind` values this module produces (DESIGN §8-2). */
-export type SpawnKind = 'headless' | 'probe';
-
 export interface RegisteredSpawn {
   spawnId: string;
   envMarker: string;
   env: Record<string, string>;
 }
 
-function currentCtx(): { runId: string; vendor: string } {
-  return runCtx.getStore() ?? { runId: INTROSPECT_RUN_ID, vendor: 'unknown' };
+/** Outside any context a spawn is an unattributed probe. */
+function currentCtx(): SpawnCtx {
+  return runCtx.getStore() ?? { turnId: null, vendor: null, kind: 'probe' };
 }
 
 /**
@@ -109,29 +127,47 @@ function composeEnv(
 
 /**
  * Durable plan row first, spawn second (DESIGN §0 rule 2). Awaiting this is the
- * whole point of the bidirectional channel — a rejection here means we never spawn.
+ * whole point of the bidirectional channel — a rejection here (including the
+ * host's allowlist refusal) means we never spawn.
+ *
+ * `kindOverride` lets a seam that is always a probe (the duplex quota probe, the
+ * codex model listing) say so even inside a turn's context.
  */
 export async function registerSpawn(
   rpc: Rpc,
   appInstanceId: string,
-  kind: SpawnKind,
   req: ExecRequest,
+  kindOverride?: SidecarSpawnKind,
 ): Promise<RegisteredSpawn> {
-  const { runId, vendor } = currentCtx();
+  const ctx = currentCtx();
+  const kind = kindOverride ?? ctx.kind;
   const spawnId = randomUUID();
-  const res = await rpc.call<RegisterSpawnResult>('host.registerSpawn', {
+  // Exactly the contract's fields (the host rejects unknown fields).
+  const params: RegisterSpawnParams = {
     spawnId,
-    runId,
-    vendor,
+    turnId: kind === 'turn' ? ctx.turnId : null,
+    vendor: ctx.vendor,
     kind,
     cmd: req.cmd,
-    args: req.args,
-    cwd: req.cwd,
-    // Keys only. An env VALUE must never reach a host log (DESIGN §5-5).
+    args: [...req.args],
+    cwd: req.cwd ?? null,
+    // Keys only. An env VALUE must never reach the host (DESIGN §5-5).
     envKeys: Object.keys(req.env ?? {}),
-    plannedAt: Date.now(),
-  });
-  const envMarker = typeof res?.envMarker === 'string' && res.envMarker.length > 0 ? res.envMarker : spawnId;
+  };
+  let res: RegisterSpawnResult | undefined;
+  try {
+    res = await rpc.call<RegisterSpawnResult>('host.registerSpawn', params);
+  } catch (err) {
+    noteSpawnFailure();
+    // A refusal (the allowlist) or a dead channel: nothing spawns. The message
+    // names the seam so the turn's error is classed `exec`.
+    throw new Error(`host.registerSpawn refused the spawn: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (res?.ok !== true || typeof res.envMarker !== 'string' || res.envMarker.length === 0) {
+    noteSpawnFailure();
+    throw new Error(`host.registerSpawn did not approve ${req.cmd}`);
+  }
+  const envMarker = res.envMarker;
   return { spawnId, envMarker, env: composeEnv(req.env, envMarker, appInstanceId) };
 }
 
@@ -150,54 +186,63 @@ export async function reportExited(
   try {
     await rpc.call('host.exited', { spawnId, exitCode, signal, timedOut });
   } catch (err) {
-    // The row settles through the reaper if this never lands; losing the run's
+    // The row settles through the reaper if this never lands; losing the turn's
     // result because a bookkeeping call failed would be worse.
     rpc.notify('host.log', {
       level: 'warn',
       msg: 'host.exited failed',
-      fields: { spawnId, error: err instanceof Error ? err.message : String(err) },
+      fields: { error: err instanceof Error ? err.message : String(err) },
     });
   }
 }
 
 /**
+ * The signal that actually leaves: SIGKILL is never sent to a vendor CLI
+ * (contract §9.8, C5), so it becomes SIGTERM; everything else passes.
+ */
+export function deliverableSignal(signal: NodeJS.Signals | number): NodeJS.Signals | number {
+  return signal === 'SIGKILL' || signal === 9 ? 'SIGTERM' : signal;
+}
+
+/**
  * Signal the child's whole process group. `detached:true` guarantees a group of
- * its own, so this can never reach the sidecar or the app.
+ * its own, so this can never reach the sidecar or the app. Never SIGKILL.
  */
 export function killProcessGroup(child: ChildProcess, signal: NodeJS.Signals | number): void {
+  const sig = deliverableSignal(signal);
   if (child.pid !== undefined) {
     try {
-      process.kill(-child.pid, signal);
+      process.kill(-child.pid, sig);
       return;
     } catch {
       /* group already gone — fall through to the direct kill */
     }
   }
   try {
-    child.kill(signal);
+    child.kill(sig);
   } catch {
     /* already reaped */
   }
 }
 
-/** Arm the wall-clock cap. Returns a disposer that clears both timers. */
-function armTimeout(
-  child: ChildProcess,
-  timeoutMs: number | undefined,
-  onTimeout: () => void,
-): () => void {
+/**
+ * Arm the wall-clock cap: SIGTERM at the deadline, and one more SIGTERM after
+ * {@link KILL_GRACE_MS} if the group is still there. Returns a disposer.
+ */
+function armTimeout(child: ChildProcess, timeoutMs: number | undefined, onTimeout: () => void): () => void {
   if (timeoutMs === undefined || !(timeoutMs > 0)) return () => {};
-  let killTimer: NodeJS.Timeout | undefined;
+  let repeatTimer: NodeJS.Timeout | undefined;
   const timer = setTimeout(() => {
     onTimeout();
+    noteTimeout();
     killProcessGroup(child, 'SIGTERM');
-    killTimer = setTimeout(() => killProcessGroup(child, 'SIGKILL'), KILL_GRACE_MS);
-    killTimer.unref?.();
+    repeatTimer = setTimeout(() => killProcessGroup(child, 'SIGTERM'), KILL_GRACE_MS);
+    repeatTimer.unref?.();
   }, timeoutMs);
   timer.unref?.();
   return () => {
     clearTimeout(timer);
-    if (killTimer !== undefined) clearTimeout(killTimer);
+    if (repeatTimer !== undefined) clearTimeout(repeatTimer);
   };
 }
 
@@ -214,14 +259,22 @@ function primeStdin(child: ChildProcess, stdin: string | undefined): void {
   }
 }
 
+/** A timer that can never by itself hold the process open. */
+function sleep(ms: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const t = setTimeout(resolve, ms);
+    t.unref?.();
+  });
+}
+
 /**
  * The registered {@link ExecFn}: run a child to completion, collecting stdout and
- * stderr. Resolves an {@link ExecResult}; a spawn-level failure (ENOENT) REJECTS,
- * which the adapters convert into an `AdapterExecError`.
+ * stderr. Resolves an {@link ExecResult}; a spawn-level failure (ENOENT, or the
+ * host refusing the spawn) REJECTS, which the adapters convert into their error.
  */
 export function makeRegisteredExec(rpc: Rpc, appInstanceId: string): ExecFn {
   return async (req: ExecRequest): Promise<ExecResult> => {
-    const { spawnId, env } = await registerSpawn(rpc, appInstanceId, 'headless', req);
+    const { spawnId, env } = await registerSpawn(rpc, appInstanceId, req);
 
     let child: ChildProcess;
     try {
@@ -229,13 +282,14 @@ export function makeRegisteredExec(rpc: Rpc, appInstanceId: string): ExecFn {
         cwd: req.cwd,
         env,
         shell: false,
-        // Own process group: `pgid === pid`, so a timeout kill reaps the whole tree
-        // and the host's killpg can never touch anything but this run.
+        // Own process group: `pgid === pid`, so a timeout signal reaches the whole
+        // tree and the host's killpg can never touch anything but this child.
         detached: true,
         stdio: ['pipe', 'pipe', 'pipe'],
       });
     } catch (err) {
       // The planned row must not dangle even though nothing ever ran.
+      noteSpawnFailure();
       await reportExited(rpc, spawnId, null, null, false);
       throw err;
     }
@@ -297,6 +351,7 @@ export function makeRegisteredExec(rpc: Rpc, appInstanceId: string): ExecFn {
     try {
       await settled;
     } catch (err) {
+      noteSpawnFailure();
       await reportExited(rpc, spawnId, null, null, timedOut);
       throw err;
     }
@@ -311,7 +366,7 @@ export function makeRegisteredExec(rpc: Rpc, appInstanceId: string): ExecFn {
  *
  * `onEnd` is invoked EXACTLY ONCE after the final line — on normal completion, on
  * a timeout, on a spawn error, and when the consumer abandons the iterator early
- * (in which case the child's group is force-killed first).
+ * (in which case the child's group gets SIGTERM first, never SIGKILL).
  */
 export function makeRegisteredLineStream(rpc: Rpc, appInstanceId: string): LineStreamFn {
   return function registeredLineStream(
@@ -319,7 +374,7 @@ export function makeRegisteredLineStream(rpc: Rpc, appInstanceId: string): LineS
     onEnd?: (meta: StreamEndMeta) => void,
   ): AsyncIterable<string> {
     return (async function* () {
-      const { spawnId, env } = await registerSpawn(rpc, appInstanceId, 'headless', req);
+      const { spawnId, env } = await registerSpawn(rpc, appInstanceId, req);
 
       let child: ChildProcess;
       try {
@@ -331,6 +386,7 @@ export function makeRegisteredLineStream(rpc: Rpc, appInstanceId: string): LineS
           stdio: ['pipe', 'pipe', 'pipe'],
         });
       } catch (err) {
+        noteSpawnFailure();
         await reportExited(rpc, spawnId, null, null, false);
         onEnd?.({ timedOut: false, exitCode: null, stderrTail: '' });
         throw err;
@@ -364,6 +420,7 @@ export function makeRegisteredLineStream(rpc: Rpc, appInstanceId: string): LineS
         resolveExit();
       });
       child.on('error', (err) => {
+        noteSpawnFailure();
         if (!exited) {
           exited = true;
           resolveExit();
@@ -407,9 +464,15 @@ export function makeRegisteredLineStream(rpc: Rpc, appInstanceId: string): LineS
         disarm();
         rl.close();
         if (!exited) {
-          // The consumer walked away (break / throw): never leave the group behind.
-          killProcessGroup(child, 'SIGKILL');
-          await exitedPromise;
+          // The consumer walked away (break / throw / turn.cancel): never leave the
+          // group behind — SIGTERM, a second one after the grace, then whatever is
+          // left is the host's survivor to report (C5: never SIGKILL).
+          killProcessGroup(child, 'SIGTERM');
+          await Promise.race([exitedPromise, sleep(KILL_GRACE_MS)]);
+          if (!exited) {
+            killProcessGroup(child, 'SIGTERM');
+            await Promise.race([exitedPromise, sleep(KILL_GRACE_MS)]);
+          }
         }
         await finish();
       }
@@ -439,7 +502,7 @@ export const SPAWN_DRAIN_CAP_MS = 1_000;
  *                before the spawn ends the child's stdin after them.
  *   - `stdout` / `stderr` — the child's, piped through.
  *   - `kill(sig)` — the child's whole process group (it is spawned detached, a group of
- *                its own), so whatever the app-server started dies with it. Before the
+ *                its own), as SIGTERM even when SIGKILL is asked for (C5). Before the
  *                spawn it cancels it: nothing is spawned, the row is settled, `exit`
  *                fires with that signal.
  *   - `error` — a refused registration or a failed spawn (the row settled first).
@@ -459,7 +522,7 @@ class RegisteredChild extends EventEmitter implements SpawnedChild {
 
   kill(signal: NodeJS.Signals | number = 'SIGTERM'): boolean {
     if (this.over) return false;
-    this.killedWith = signal;
+    this.killedWith = deliverableSignal(signal);
     if (this.real !== undefined) killProcessGroup(this.real, signal);
     return true;
   }
@@ -470,7 +533,7 @@ class RegisteredChild extends EventEmitter implements SpawnedChild {
     const reqEnv = options.env as Record<string, string | undefined> | undefined;
     let registered: RegisteredSpawn;
     try {
-      registered = await registerSpawn(rpc, appInstanceId, 'probe', { cmd: command, args, cwd, env: reqEnv });
+      registered = await registerSpawn(rpc, appInstanceId, { cmd: command, args, cwd, env: reqEnv }, 'probe');
     } catch (err) {
       this.failed(err);
       return;
@@ -571,9 +634,9 @@ class RegisteredChild extends EventEmitter implements SpawnedChild {
 /**
  * The registered {@link SpawnFn} (agent-mesh-codex 0.1.4 `CodexAdapterOptions.spawn`): the
  * `codex app-server` model listing behind `availableModels()` gets a registry row (`kind:
- * 'probe'`, the run of the current {@link runCtx}) before it exists, the markers in its env,
- * `host.spawned` / `host.exited` like every other child — and its own process group, which
- * the caller's deadline kill (`child.kill('SIGKILL')`) takes down whole.
+ * 'probe'`) before it exists, the markers in its env, `host.spawned` / `host.exited` like
+ * every other child — and its own process group, which the caller's deadline kill takes
+ * down whole (as SIGTERM: C5).
  */
 export function makeRegisteredSpawn(rpc: Rpc, appInstanceId: string): SpawnFn {
   return (command, args, options) => {

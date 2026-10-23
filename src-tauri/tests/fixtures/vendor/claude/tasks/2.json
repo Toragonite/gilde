@@ -1,0 +1,9 @@
+{
+  "id": "2",
+  "subject": "CANARY-7f3a-CONTENT subject two",
+  "description": "CANARY-7f3a-CONTENT",
+  "status": "pending",
+  "blocks": [],
+  "blockedBy": ["1"],
+  "metadata": {"x": 1}
+}

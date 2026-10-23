@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-session-continue"
+description = "Enables the session_continue command without any pre-configured scope."
+commands.allow = ["session_continue"]
+
+[[permission]]
+identifier = "deny-session-continue"
+description = "Denies the session_continue command without any pre-configured scope."
+commands.deny = ["session_continue"]

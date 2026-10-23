@@ -24,6 +24,28 @@
 //!   → KillReport
 //! ```
 //!
+//! **Gilde 2 policy change (contract §9.8) [C5, F-32].** A process whose
+//! executable is a vendor CLI (the §5.2.2 classifier,
+//! [`procscan::vendor_of_exec`]) is **never** sent `SIGKILL` — Gilde's own
+//! sessions included — and neither is any process that still has a live vendor
+//! CLI below it (a pane's `/bin/sh -c` wrapper: killing it would orphan the
+//! `claude` child and close its PTY). For them the path stops at `SIGTERM`
+//! (`SIGHUP` first for PTYs and panes, [`KillOpts::hup_first`]) and they are
+//! reported as survivors ([`KillReport::held`]). A process group that holds
+//! one of them is never `killpg(SIGKILL)`ed either. Non-vendor helpers (the
+//! sidecar's node, `git`, a wrapper whose vendor child is gone) keep the
+//! existing TERM → grace → KILL escalation.
+//!
+//! **Gilde's own rows are authoritative (A39.1(b)).** The classifier is the
+//! one shared [`crate::agents::classify`]; on top of it, a target pid that the
+//! registry recorded as one of Gilde's vendor sessions
+//! ([`crate::supervise::registry::is_own_vendor_row`]: a Conversation, PTY,
+//! pane member, turn or vendor-binary probe row) is held as a vendor CLI
+//! whatever its exec path classifies as, and a group such a row recorded is
+//! never `killpg(SIGKILL)`ed. An unknown install layout therefore never lets
+//! Gilde SIGKILL its own session, and a registry that cannot be read escalates
+//! nothing (fail safe).
+//!
 //! Three things are deliberately stricter than the pseudocode in the design
 //! document, all of them in the "do not kill" direction:
 //!
@@ -87,8 +109,6 @@ pub const MIN_TARGET_AGE: Duration = Duration::from_millis(200);
 
 /// macOS `SZOMB` from `<sys/proc.h>`: exited, not yet reaped.
 const SZOMB: u32 = 5;
-/// What `ps` prints as the command line of a zombie.
-const DEFUNCT: &str = "<defunct>";
 
 /// Stable, non-localized reasons. The UI maps them to i18n keys; they are also
 /// what lands in `proc_registry.note` and in `event_log`.
@@ -122,6 +142,11 @@ pub mod reason {
     /// The kernel start time changed between SIGTERM and SIGKILL — the pid was
     /// recycled during the grace window and belongs to somebody else now.
     pub const START_TIME_CHANGED: &str = "startTimeChanged";
+    /// The pid runs a vendor CLI: never escalated to SIGKILL (contract §9.8).
+    pub const VENDOR_CLI: &str = "vendorCli";
+    /// The pid has a live vendor CLI below it (a pane's `sh` wrapper): never
+    /// escalated to SIGKILL while that descendant lives [F-32].
+    pub const VENDOR_DESCENDANT: &str = "vendorDescendant";
 }
 
 /// Exclusion reasons that make the *primary* pid untouchable, which refuses the
@@ -153,6 +178,12 @@ pub struct KillOpts {
     /// Permit `.app/Contents/MacOS/*` targets. Off unless the user explicitly
     /// confirmed one row at a time.
     pub allow_bundle_main: bool,
+    /// Send `SIGHUP` first and wait `grace` before the `SIGTERM` (what closing
+    /// a terminal does; PTYs and panes, contract §10.2).
+    pub hup_first: bool,
+    /// Escalate surviving **non-vendor** pids to `SIGKILL` after the grace.
+    /// Vendor CLIs and their wrappers are never escalated, whatever this says.
+    pub escalate: bool,
 }
 
 impl Default for KillOpts {
@@ -161,6 +192,8 @@ impl Default for KillOpts {
             grace: DEFAULT_GRACE,
             dry_run: false,
             allow_bundle_main: false,
+            hup_first: false,
+            escalate: true,
         }
     }
 }
@@ -187,25 +220,25 @@ impl KillOpts {
         self.allow_bundle_main = allow;
         self
     }
+
+    pub fn hup_first(mut self, hup: bool) -> KillOpts {
+        self.hup_first = hup;
+        self
+    }
+
+    pub fn escalate(mut self, escalate: bool) -> KillOpts {
+        self.escalate = escalate;
+        self
+    }
 }
 
 /// Serde shape of [`KillOpts`] — `ipc.ts::KillOpts` plus the optional grace.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct KillOptsWire {
     dry_run: bool,
     allow_bundle_main: bool,
     grace_ms: Option<u64>,
-}
-
-impl Default for KillOptsWire {
-    fn default() -> Self {
-        KillOptsWire {
-            dry_run: false,
-            allow_bundle_main: false,
-            grace_ms: None,
-        }
-    }
 }
 
 impl From<KillOptsWire> for KillOpts {
@@ -214,6 +247,7 @@ impl From<KillOptsWire> for KillOpts {
             grace: w.grace_ms.map(Duration::from_millis).unwrap_or(DEFAULT_GRACE),
             dry_run: w.dry_run,
             allow_bundle_main: w.allow_bundle_main,
+            ..KillOpts::default()
         }
     }
 }
@@ -321,6 +355,17 @@ impl KillReport {
     /// Whether any signal was sent.
     pub fn is_refused(&self) -> bool {
         self.refused_reason.is_some()
+    }
+
+    /// Survivors that were deliberately **not** escalated to SIGKILL: vendor
+    /// CLIs and wrappers with a live vendor descendant (contract §9.8). They
+    /// are listed in `excluded` with [`reason::VENDOR_CLI`] /
+    /// [`reason::VENDOR_DESCENDANT`] and are also in `survivors`.
+    pub fn held(&self) -> Vec<&KillExclusion> {
+        self.excluded
+            .iter()
+            .filter(|e| e.reason == reason::VENDOR_CLI || e.reason == reason::VENDOR_DESCENDANT)
+            .collect()
     }
 
     /// Whether everything that was targeted is gone.
@@ -474,8 +519,10 @@ pub async fn kill_tree(sup: &Supervisor, spawn_id: &str, opts: KillOpts) -> Kill
 
     // Rows this instance created have an owner holding the `Child` handle.
     let harvest = row.app_instance != sup.app_instance_id();
-    let outcome = execute(&plan, &opts, &snap, harvest).await;
+    let own = own_vendor_rows(sup, &plan, Some(&row.spawn_id)).await;
+    let outcome = execute(&plan, &opts, &snap, harvest, &own).await;
     let report = outcome.report("verified", &plan, &opts);
+    note_escapees(sup, &row, &plan.escapees).await;
 
     record_result(sup, &row, &report, outcome.last_signal).await;
     write_event_log(sup, &row, &report, &outcome.per_pid, Some(plan.primary), plan.group).await;
@@ -514,6 +561,38 @@ pub async fn kill_pids(
     out
 }
 
+/// A42.1: stop a pid that has **no Gilde row** (a watched session, a
+/// non-Gilde leftover) — that identity-fenced pid alone, never its
+/// descendants or its group, and never escalated past the plan's signals
+/// (`opts.escalate` is honoured; every `SignalPlan` passes `false`). A
+/// survivor is reported as one.
+pub async fn kill_single_pid(sup: &Supervisor, pid: i32, opts: KillOpts) -> KillReport {
+    let snap = match ps_snapshot() {
+        Ok(snap) => snap,
+        Err(_) => return KillReport::refused(None, "unfenced", reason::SCAN_UNAVAILABLE),
+    };
+    if !snap.contains(pid) && !is_alive(pid) {
+        return KillReport::refused(None, "gone", reason::GONE);
+    }
+    let guard = SelfGuard::of(&snap);
+    let plan = KillPlan::single(pid, &snap, &opts, &guard);
+    if let Some(refused) = plan.refused.clone() {
+        let report = plan.into_report("unfenced", &opts).with_reason(&refused);
+        write_bare_event_log(sup, pid, &report, &[]).await;
+        return report;
+    }
+    if opts.dry_run {
+        return plan.into_report("unfenced", &opts);
+    }
+    // A finished row (a survivor of an earlier stop) can still be one of
+    // Gilde's vendor sessions (A39.1(b)).
+    let own = own_vendor_rows(sup, &plan, None).await;
+    let outcome = execute(&plan, &opts, &snap, true, &own).await;
+    let report = outcome.report("unfenced", &plan, &opts);
+    write_bare_event_log(sup, pid, &report, &outcome.per_pid).await;
+    report
+}
+
 /// Kill a pid that no registry row claims. Exposed because the Process Monitor
 /// legitimately terminates residue we never spawned; it is deliberately the
 /// weakest path and does no group signalling.
@@ -540,7 +619,10 @@ pub async fn kill_bare_pid(sup: &Supervisor, pid: i32, opts: KillOpts) -> KillRe
     }
 
     // Nothing in this process owns a handle to a pid we never registered.
-    let outcome = execute(&plan, &opts, &snap, true).await;
+    // A finished row (a survivor of an earlier stop) or a descendant can still
+    // be one of Gilde's vendor sessions (A39.1(b)).
+    let own = own_vendor_rows(sup, &plan, None).await;
+    let outcome = execute(&plan, &opts, &snap, true, &own).await;
     let report = outcome.report("unfenced", &plan, &opts);
     write_bare_event_log(sup, pid, &report, &outcome.per_pid).await;
     report
@@ -629,6 +711,12 @@ struct KillPlan {
     start_times: HashMap<i32, Option<i64>>,
     /// `targets` with their names, from the plan's own scan.
     names: Vec<KillName>,
+    /// Targets (and descendants) that run a vendor CLI, classified before any
+    /// signal (contract §9.8).
+    vendor_pids: HashSet<i32>,
+    /// A41.2: live processes carrying the row's marker outside its tree —
+    /// never signalled; recorded as Leftovers when the row is stopped.
+    escapees: Vec<i32>,
 }
 
 impl KillPlan {
@@ -649,26 +737,45 @@ impl KillPlan {
         //     group). `group_is_safe` below fenced only the `killpg`; the
         //     members of such a group still became per-pid targets (A4: a row
         //     whose recorded pgid named a bystander's group TERM'd the
-        //     bystander). Such a row is killed by pid, descendants and env
-        //     marker only, and the refusal is reported.
+        //     bystander). Such a row is killed by pid and descendants only,
+        //     and the refusal is reported.
         let (pgid, foreign_group) = match pgid.filter(|p| *p > 0) {
             Some(g) if g == primary => (Some(g), None),
             Some(g) => (None, Some(g)),
             None => (None, None),
         };
 
-        // --- union of the three independent discovery paths (DESIGN §8-6).
+        // --- A41.1: the spawned tree only — the group the primary leads and
+        //     its descendants by ancestry, fenced by start time (a process
+        //     that started before the primary is not of its tree: a stale
+        //     snapshot entry whose pid was recycled). §9.8 "never automatic
+        //     termination of anything Gilde did not start" wins over DESIGN
+        //     §8-6's env-marker union.
         let mut discovered: HashSet<i32> = HashSet::new();
         discovered.insert(primary);
+        let primary_start = procscan::start_time_of(primary);
+        let of_tree = |pid: &i32| match (primary_start, procscan::start_time_of(*pid)) {
+            (Some(p), Some(s)) => s >= p,
+            _ => true,
+        };
         if let Some(pgid) = pgid {
-            discovered.extend(snap.pids_in_group(pgid));
+            discovered.extend(snap.pids_in_group(pgid).into_iter().filter(of_tree));
         }
-        discovered.extend(snap.descendants_of(primary));
-        if let Some(marker) = env_marker.filter(|m| !m.is_empty()) {
-            // Best effort by design: reading another process's environment is
-            // restricted on macOS (DESIGN §8-4).
-            discovered.extend(snap.with_env(ENV_SPAWN_ID, marker));
-        }
+        discovered.extend(snap.descendants_of(primary).into_iter().filter(of_tree));
+        // --- A41.2: a process that carries the row's marker but left the tree
+        //     (setsid / double fork: a `claude --bg` job, a `nohup` server) is
+        //     an escapee — listed as a Leftover, never a target. Best effort by
+        //     design: reading another process's environment is restricted on
+        //     macOS (DESIGN §8-4).
+        let me = std::process::id() as i32;
+        let escapees: Vec<i32> = match env_marker.filter(|m| !m.is_empty()) {
+            Some(marker) => snap
+                .with_env(ENV_SPAWN_ID, marker)
+                .into_iter()
+                .filter(|pid| *pid > 1 && *pid != me && !guard.ancestors.contains(pid) && !discovered.contains(pid))
+                .collect(),
+            None => Vec::new(),
+        };
 
         // --- exclusion set, applied last and unconditionally.
         let mut targets: Vec<i32> = Vec::with_capacity(discovered.len());
@@ -728,6 +835,16 @@ impl KillPlan {
             })
             .collect();
 
+        let vendor_pids: HashSet<i32> = if refused.is_some() || opts.dry_run {
+            HashSet::new()
+        } else {
+            targets
+                .iter()
+                .copied()
+                .filter(|pid| procscan::vendor_of_pid(*pid).is_some())
+                .collect()
+        };
+
         KillPlan {
             spawn_id,
             primary,
@@ -737,6 +854,45 @@ impl KillPlan {
             refused,
             start_times,
             names,
+            vendor_pids,
+            escapees,
+        }
+    }
+
+    /// A42.1: the plan for a pid with no Gilde row — that identity-fenced pid
+    /// alone: never its descendants, never its group, never a marker match.
+    fn single(pid: i32, snap: &Snapshot, opts: &KillOpts, guard: &SelfGuard) -> KillPlan {
+        let mut targets = Vec::new();
+        let mut excluded = Vec::new();
+        let refused = match guard.exclusion_for(pid, snap, opts, true) {
+            Some(why) => {
+                excluded.push(KillExclusion::new(pid, why));
+                Some(why.to_string())
+            }
+            None => {
+                targets.push(pid);
+                None
+            }
+        };
+        let live = refused.is_none() && !opts.dry_run;
+        KillPlan {
+            spawn_id: None,
+            primary: pid,
+            start_times: if live { targets.iter().map(|p| (*p, procscan::start_time_of(*p))).collect() } else { HashMap::new() },
+            names: targets
+                .iter()
+                .map(|p| KillName { pid: *p, name: snap.get(*p).map(|r| r.name()).unwrap_or_default() })
+                .collect(),
+            vendor_pids: if live {
+                targets.iter().copied().filter(|p| procscan::vendor_of_pid(*p).is_some()).collect()
+            } else {
+                HashSet::new()
+            },
+            targets,
+            excluded,
+            group: None,
+            refused,
+            escapees: Vec::new(),
         }
     }
 
@@ -805,6 +961,7 @@ struct Execution {
     survivors: Vec<i32>,
     escalated: Vec<i32>,
     dropped: Vec<KillExclusion>,
+    held: Vec<KillExclusion>,
     per_pid: Vec<PidResult>,
     last_signal: Option<i32>,
 }
@@ -813,6 +970,9 @@ impl Execution {
     fn report(&self, fence: &str, plan: &KillPlan, opts: &KillOpts) -> KillReport {
         let mut excluded = plan.excluded.clone();
         excluded.extend(self.dropped.iter().cloned());
+        // Held pids were signalled and then deliberately spared from SIGKILL
+        // (contract §9.8); they are also in `survivors`.
+        excluded.extend(self.held.iter().cloned());
         KillReport {
             spawn_id: plan.spawn_id.clone(),
             requested: plan.targets.clone(),
@@ -828,7 +988,8 @@ impl Execution {
     }
 }
 
-/// TERM → grace → start-time re-check → KILL → verify → reap.
+/// [HUP → grace →] TERM → grace → start-time re-check → never-KILL filter →
+/// KILL → verify → reap.
 ///
 /// `harvest` says whether this call is entitled to `waitpid` the targets that
 /// are our own direct children — see [`reap_zombies`].
@@ -837,32 +998,85 @@ async fn execute(
     opts: &KillOpts,
     snap: &Snapshot,
     harvest: bool,
+    own: &OwnVendorRows,
 ) -> Execution {
-    // ---- SIGTERM, group first then per pid.
-    if let Some(pgid) = plan.group {
-        send_group(pgid, Signal::SIGTERM);
-    }
-    for pid in &plan.targets {
-        send_one(*pid, Signal::SIGTERM);
-    }
-    let mut last_signal = Some(Signal::SIGTERM as i32);
+    let mut last_signal = None;
 
-    let survivors = poll_until_gone(&plan.targets, opts.grace).await;
+    // ---- SIGHUP first for PTYs and panes (what closing a terminal does).
+    let mut alive: Vec<i32> = plan.targets.clone();
+    if opts.hup_first {
+        if let Some(pgid) = plan.group {
+            send_group(pgid, Signal::SIGHUP);
+        }
+        for pid in &plan.targets {
+            send_one(*pid, Signal::SIGHUP);
+        }
+        last_signal = Some(Signal::SIGHUP as i32);
+        alive = poll_until_gone(&plan.targets, opts.grace).await;
+    }
+
+    // ---- SIGTERM, group first then per pid (only what is still there, and
+    //      only pids whose start time still matches the plan's).
+    if !alive.is_empty() {
+        // After a SIGHUP grace the world moved: re-fence pids and the group.
+        let (still_ours, group_ok) = if opts.hup_first {
+            let (ours, _) = survivors_still_ours(&alive, &plan.start_times);
+            let fresh = ps_snapshot().unwrap_or_else(|_| snap.clone());
+            let ok = plan
+                .group
+                .is_some_and(|pgid| group_is_safe(pgid, &fresh, &SelfGuard::of(&fresh), &ours));
+            (ours, ok)
+        } else {
+            (alive.clone(), plan.group.is_some())
+        };
+        if let Some(pgid) = plan.group.filter(|_| group_ok) {
+            send_group(pgid, Signal::SIGTERM);
+        }
+        for pid in &still_ours {
+            send_one(*pid, Signal::SIGTERM);
+        }
+        last_signal = Some(Signal::SIGTERM as i32);
+    }
+
+    let survivors = poll_until_gone(&alive, opts.grace).await;
 
     // ---- ★ the escalation gate. A pid that died during the grace window may
     //      already belong to somebody else; SIGKILL to a recycled pid kills a
     //      stranger's process.
-    let (mut escalate, dropped) = survivors_still_ours(&survivors, &plan.start_times);
+    let (still_ours, dropped) = survivors_still_ours(&survivors, &plan.start_times);
+
+    // ---- the never-KILL filter (contract §9.8): vendor CLIs, and anything
+    //      with a live vendor CLI below it, stop at SIGTERM.
+    let fresh = if still_ours.is_empty() {
+        snap.clone()
+    } else {
+        ps_snapshot().unwrap_or_else(|_| snap.clone())
+    };
+    let (mut escalate, mut held) = split_never_kill_with_rows(&still_ours, &fresh, &plan.vendor_pids, &own.pids);
+    if own.unknown {
+        // A39.1(b), fail safe: without the registry we cannot tell which
+        // survivor is one of Gilde's own vendor sessions.
+        held.extend(escalate.drain(..).map(|pid| KillExclusion::new(pid, reason::REGISTRY_UNAVAILABLE)));
+    }
+    // A42.1: without escalation (every `SignalPlan`) a survivor stays a
+    // survivor — never reported as a clean stop that did not happen.
+    let not_escalated: Vec<i32> = if opts.escalate { Vec::new() } else { std::mem::take(&mut escalate) };
 
     if !escalate.is_empty() {
-        // Re-check the group against a fresh snapshot: the world moved while we
-        // waited out the grace.
-        let fresh = ps_snapshot().unwrap_or_else(|_| snap.clone());
+        // Re-check the group against the fresh snapshot: the world moved while
+        // we waited out the grace. A group that holds a held pid is never
+        // signalled with SIGKILL.
         let guard = SelfGuard::of(&fresh);
-        if let Some(pgid) = plan
-            .group
-            .filter(|pgid| group_is_safe(*pgid, &fresh, &guard, &escalate))
-        {
+        if let Some(pgid) = plan.group.filter(|pgid| {
+            !own.unknown
+                && !own.groups.contains(pgid)
+                && group_is_safe(*pgid, &fresh, &guard, &escalate)
+                && !fresh.pids_in_group(*pgid).iter().any(|m| {
+                    held.iter().any(|h| h.pid == *m)
+                        || own.pids.contains(m)
+                        || is_vendor_pid(*m, &plan.vendor_pids)
+                })
+        }) {
             send_group(pgid, Signal::SIGKILL);
         }
         for pid in &escalate {
@@ -881,7 +1095,14 @@ async fn execute(
 
     // A zombie is gone for every purpose this report has; only re-check the
     // pids that were still alive a moment ago.
-    let survivors_final: Vec<i32> = still.into_iter().filter(|p| !is_gone(*p)).collect();
+    let mut survivors_final: Vec<i32> = still.into_iter().filter(|p| !is_gone(*p)).collect();
+    for pid in held.iter().map(|h| h.pid).chain(not_escalated.iter().copied()) {
+        if !is_gone(pid) && !survivors_final.contains(&pid) {
+            survivors_final.push(pid);
+        }
+    }
+    survivors_final.sort_unstable();
+    let held: Vec<KillExclusion> = held.into_iter().filter(|h| survivors_final.contains(&h.pid)).collect();
 
     let per_pid = plan
         .targets
@@ -893,6 +1114,7 @@ async fn execute(
             gone: !survivors_final.contains(pid),
             skipped: dropped
                 .iter()
+                .chain(held.iter())
                 .find(|e| e.pid == *pid)
                 .map(|e| e.reason.clone()),
         })
@@ -902,9 +1124,220 @@ async fn execute(
         survivors: survivors_final,
         escalated: escalate,
         dropped,
+        held,
         per_pid,
         last_signal,
     }
+}
+
+/// Split SIGTERM survivors into the ones that may be escalated to SIGKILL and
+/// the ones that never are (contract §9.8, F-32): a vendor CLI, or a process
+/// with a live vendor CLI among its descendants in `snap`.
+///
+/// `vendor_pids` is the plan-time classification (taken before any signal,
+/// while every target's exec path was still readable); a pid that cannot be
+/// classified now is held too — an unidentifiable process is never killed.
+pub fn split_never_kill(
+    survivors: &[i32],
+    snap: &Snapshot,
+    vendor_pids: &HashSet<i32>,
+) -> (Vec<i32>, Vec<KillExclusion>) {
+    split_never_kill_with_rows(survivors, snap, vendor_pids, &HashSet::new())
+}
+
+/// [`split_never_kill`] with Gilde's own vendor rows (A39.1(b)): `own_rows`
+/// are the pids the registry recorded as Gilde's vendor sessions. Such a pid
+/// is held as a vendor CLI whatever its exec path classifies as, and counts as
+/// a vendor below a wrapper. A wrapper with a live vendor below it is reported
+/// `vendorDescendant` even when it is itself an own row.
+pub fn split_never_kill_with_rows(
+    survivors: &[i32],
+    snap: &Snapshot,
+    vendor_pids: &HashSet<i32>,
+    own_rows: &HashSet<i32>,
+) -> (Vec<i32>, Vec<KillExclusion>) {
+    let mut escalate = Vec::new();
+    let mut held = Vec::new();
+    for pid in survivors {
+        if is_vendor_pid(*pid, vendor_pids) {
+            held.push(KillExclusion::new(*pid, reason::VENDOR_CLI));
+            continue;
+        }
+        let vendor_below = snap
+            .descendants_of(*pid)
+            .into_iter()
+            .any(|d| !is_gone(d) && (own_rows.contains(&d) || is_vendor_pid(d, vendor_pids)));
+        if vendor_below {
+            held.push(KillExclusion::new(*pid, reason::VENDOR_DESCENDANT));
+            continue;
+        }
+        if own_rows.contains(pid) {
+            held.push(KillExclusion::new(*pid, reason::VENDOR_CLI));
+            continue;
+        }
+        escalate.push(*pid);
+    }
+    (escalate, held)
+}
+
+/// A39.1(b): which of a kill's targets, and which process groups, Gilde's
+/// registry recorded as its own vendor sessions.
+#[derive(Debug, Clone, Default)]
+struct OwnVendorRows {
+    /// Target pids a vendor row recorded: held, never SIGKILLed.
+    pids: HashSet<i32>,
+    /// Groups a vendor row recorded: never `killpg(SIGKILL)`ed.
+    groups: HashSet<i32>,
+    /// The registry could not be read: nothing is escalated (fail safe).
+    unknown: bool,
+}
+
+/// How far a row's recorded start time may be from the kernel's and still name
+/// the same process: the identity fence's degraded tolerance (start times are
+/// whole seconds). Wider is the safe direction here — it only holds more.
+const OWN_ROW_START_TOLERANCE_SECS: i64 = 2;
+
+/// One registry row as [`own_vendor_rows`] reads it.
+struct OwnRowFacts {
+    kind: String,
+    vendor: Option<String>,
+    owned_by_session: bool,
+    pid: i64,
+    pgid: Option<i64>,
+    start: Option<i64>,
+}
+
+/// The rows of every instance whose process may still live (`kill_incomplete`
+/// included: a survivor of an earlier stop), plus the row being killed,
+/// matched against the plan's targets. A row whose pid was recycled since it
+/// was recorded (both start times known and further apart than
+/// [`OWN_ROW_START_TOLERANCE_SECS`]) does not count; an unreadable start time
+/// counts (fail safe), and so does a kind this build does not know.
+async fn own_vendor_rows(sup: &Supervisor, plan: &KillPlan, spawn_id: Option<&str>) -> OwnVendorRows {
+    let this_row = spawn_id.unwrap_or_default().to_string();
+    let rows = sup
+        .db()
+        .read(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT kind, vendor, parent_uid, session_id, pid, pgid, proc_start_ts
+                   FROM proc_registry
+                  WHERE pid IS NOT NULL
+                    AND (state IN ('planned','running','adopted','kill_incomplete') OR spawn_id = ?1)",
+            )?;
+            let mapped = stmt.query_map([this_row], |r| {
+                Ok(OwnRowFacts {
+                    kind: r.get(0)?,
+                    vendor: r.get(1)?,
+                    owned_by_session: r.get::<_, Option<String>>(2)?.is_some() || r.get::<_, Option<String>>(3)?.is_some(),
+                    pid: r.get(4)?,
+                    pgid: r.get(5)?,
+                    start: r.get(6)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in mapped {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+        .await;
+    let rows = match rows {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(target: "supervise", error = %e, "kill: registry unreadable; nothing is escalated");
+            return OwnVendorRows { unknown: true, ..OwnVendorRows::default() };
+        }
+    };
+    let mut own = OwnVendorRows::default();
+    for row in rows {
+        let Ok(pid) = i32::try_from(row.pid) else { continue };
+        if !plan.targets.contains(&pid) {
+            continue;
+        }
+        let vendor_row = crate::store::models::ProcKind::from_db_str(&row.kind).is_none_or(|kind| {
+            crate::supervise::registry::is_own_vendor_row(kind, row.vendor.as_deref(), row.owned_by_session)
+        });
+        if !vendor_row {
+            continue;
+        }
+        if let (Some(recorded), Some(now)) = (row.start, procscan::start_time_of(pid)) {
+            if (recorded - now).abs() > OWN_ROW_START_TOLERANCE_SECS {
+                continue;
+            }
+        }
+        own.pids.insert(pid);
+        if let Some(pgid) = row.pgid.and_then(|g| i32::try_from(g).ok()).filter(|g| *g > 1) {
+            own.groups.insert(pgid);
+        }
+    }
+    own
+}
+
+/// A41.2: where an escapee came from — the row whose marker it carries and
+/// the session that owned that row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Escapee {
+    pub spawn_id: String,
+    pub session_uid: Option<String>,
+}
+
+fn escapee_store() -> &'static parking_lot::Mutex<HashMap<(i32, i64), Escapee>> {
+    static STORE: std::sync::OnceLock<parking_lot::Mutex<HashMap<(i32, i64), Escapee>>> = std::sync::OnceLock::new();
+    STORE.get_or_init(Default::default)
+}
+
+/// A41.2: the escapees recorded this run, keyed by `(pid, start_sec)`. The
+/// health scan lists the live ones as Leftovers (the user's Clean-up stops
+/// them); nothing signals them automatically.
+pub fn escapees() -> HashMap<(i32, i64), Escapee> {
+    escapee_store().lock().clone()
+}
+
+/// Record the escapees of a stopped row (pid recycling is fenced by the start
+/// time in the key; a pid whose start time cannot be read is not recorded).
+async fn note_escapees(sup: &Supervisor, row: &ProcRow, pids: &[i32]) {
+    if pids.is_empty() {
+        return;
+    }
+    let id = row.spawn_id.clone();
+    let parent = sup.db().read(move |conn| dao::proc::parent_uid(conn, &id)).await.ok().flatten();
+    let session_uid = parent.or_else(|| row.session_id.clone()).filter(|s| !s.is_empty());
+    let mut store = escapee_store().lock();
+    for pid in pids {
+        let Some(start) = procscan::start_time_of(*pid) else { continue };
+        store.insert((*pid, start), Escapee { spawn_id: row.spawn_id.clone(), session_uid: session_uid.clone() });
+    }
+    store.retain(|(pid, _), _| is_alive(*pid));
+    tracing::info!(target: "supervise", spawn_id = %row.spawn_id, escapees = pids.len(), "processes outside the stopped tree are listed, not signalled");
+}
+
+/// Whether the process group `pgid` currently holds a vendor CLI (contract
+/// §9.8: a group with one is never `killpg(SIGKILL)`ed). Fails closed: a scan
+/// that cannot be taken counts as "yes".
+pub fn group_has_vendor(pgid: i32) -> bool {
+    if pgid <= 1 {
+        return true;
+    }
+    match ps_snapshot() {
+        Ok(snap) => snap
+            .pids_in_group(pgid)
+            .into_iter()
+            .any(|pid| procscan::vendor_of_pid(pid).is_some()),
+        Err(_) => true,
+    }
+}
+
+/// Whether `pid` runs a vendor CLI: the plan-time set, or the kernel's answer
+/// now. A live pid whose executable cannot be read at all counts as one
+/// (fail closed: never SIGKILL what we cannot identify).
+fn is_vendor_pid(pid: i32, vendor_pids: &HashSet<i32>) -> bool {
+    if vendor_pids.contains(&pid) {
+        return true;
+    }
+    if procscan::vendor_of_pid(pid).is_some() {
+        return true;
+    }
+    procscan::proc_args(pid).is_none() && procscan::exe_path_of(pid).is_none() && !is_gone(pid)
 }
 
 /// The SIGKILL gate of DESIGN §8-6, exported so the re-check can be exercised
@@ -1040,8 +1473,10 @@ pub fn is_zombie(pid: i32) -> bool {
     if let Some(info) = bsd_info(pid) {
         return info.pbi_status == SZOMB;
     }
-    match procscan::ps_args_of(pid) {
-        Some(args) => args.trim() == DEFUNCT,
+    // The kernel process table still lists a zombie (with `p_stat` = SZOMB)
+    // when `proc_pidinfo` no longer answers; no `ps` is needed (Gilde 2).
+    match procscan::kinfo_of(pid) {
+        Some(k) => k.is_zombie(),
         None => true,
     }
 }

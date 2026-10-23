@@ -1,9 +1,7 @@
 //! The normalised domain model shared by every surface of the app.
 //!
-//! - [`ids`] — UUID v7 newtypes.
-//! - [`graph`] — ★ single owner (T04): node / edge / patch shapes.
-//! - [`status`] — session status, its evidence, node badges and metrics.
+//! - [`status`] — PTY-engine evidence types (source S5 of contract §3.5.1; T06).
+//!
+//! The id newtypes moved to `contract::ids` (contract §3.2, T01).
 
-pub mod graph;
-pub mod ids;
 pub mod status;

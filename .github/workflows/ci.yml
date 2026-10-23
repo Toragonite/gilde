@@ -1,0 +1,140 @@
+# Gilde 2 gates in CI (contract §14.6). Hermetic: no vendor CLI is installed
+# or run; every test uses the fakes (§14.1). The lead's local G0 additionally
+# runs the gates that need the private contract (scripts/gates/ownership-check.mjs,
+# scripts/gates/tsc-measure.mjs) and the release-profile check on release
+# artifacts (scripts/gates/release-profile-check.mjs).
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      browser_gates:
+        description: Run the G4 browser and accessibility gates on a showcase build (after the wave-2 exit)
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  AGENT_CLI_CREDENTIAL_STORE: memory
+  DISABLE_AUTOUPDATER: '1'
+  CARGO_TERM_COLOR: always
+
+jobs:
+  g0-frontend:
+    name: G0 frontend (lint, unit tests, tsc)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm run lint:ui
+      - run: npm run check:version
+      - run: npm run notices:check
+      - name: Front-end unit tests (DOM env, KO locale)
+        run: LANG=ko_KR.UTF-8 npm run test:fe
+      - name: tsc (0 errors in total)
+        run: npx tsc --noEmit -p .
+
+  g0-scripts:
+    name: G0 gate scripts, perf harness and probe kit (dry run)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - name: Script tests (gates, perf harness dry run, live-probe kit against fakes, Chrome self-test)
+        env:
+          GILDE_GATES_CHROME: '1'
+        run: node scripts/gates/test-all.mjs
+      - name: Probe kit dry run (every kit script against the fakes)
+        run: node scripts/live-probe/run.mjs --dry-run
+      - name: Perf harness dry run
+        run: node scripts/perf/run.mjs --dry-run --seconds 3
+
+  g0-sidecar:
+    name: G0 sidecar (build, seam check, tests)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: src-tauri/sidecar/package-lock.json
+      - run: npm ci
+        working-directory: src-tauri/sidecar
+      - run: npm run build
+        working-directory: src-tauri/sidecar
+      - run: npm run typecheck
+        working-directory: src-tauri/sidecar
+      - run: npm test
+        working-directory: src-tauri/sidecar
+
+  g0-rust:
+    name: G0 Rust (build, clippy -D warnings, tests, codegen drift)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: npm ci
+      - run: (cd src-tauri/sidecar && npm ci)
+      - run: npm run node:fetch
+      - run: npm run sidecar:build
+      # Every cargo command runs through the hermetic wrapper (A38.1): env -i,
+      # a temporary HOME and GILDE_HOME, and a refusal when a vendor CLI is
+      # reachable. A plain `cargo test` refuses on a machine with the CLIs.
+      - name: cargo build (hermetic)
+        working-directory: src-tauri
+        run: ../scripts/gates/hermetic-cargo.sh build
+      - name: cargo clippy (hermetic; every feature except l2, A7.10)
+        working-directory: src-tauri
+        run: ../scripts/gates/hermetic-cargo.sh clippy --all-targets --features test-fixtures,ts-export,showcase,probe-log,wakeup-count -- -D warnings
+      - name: cargo test (hermetic HOME and GILDE_HOME)
+        working-directory: src-tauri
+        run: ../scripts/gates/hermetic-cargo.sh test --no-fail-fast
+      - run: npm run lint:forbidden
+      - name: Codegen drift (ts-rs + manifest)
+        run: npm run gen:ipc:check
+
+  g4-browser:
+    name: G4 browser and accessibility gates (showcase build)
+    if: github.event_name == 'workflow_dispatch' && inputs.browser_gates
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - name: The showcase is in a showcase build and absent from a normal build
+        run: node scripts/check-showcase-tree-shaking.mjs
+      - name: Contrast pairs from the tokens (ux-ia §10)
+        run: node scripts/gates/contrast.mjs
+      - name: Floor geometry, Focus Home density, axe, clipping, keyboard flows, snapshots (strict)
+        run: node scripts/gates/browser-gates.mjs --build --strict --out "$RUNNER_TEMP/gate-shots"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gate-snapshots
+          path: ${{ runner.temp }}/gate-shots

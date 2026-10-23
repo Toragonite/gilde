@@ -1,106 +1,128 @@
 /**
- * The five showcase scenes — the landing page's screenshot slots
- * (`site/README.md` § Screenshots) — and how the URL picks one:
+ * The showcase scenes and how the URL picks one.
  *
- *   ?scene=team|workers|health|health-snoozed|grouping   (default team)
- *   &lang=en|ko                           (default en; the app's own language setting)
- *   &theme=system|light|dark              (default system; the app's own theme setting)
- *   &member=<name>|none                   (Team scene: whose details are open; default api)
+ *   ?scene=<name>                 one of SCENE_NAMES (default home)
+ *   &lang=en|ko                   the app language (default en)
+ *   &theme=system|light|dark      (default system)
+ *   &t=<seconds>                  start the patch script at this moment (default 0)
+ *   &live=0|1                     deliver later script steps on timers (default 1);
+ *                                 gates pass live=0 and drive `__gildeShowcase.advanceTo`
+ *   &agents=<n>&teams=<list>      override the world size and teams
+ *                                 (teams: native,nativeInferred,orchestrator or none)
  *
+ * The scenes cover the screens the visual-snapshot and accessibility gates
+ * name (contract §14.3: Home (Focus) — also with its notice and warning line
+ * for the density gate (A26.6) —, Session with a card, Watching, Split 4,
+ * Team Panes/Board/Floor, New session, History, Accounts & health, Quit sheet)
+ * and the Floor geometry sizes (1, 8, 20, 31 agents).
  * A value this build does not know falls back to the default, so a typo still
- * shows a scene rather than nothing.
+ * shows a scene.
  */
 
-import type { Locale, ThemePreference } from '../lib/ipc';
-import type { TeamGroupBy, TeamScope, ViewKey } from '../store/uiSlice';
-import { MAIN_MEMBER } from './world';
-import type { WorldOptions } from './world';
+import type { JsonValue } from '../lib/gen/serde_json/JsonValue';
+import type { Locale } from '../lib/gen/Locale';
+import type { TeamViewMode } from '../lib/gen/TeamViewMode';
+import type { Theme } from '../lib/gen/Theme';
+import type { SheetId } from '../store/uiSlice';
+import { sessionUid } from './ids';
+import type { TeamKind, WorldOptions, WorldRoles } from './world';
 
-export type SceneName = 'team' | 'workers' | 'health' | 'health-snoozed' | 'grouping';
+export const SCENE_NAMES = [
+  'home', 'home-notice', 'empty', 'session', 'changes', 'terminal', 'watching', 'split',
+  'team', 'team-panes', 'board', 'team-floor', 'floor', 'floor-1', 'floor-8', 'floor-20', 'floor-31',
+  'newsession', 'history', 'accounts', 'health', 'settings', 'quit',
+  'history-read', 'recovered',
+] as const;
 
-export const SCENE_NAMES: readonly SceneName[] = ['team', 'workers', 'health', 'health-snoozed', 'grouping'];
+export type SceneName = (typeof SCENE_NAMES)[number];
+
+/** Where the scene opens, given the world's roles: the persisted `lastView` (uiSlice `parseView`). */
+export type SceneView = (roles: WorldRoles) => JsonValue;
 
 export interface SceneSpec {
-  /** The view in front. */
-  view: ViewKey;
   world: WorldOptions;
-  groupBy: TeamGroupBy;
-  scope: TeamScope;
-  /** The health popover is open over the status bar. */
-  popover: boolean;
-  /**
-   * The user closed the action alerts' toasts (which dismisses them, as in the
-   * app): the alerts are snoozed for the cooldown.
-   */
-  snoozeAlerts: boolean;
-  /** The member whose details are open when the URL names none. */
-  member: string | null;
+  view: SceneView;
+  /** Put the world's Split set in `splitSet` (the Split scene). */
+  split: number;
+  /** The layout of the scene's team (`teamLayout:<key>`). */
+  teamMode: TeamViewMode | null;
+  /** A sheet the scene opens once the app has hydrated. */
+  sheet: SheetId | null;
+  /** The quit sheet, through the quit-requested path. */
+  quit: boolean;
+  /** Launch after a quit that stopped sessions: Home shows its one notice (A26.6). */
+  notice: boolean;
 }
 
-export const SCENES: Record<SceneName, SceneSpec> = {
-  // The Team view of one live team, the selected member's details open.
-  team: {
-    view: 'team',
-    world: { allTeams: false, leftover: false },
-    groupBy: 'repository',
-    scope: 'all',
-    popover: false,
-    snoozeAlerts: false,
-    member: MAIN_MEMBER,
-  },
-  // The Worker accounts view: five accounts across the agent CLIs.
-  workers: {
-    view: 'workers',
-    world: { allTeams: false, leftover: false },
-    groupBy: 'repository',
-    scope: 'all',
-    popover: false,
-    snoozeAlerts: false,
-    member: null,
-  },
-  // The Team view with the health popover open: one leftover agent of an ended team.
-  // Its sticky toast is hidden while the popover shows the same alert.
-  health: {
-    view: 'team',
-    world: { allTeams: false, leftover: true },
-    groupBy: 'repository',
-    scope: 'all',
-    popover: true,
-    snoozeAlerts: false,
-    member: null,
-  },
-  // The health scene after the user closed the alert's toast: the alert is
-  // snoozed, the popover says so (never "all well") and still offers the clean-up.
-  'health-snoozed': {
-    view: 'team',
-    world: { allTeams: false, leftover: true },
-    groupBy: 'repository',
-    scope: 'all',
-    popover: true,
-    snoozeAlerts: true,
-    member: null,
-  },
-  // The Team sidebar grouped by repository: three repositories, four teams.
-  grouping: {
-    view: 'team',
-    world: { allTeams: true, leftover: false },
-    groupBy: 'repository',
-    scope: 'all',
-    popover: false,
-    snoozeAlerts: false,
-    member: null,
-  },
+const BASE: WorldOptions = { agents: 12, teams: ['native'], pending: true, leftovers: 2, history: 40 };
+const FLOOR_TEAMS: Readonly<Record<number, readonly TeamKind[]>> = {
+  1: [],
+  8: ['native'],
+  20: ['nativeInferred', 'orchestrator'],
+  31: ['native', 'nativeInferred', 'orchestrator'],
+};
+
+const HOME: JsonValue = { screen: 'home' };
+const home: SceneView = () => HOME;
+const sessionView = (role: keyof Pick<WorldRoles, 'approval' | 'watching' | 'terminal'>, sub: string): SceneView => (roles) => {
+  const uid = roles[role];
+  return uid ? { screen: 'session', uid, sub } : HOME;
+};
+const teamView = (mode: TeamViewMode): SceneView => (roles) => (roles.team ? { screen: 'team', teamKey: roles.team, mode } : HOME);
+
+function scene(partial: Partial<SceneSpec> & Pick<SceneSpec, 'view'>): SceneSpec {
+  return { world: BASE, split: 0, teamMode: null, sheet: null, quit: false, notice: false, ...partial };
+}
+
+function floorScene(agents: number): SceneSpec {
+  return scene({ world: { ...BASE, agents, teams: FLOOR_TEAMS[agents] ?? ['native'], leftovers: 0 }, view: () => ({ screen: 'floor' }) });
+}
+
+export const SCENES: Readonly<Record<SceneName, SceneSpec>> = {
+  home: scene({ view: home }),
+  'home-notice': scene({ world: { ...BASE, quotaHot: true }, view: home, notice: true }),
+  empty: scene({ world: { agents: 0, teams: [], pending: false, leftovers: 0, history: 0 }, view: home }),
+  session: scene({ view: sessionView('approval', 'conversation') }),
+  changes: scene({ view: sessionView('approval', 'changes') }),
+  terminal: scene({ view: sessionView('terminal', 'terminal') }),
+  watching: scene({ view: sessionView('watching', 'conversation') }),
+  split: scene({ view: () => ({ screen: 'split' }), split: 4 }),
+  team: scene({ view: teamView('panes'), teamMode: 'panes' }),
+  // A30.1: a small hosted team whose panes include a starting, a failed and a running unknown pane.
+  'team-panes': scene({ world: { ...BASE, agents: 4, teams: ['native'], pending: false, paneTiles: true }, view: teamView('panes'), teamMode: 'panes' }),
+  board: scene({ world: { ...BASE, teams: ['native', 'nativeInferred'] }, view: teamView('board'), teamMode: 'board' }),
+  'team-floor': scene({ view: teamView('floor'), teamMode: 'floor' }),
+  floor: floorScene(20),
+  'floor-1': floorScene(1),
+  'floor-8': floorScene(8),
+  'floor-20': floorScene(20),
+  'floor-31': floorScene(31),
+  newsession: scene({ view: home, sheet: 'newSession' }),
+  history: scene({ view: () => ({ screen: 'history' }) }),
+  accounts: scene({ view: () => ({ screen: 'accounts', section: 'accounts' }) }),
+  health: scene({ view: () => ({ screen: 'accounts', section: 'health' }) }),
+  settings: scene({ view: () => ({ screen: 'settings' }) }),
+  quit: scene({ view: home, quit: true }),
+  // T18b (A29.2): History's read-only view of a session World does not hold.
+  'history-read': scene({ view: () => ({ screen: 'session', uid: sessionUid(5000), sub: 'conversation' }) }),
+  // T18b (A29.3): the boot sweep's undo window — the Recovered dialog over Home.
+  recovered: scene({ world: { ...BASE, recovery: true }, view: home }),
 };
 
 export interface ShowcaseOptions {
   scene: SceneName;
   locale: Locale;
-  theme: ThemePreference;
-  /** The selected member; null = none. */
-  member: string | null;
+  theme: Theme;
+  /** Seconds into the patch script. */
+  t: number;
+  live: boolean;
+  /** The scene's world, with the URL's overrides applied. */
+  world: WorldOptions;
 }
 
-/** The scene, language, theme and member the query string asks for. Never throws. */
+const TEAM_KINDS: readonly TeamKind[] = ['native', 'nativeInferred', 'orchestrator'];
+
+/** The scene, language, theme, time and world the query string asks for. Never throws. */
 export function parseShowcaseQuery(search: string): ShowcaseOptions {
   let params: URLSearchParams;
   try {
@@ -109,13 +131,19 @@ export function parseShowcaseQuery(search: string): ShowcaseOptions {
     params = new URLSearchParams();
   }
   const sceneParam = params.get('scene') ?? '';
-  const scene: SceneName = (SCENE_NAMES as readonly string[]).includes(sceneParam) ? (sceneParam as SceneName) : 'team';
-  const langParam = params.get('lang');
-  const locale: Locale = langParam === 'ko' ? 'ko' : 'en';
+  const scene: SceneName = (SCENE_NAMES as readonly string[]).includes(sceneParam) ? (sceneParam as SceneName) : 'home';
+  const locale: Locale = params.get('lang') === 'ko' ? 'ko' : 'en';
   const themeParam = params.get('theme');
-  const theme: ThemePreference = themeParam === 'light' || themeParam === 'dark' ? themeParam : 'system';
-  const memberParam = params.get('member');
-  const member =
-    memberParam === null ? SCENES[scene].member : memberParam === '' || memberParam === 'none' ? null : memberParam;
-  return { scene, locale, theme, member };
+  const theme: Theme = themeParam === 'light' || themeParam === 'dark' ? themeParam : 'system';
+  const tRaw = Number(params.get('t') ?? '0');
+  const t = Number.isFinite(tRaw) && tRaw >= 0 && tRaw <= 3600 ? tRaw : 0;
+  const live = params.get('live') !== '0';
+  const world: WorldOptions = { ...SCENES[scene].world };
+  const agents = Number(params.get('agents'));
+  if (params.has('agents') && Number.isInteger(agents) && agents >= 0 && agents <= 200) world.agents = agents;
+  const teams = params.get('teams');
+  if (teams !== null) {
+    world.teams = teams === 'none' ? [] : teams.split(',').filter((k): k is TeamKind => (TEAM_KINDS as readonly string[]).includes(k));
+  }
+  return { scene, locale, theme, t, live, world };
 }

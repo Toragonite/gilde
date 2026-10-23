@@ -8,6 +8,8 @@
 
 import { assert, assertEqual, assertMatch, test } from '../test/harness';
 import {
+  formatCostMicros,
+  formatTokens,
   formatBytes,
   formatCostUsd,
   formatDiffStat,
@@ -112,4 +114,17 @@ test('truncatePath keeps the tail segments', () => {
     'only the last two segments survive',
   );
   assertEqual(truncatePath('/repo', 2), '/repo', 'a short path is untouched');
+});
+
+// -- spend -------------------------------------------------------------------
+
+test('T-ui-unknownSpend: unknown cost and tokens stay unknown, never 0', () => {
+  assertEqual(formatCostMicros(null, 'en'), null, 'unknown cost');
+  assertEqual(formatCostMicros(undefined, 'ko'), null, 'absent cost');
+  assertEqual(formatCostMicros(-5, 'en'), null, 'a negative value is not a cost');
+  assertEqual(formatTokens(null, 'en'), null, 'unknown tokens');
+  assertMatch(formatCostMicros(0, 'en') ?? '', /\$0/, 'a known zero is shown as zero');
+  assertMatch(formatCostMicros(1_234_567, 'en') ?? '', /\$1\.23/, 'micro-USD to dollars');
+  assertMatch(formatTokens(950, 'en') ?? '', /^950$/, 'small counts in full');
+  assertMatch(formatTokens(48_200, 'en') ?? '', /48\.2K/, 'large counts compact');
 });

@@ -1,5 +1,17 @@
 //! The durable PID registry: `Supervisor`, `SpawnPlan`, `SpawnGuard`
-//! (DESIGN §8-2, §8-3, §6-1).
+//! (DESIGN §8-2, §8-3, §6-1), and the [`SupervisorApi`] every Gilde 2 task
+//! spawns through (contract §2.1, §3.8, §9.3, §9.8; owner T09).
+//!
+//! Gilde 2 additions:
+//!
+//! * **the spawn gate** (§2.4 B6): every plan waits for the boot sweep;
+//! * **memory-only mode** (§2.4): no durable row, no spawn — `DISK_FULL`; a
+//!   durable write that fails with `ENOSPC`/read-only enters the mode;
+//! * **the launch allowlist** (§9.3): `SupervisorApi::plan_spawn` refuses an
+//!   `argv[0]` that is not allowlisted for its kind (`REFUSED{notAllowlisted}`);
+//! * **one redaction** (§9.7, F-03): `proc_registry.argv` holds the redacted
+//!   argv (`supervise::redact`); the signature still hashes the raw argv;
+//! * `parent_uid` (§3.8): the owning session, written with the planned row.
 //!
 //! **Write before spawn.** A row describing the child is committed with
 //! `synchronous=FULL` *before* the process exists, so that a hard crash between
@@ -43,13 +55,21 @@ use uuid::Uuid;
 use crate::accounts::AccountSlot;
 use crate::config::ConfigStore;
 use crate::error::{GildeError, Result};
-use crate::events::bus::EventBus;
+use crate::events::Events;
 use crate::store::models::{
     argv_signature, AppInstanceRow, NewPlannedProc, ProcKind, ProcRow, ProcState,
 };
 use crate::store::{dao, now_ms, Db};
+use crate::contract::activity::ExitInfo;
+use crate::contract::ids::ProcessKey;
+use crate::contract::services::{
+    ProcSnapshot, SignalOutcome, SignalPlan, SpawnRequest, SpawnTicket, SupervisorApi,
+};
+use crate::contract::IpcError;
+use crate::lifecycle::memory_only::{MemoryOnly, MemoryOnlyReason};
+use crate::lifecycle::spawn_gate::SpawnGate;
 use crate::supervise::identity::ENV_SPAWN_ID;
-use crate::supervise::procscan::{mask_argv, start_time_of, REDACTED};
+use crate::supervise::procscan::{start_time_of, ScanHub};
 
 /// Environment variable carrying the id of the app instance that started a
 /// child. The untracked-orphan sweep (DESIGN §8-5 step 4) is built on it.
@@ -97,6 +117,33 @@ pub fn account_env_key(vendor: &str) -> Option<&'static str> {
     }
 }
 
+/// A39.1(b): whether a registry row is one of Gilde's own vendor sessions.
+/// Such a row is a vendor CLI for the kill policy (§9.8 [C5]) and for quit
+/// survivor recording (§10.2) **whatever its exec path classifies as** — an
+/// unknown install layout never makes Gilde SIGKILL its own session:
+///
+/// * a row whose `vendor` was recorded at plan time (the classifier knew the
+///   binary, or the command a hosted pane runs);
+/// * every Conversation, `claude attach`, sidecar turn (and the legacy
+///   `headless` turn) and vendor-binary probe (`vendorcli`) row: those kinds
+///   launch nothing but a resolved vendor binary (§3.8, §9.3, A13);
+/// * a PTY or hosted-pane row that a Gilde session owns (`owned_by_session`:
+///   `parent_uid`, or the older `session_id`): Gilde 2 opens PTYs only for a
+///   session's agent and for a lead's pane members.
+///
+/// Sidecar, probe, git and IDE rows are helpers and keep the TERM → KILL
+/// escalation.
+pub fn is_own_vendor_row(kind: ProcKind, vendor: Option<&str>, owned_by_session: bool) -> bool {
+    if vendor.is_some_and(|v| !v.is_empty()) {
+        return true;
+    }
+    match kind {
+        ProcKind::Convo | ProcKind::Attach | ProcKind::Turn | ProcKind::Headless | ProcKind::Vendorcli => true,
+        ProcKind::Pty | ProcKind::Pane => owned_by_session,
+        ProcKind::Sidecar | ProcKind::Gateway | ProcKind::Probe | ProcKind::Git | ProcKind::Ide => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SpawnPlan
 // ---------------------------------------------------------------------------
@@ -104,7 +151,7 @@ pub fn account_env_key(vendor: &str) -> Option<&'static str> {
 /// Everything the registry needs to describe a child *before* it exists.
 ///
 /// `argv` is the **raw** argv, `argv[0]` being the absolute binary path. The
-/// masking happens inside [`Supervisor::plan_spawn`]; callers must not mask
+/// masking happens inside `SupervisorApi::plan_spawn`; callers must not mask
 /// first or fence 2 will hash the wrong thing.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpawnPlan {
@@ -118,6 +165,8 @@ pub struct SpawnPlan {
     pub cwd: PathBuf,
     pub config_dir: Option<PathBuf>,
     pub worktree_id: Option<String>,
+    /// The owning session (contract §3.8), stored in `proc_registry.parent_uid`.
+    pub parent_uid: Option<String>,
 }
 
 impl Default for SpawnPlan {
@@ -132,6 +181,7 @@ impl Default for SpawnPlan {
             cwd: PathBuf::from("/"),
             config_dir: None,
             worktree_id: None,
+            parent_uid: None,
         }
     }
 }
@@ -174,6 +224,11 @@ impl SpawnPlan {
 
     pub fn config_dir(mut self, dir: impl Into<PathBuf>) -> SpawnPlan {
         self.config_dir = Some(dir.into());
+        self
+    }
+
+    pub fn parent(mut self, uid: impl Into<String>) -> SpawnPlan {
+        self.parent_uid = Some(uid.into());
         self
     }
 }
@@ -385,7 +440,17 @@ pub struct Supervisor {
     app_instance_id: String,
     version: String,
     config: Arc<ConfigStore>,
-    events: Option<EventBus>,
+    events: Option<Events>,
+    gate: Arc<SpawnGate>,
+    memory_only: Arc<MemoryOnly>,
+    scans: Arc<ScanHub>,
+    /// Guards of rows planned through [`SupervisorApi::plan_spawn`], keyed by
+    /// spawn id, until the caller reports the exit.
+    tickets: parking_lot::Mutex<std::collections::HashMap<String, SpawnGuard>>,
+    /// Leads whose teammates run in PaneHost (A11.3 `hosted_leads`), noted
+    /// by the composition root when the sessions manager reports a hosted
+    /// lead started, removed when it exits.
+    hosted: parking_lot::Mutex<Vec<crate::discovery::HostedLead>>,
 }
 
 impl std::fmt::Debug for Supervisor {
@@ -443,22 +508,105 @@ impl Supervisor {
             version,
             config,
             events: None,
+            // Tests and tools run no boot sweep: open unless the boot path
+            // installs its own closed gate (`with_spawn_gate`).
+            gate: SpawnGate::opened(),
+            memory_only: MemoryOnly::new(),
+            scans: ScanHub::new(),
+            tickets: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            hosted: parking_lot::Mutex::new(Vec::new()),
         })
+    }
+
+    /// A hosted lead started (PaneHost hosts its teammates): discovery's
+    /// `Hosted` team join reads it through [`crate::discovery::OwnProcesses`].
+    pub fn note_hosted_lead(&self, pid: i32, spawned_at: i64, config_dir: Option<String>) {
+        let mut hosted = self.hosted.lock();
+        hosted.retain(|h| h.pid != pid);
+        hosted.push(crate::discovery::HostedLead {
+            pid,
+            spawned_at,
+            config_dir: config_dir.unwrap_or_default(),
+        });
+    }
+
+    /// A hosted lead exited.
+    pub fn drop_hosted_lead(&self, pid: i32) {
+        self.hosted.lock().retain(|h| h.pid != pid);
+    }
+
+    /// The boot path's gate (closed until the boot sweep opens it, §2.4 B6).
+    pub fn with_spawn_gate(mut self, gate: Arc<SpawnGate>) -> Supervisor {
+        self.gate = gate;
+        self
+    }
+
+    /// The process-wide memory-only state (§2.4).
+    pub fn with_memory_only(mut self, mode: Arc<MemoryOnly>) -> Supervisor {
+        self.memory_only = mode;
+        self
+    }
+
+    /// The shared discovery scan (§2.2.1 `procscan.rs`).
+    pub fn with_scan_hub(mut self, hub: Arc<ScanHub>) -> Supervisor {
+        self.scans = hub;
+        self
+    }
+
+    pub fn spawn_gate_handle(&self) -> &Arc<SpawnGate> {
+        &self.gate
+    }
+
+    pub fn memory_only_state(&self) -> &Arc<MemoryOnly> {
+        &self.memory_only
+    }
+
+    pub fn scan_hub(&self) -> &Arc<ScanHub> {
+        &self.scans
+    }
+
+    /// B5: record when the window became visible (T-boot-2 compares every
+    /// `planned_at` of this instance against it).
+    pub async fn mark_window_visible(&self, at: i64) -> Result<()> {
+        let id = self.app_instance_id.clone();
+        self.db
+            .write_durable(move |conn| {
+                dao::app_instance::set_window_visible(conn, &id, at)?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// A durable write failed: classify it, enter memory-only mode when it is
+    /// a full or read-only disk, and say whether it did.
+    fn note_write_failure(&self, err: &GildeError) -> bool {
+        let reason = match err {
+            GildeError::Io(io) => Some(MemoryOnlyReason::of_io(io)).filter(|r| *r != MemoryOnlyReason::Unwritable),
+            GildeError::Db(msg) => MemoryOnlyReason::of_db_message(msg),
+            _ => None,
+        };
+        match reason {
+            Some(r) => {
+                self.memory_only.enter(r);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Attach the event bus. Separate from [`Supervisor::open_instance`]
     /// because the supervisor is created during boot, before the window (and
     /// therefore the bus) exists.
-    pub fn with_events(mut self, events: EventBus) -> Supervisor {
+    pub fn with_events(mut self, events: Events) -> Supervisor {
         self.events = Some(events);
         self
     }
 
-    pub fn set_events(&mut self, events: EventBus) {
+    pub fn set_events(&mut self, events: Events) {
         self.events = Some(events);
     }
 
-    pub fn events(&self) -> Option<&EventBus> {
+    pub fn events(&self) -> Option<&Events> {
         self.events.as_ref()
     }
 
@@ -495,21 +643,115 @@ impl Supervisor {
             .await
     }
 
-    /// Write the row, then hand back the guard that owns it (DESIGN §8-3).
-    ///
-    /// The INSERT and the `argv_sig` correction go in one transaction under
-    /// `synchronous=FULL`, so the row that reaches the disk is either complete
-    /// or absent.
-    pub async fn plan_spawn(&self, plan: SpawnPlan) -> Result<SpawnGuard> {
+    /// `SupervisorApi::plan_spawn` with the row's guard handed to the caller
+    /// instead of kept until the exit is reported (the registry's own tests
+    /// and fixtures that drive the row by hand). The same checks, in the same
+    /// order: the A13.1/A15.1 ids, the boot gate, the §9.3 allowlist,
+    /// memory-only mode; then the durable row.
+    pub async fn plan_guarded(&self, req: SpawnRequest) -> std::result::Result<SpawnGuard, IpcError> {
+        // A13.1: a malformed request is refused before anything waits or is
+        // planned.
+        validate_spawn_ids(req.kind, req.generation, req.turn_id.as_deref())?;
+        self.gate.wait().await?;
+        // The same check `plan_spawn_now` applies again (A12.8).
+        if !crate::supervise::spawn::is_allowed(Path::new(req.argv0.as_str()), req.kind) {
+            return Err(IpcError::refused(REASON_NOT_ALLOWLISTED));
+        }
+        if self.memory_only.is_active() || self.db.is_memory_only() {
+            return Err(IpcError::disk_full());
+        }
+        let mut argv = Vec::with_capacity(req.args.len() + 1);
+        argv.push(req.argv0.as_str().to_string());
+        argv.extend(req.args.iter().cloned());
+        let cwd = req
+            .cwd
+            .as_ref()
+            .map(|c| PathBuf::from(c.as_str()))
+            .unwrap_or_else(|| PathBuf::from("/"));
+        // A39.1(a): the shared classifier over the whole argv; a hosted pane
+        // (`/bin/sh -c <command>`) records the vendor its command runs.
+        let vendor = crate::supervise::procscan::vendor_of_argv(req.argv0.as_str(), &argv).or_else(|| {
+            if req.kind != crate::contract::process::ProcKind::Pane {
+                return None;
+            }
+            let command = req.args.iter().skip_while(|a| a.as_str() != "-c").nth(1)?;
+            crate::agents::classify::vendor_of_command(command).map(crate::contract::common::Vendor::as_str)
+        });
+        let mut plan = SpawnPlan::new(req.kind.into(), argv, cwd);
+        if let Some(vendor) = vendor {
+            plan = plan.vendor(vendor);
+        }
+        if let Some(uid) = &req.parent_uid {
+            plan = plan.parent(uid.as_str());
+        }
+        // A13.1: the generation and the turn id live in the row, so the
+        // dead-generation sweep (`live_rows_of_generation`) finds the spawn.
+        if let Some(generation) = req.generation {
+            plan = plan.generation(generation);
+        }
+        if let Some(turn_id) = &req.turn_id {
+            plan = plan.run(turn_id.clone());
+        }
+        self.plan_spawn_now(plan).await.map_err(|e| IpcError::from(&e))
+    }
+
+    /// The registry's own unit tests plan rows directly (gate, allowlist,
+    /// row); everything else plans through `SupervisorApi::plan_spawn`
+    /// (A12.8: the legacy public `plan_spawn` is gone, A22.3).
+    #[cfg(test)]
+    async fn plan_spawn(&self, plan: SpawnPlan) -> Result<SpawnGuard> {
         if plan.argv.is_empty() {
             return Err(GildeError::spawn("a spawn plan needs at least argv[0]"));
         }
+        // §2.4 B6: nothing spawns before the boot sweep opened the gate.
+        if self.gate.wait_for(crate::lifecycle::spawn_gate::GATE_WAIT).await.is_err() {
+            return Err(GildeError::Refused {
+                reason: crate::lifecycle::spawn_gate::REASON_BOOT_SWEEP.to_string(),
+            });
+        }
+        self.plan_spawn_now(plan).await
+    }
+
+    /// Register a process that is **already running** (the reaper's adoption
+    /// of an untracked orphan): the same row as `SupervisorApi::plan_spawn`,
+    /// but no gate wait and no allowlist check, because nothing is launched —
+    /// refusing would only leave a live process unsupervised.
+    pub async fn plan_existing(&self, plan: SpawnPlan) -> Result<SpawnGuard> {
+        if plan.argv.is_empty() {
+            return Err(GildeError::spawn("a spawn plan needs at least argv[0]"));
+        }
+        // A41.3: observing a process that already runs is a registry write,
+        // not a spawn, so it never waits on the spawn gate — the boot sweep
+        // registers orphans while the gate it opens is still closed.
+        self.write_plan(plan).await
+    }
+
+    /// `SupervisorApi::plan_spawn` after the gate: the §9.3 allowlist, then
+    /// the row (DESIGN §8-3: the INSERT and the `argv_sig` correction go in
+    /// one transaction under `synchronous=FULL`, so the row that reaches the
+    /// disk is either complete or absent).
+    async fn plan_spawn_now(&self, plan: SpawnPlan) -> Result<SpawnGuard> {
+        check_allowlist(&plan)?;
+        check_plan_ids(&plan)?;
+        self.write_plan(plan).await
+    }
+
+    /// Write the planned row (memory-only mode refuses).
+    async fn write_plan(&self, plan: SpawnPlan) -> Result<SpawnGuard> {
+        if plan.argv.is_empty() {
+            return Err(GildeError::spawn("a spawn plan needs at least argv[0]"));
+        }
+        // §2.4: a spawn needs a durable row; memory-only mode has none.
+        if self.memory_only.is_active() || self.db.is_memory_only() {
+            return Err(GildeError::Io(std::io::Error::from_raw_os_error(libc::ENOSPC)));
+        }
 
         let spawn_id = Uuid::now_v7().to_string();
-        // Fence 2 hashes the *unmasked* argv; the stored `argv` is masked. See
-        // the module header for why the two must disagree.
+        // Fence 2 hashes the *unmasked* argv; the stored `argv` is redacted
+        // (contract §9.7). See the module header for why the two must disagree.
         let raw_sig = argv_signature(&plan.argv);
         let masked = mask_argv_vec(&plan.argv);
+        let parent_uid = plan.parent_uid.clone();
 
         let planned = NewPlannedProc {
             spawn_id: spawn_id.clone(),
@@ -532,7 +774,8 @@ impl Supervisor {
         };
 
         let row_id = spawn_id.clone();
-        self.db
+        let written = self
+            .db
             .write_durable(move |conn| {
                 let tx = conn.unchecked_transaction()?;
                 dao::proc::insert_planned(&tx, &planned)?;
@@ -540,10 +783,19 @@ impl Supervisor {
                     "UPDATE proc_registry SET argv_sig = ?2 WHERE spawn_id = ?1",
                     rusqlite::params![row_id, raw_sig],
                 )?;
+                if let Some(uid) = &parent_uid {
+                    dao::proc::set_parent_uid(&tx, &row_id, uid)?;
+                }
                 tx.commit()?;
                 Ok(())
             })
-            .await?;
+            .await;
+        if let Err(err) = written {
+            if self.note_write_failure(&err) {
+                return Err(GildeError::Io(std::io::Error::from_raw_os_error(libc::ENOSPC)));
+            }
+            return Err(err);
+        }
 
         tracing::debug!(
             target: "supervise",
@@ -553,6 +805,54 @@ impl Supervisor {
             "spawn planned"
         );
 
+        Ok(SpawnGuard::new(self.db.clone(), spawn_id))
+    }
+
+    /// A synchronous plan for the `ps`/`lsof` fallbacks and the PATH probe
+    /// (`probe` rows, contract §3.8). No gate: the boot sweep's own identity
+    /// checks may need it before the gate opens.
+    pub fn plan_spawn_blocking(&self, plan: SpawnPlan) -> Result<SpawnGuard> {
+        if plan.argv.is_empty() {
+            return Err(GildeError::spawn("a spawn plan needs at least argv[0]"));
+        }
+        check_allowlist(&plan)?;
+        if self.memory_only.is_active() || self.db.is_memory_only() {
+            return Err(GildeError::Io(std::io::Error::from_raw_os_error(libc::ENOSPC)));
+        }
+        let spawn_id = Uuid::now_v7().to_string();
+        let raw_sig = argv_signature(&plan.argv);
+        let planned = NewPlannedProc {
+            spawn_id: spawn_id.clone(),
+            app_instance: self.app_instance_id.clone(),
+            generation: plan.generation,
+            kind: plan.kind,
+            vendor: plan.vendor.clone(),
+            session_id: plan.session_id.clone(),
+            run_id: plan.run_id.clone(),
+            argv: mask_argv_vec(&plan.argv),
+            cwd: plan.cwd.to_string_lossy().into_owned(),
+            config_dir: None,
+            worktree_id: None,
+            keep_alive: false,
+            planned_at: now_ms(),
+            note: None,
+        };
+        let row_id = spawn_id.clone();
+        self.db.blocking(move |conn| {
+            conn.pragma_update(None, "synchronous", "FULL")?;
+            let result = (|| -> Result<()> {
+                let tx = conn.unchecked_transaction()?;
+                dao::proc::insert_planned(&tx, &planned)?;
+                tx.execute(
+                    "UPDATE proc_registry SET argv_sig = ?2 WHERE spawn_id = ?1",
+                    rusqlite::params![row_id, raw_sig],
+                )?;
+                tx.commit()?;
+                Ok(())
+            })();
+            let _ = conn.pragma_update(None, "synchronous", "NORMAL");
+            result
+        })?;
         Ok(SpawnGuard::new(self.db.clone(), spawn_id))
     }
 
@@ -651,14 +951,11 @@ impl Supervisor {
         }
 
         if let Some(account) = account {
-            match (account_env_key(&account.vendor), &account.config_dir) {
-                (Some(key), Some(dir)) => {
-                    env.insert(key.to_string(), dir.clone());
-                }
-                // The ambient slot has no directory of its own, and a vendor
-                // without directory-based switching has no key to set. Neither
-                // is an error.
-                _ => {}
+            // The ambient slot has no directory of its own, and a vendor
+            // without directory-based switching has no key to set. Neither
+            // is an error.
+            if let (Some(key), Some(dir)) = (account_env_key(&account.vendor), &account.config_dir) {
+                env.insert(key.to_string(), dir.clone());
             }
         }
 
@@ -673,129 +970,344 @@ impl Supervisor {
 // argv masking
 // ---------------------------------------------------------------------------
 
-/// Mask an argv **element-wise** for storage in `proc_registry.argv`.
-///
-/// [`mask_argv`] works on one string, which covers `--token=<secret>` and
-/// `Bearer <secret>` when both halves live in the same element. A CLI just as
-/// often takes `--token <secret>` as two separate arguments, and after
-/// `Vec<String>` splitting there is no single string for the regex to see —
-/// hence the extra "previous element was a credential flag" rule here.
+/// The stored form of an argv: the one redaction of contract §9.7
+/// ([`crate::supervise::redact::redact_argv`]). Kept under its old name for
+/// the call sites that already use it.
 pub fn mask_argv_vec(argv: &[String]) -> Vec<String> {
-    let mut out = Vec::with_capacity(argv.len());
-    let mut redact_next = false;
-    for arg in argv {
-        if redact_next {
-            out.push(REDACTED.to_string());
-            redact_next = false;
-            continue;
-        }
-        redact_next = is_credential_flag(arg);
-        out.push(mask_argv(arg));
-    }
-    out
-}
-
-/// A bare `--token` / `-p`-style flag whose *value* is the next argument.
-/// Only exact flag names count: a `--token=x` form is already handled by the
-/// regex, and matching prefixes would redact unrelated arguments.
-fn is_credential_flag(arg: &str) -> bool {
-    let name = arg
-        .strip_prefix("--")
-        .or_else(|| arg.strip_prefix('-'))
-        .unwrap_or("");
-    if name.is_empty() || arg == "--" {
-        return false;
-    }
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "api-key" | "api_key" | "apikey" | "token" | "password" | "secret"
-    )
+    crate::supervise::redact::redact_argv(argv)
 }
 
 // ---------------------------------------------------------------------------
-// git spawn hook — DESIGN §8-1 "맨몸 spawn은 금지다"
+// discovery::OwnProcesses (A11.3)
 // ---------------------------------------------------------------------------
 
-/// [`SpawnGuard`] as the ticket `worktree::git` hands its spawns.
-///
-/// The trait methods swallow database errors on purpose: a registry write that
-/// fails must not turn a working `git status` into a user-visible failure. The
-/// failure is logged, and the row stays in whatever state it reached — which
-/// the reaper then resolves, exactly as it does after a crash.
-impl crate::worktree::git::SpawnTicket for SpawnGuard {
-    fn env_marker(&self) -> String {
-        SpawnGuard::env_marker(self).to_string()
-    }
-
-    fn mark_running(&self, pid: i32, pgid: i32) {
-        if let Err(err) = SpawnGuard::mark_running(self, pid, pgid) {
-            tracing::warn!(
-                target: "supervise",
-                spawn_id = %self.spawn_id,
-                error = %err,
-                "could not record a git spawn as running"
-            );
+/// Gilde's own processes as the registry knows them (A11.3): discovery asks
+/// before it classifies, so a process Gilde started is never "external".
+/// Called on the discovery thread (a plain thread, never a runtime worker),
+/// so the registry is read synchronously; a read error is "not ours".
+impl crate::discovery::OwnProcesses for Supervisor {
+    fn lookup(&self, pid: i32, start_sec: i64) -> Option<crate::discovery::OwnMatch> {
+        if pid <= 0 {
+            return None;
         }
+        let rows = self
+            .db
+            .blocking(|conn| dao::proc::by_pid(conn, i64::from(pid)))
+            .ok()?;
+        rows.into_iter()
+            .find(|r| r.proc_start_ts.is_some_and(|s| (s - start_sec).abs() <= 1))
+            .map(|r| crate::discovery::OwnMatch {
+                this_instance: r.app_instance == self.app_instance_id,
+                spawn_id: r.spawn_id,
+            })
     }
 
-    fn mark_exited(&self, code: Option<i32>, signal: Option<i32>) {
-        if let Err(err) = SpawnGuard::mark_exited(self, code, signal) {
-            tracing::warn!(
-                target: "supervise",
-                spawn_id = %self.spawn_id,
-                error = %err,
-                "could not record a git spawn as exited"
-            );
+    fn match_planned(&self, argv: &[String], cwd: Option<&str>) -> Option<String> {
+        if argv.is_empty() {
+            return None;
         }
+        // The row keeps the signature of the unmasked argv (fence 2), so the
+        // raw argv discovery read matches it exactly; the cwd must agree when
+        // discovery knows it.
+        let sig = crate::supervise::identity::argv_sig_of(argv);
+        let me = self.app_instance_id.clone();
+        let rows = self
+            .db
+            .blocking(|conn| dao::proc::planned_before(conn, &me, now_ms().saturating_add(1)))
+            .ok()?;
+        rows.into_iter()
+            .rev()
+            .find(|r| {
+                r.state == ProcState::Planned
+                    && r.pid.is_none()
+                    && r.argv_sig == sig
+                    && cwd.is_none_or(|c| c == r.cwd)
+            })
+            .map(|r| r.spawn_id)
+    }
+
+    fn hosted_leads(&self) -> Vec<crate::discovery::HostedLead> {
+        let mut hosted = self.hosted.lock();
+        hosted.retain(|h| crate::supervise::spawn::is_alive(h.pid));
+        hosted.clone()
     }
 }
 
-/// The write-before-spawn hook `worktree::git` calls for every `git` process
-/// and for the worktree post-create command.
-pub struct RegistrySpawnHook {
-    supervisor: Arc<Supervisor>,
-}
+// ---------------------------------------------------------------------------
+// SupervisorApi (contract §2.1, §3.8, §9.3, §9.8)
+// ---------------------------------------------------------------------------
 
-impl RegistrySpawnHook {
-    pub fn new(supervisor: Arc<Supervisor>) -> RegistrySpawnHook {
-        RegistrySpawnHook { supervisor }
-    }
-}
+/// The refusal reason of a launch outside the §9.3 allowlist.
+pub const REASON_NOT_ALLOWLISTED: &str = "notAllowlisted";
 
-impl crate::worktree::git::SpawnHook for RegistrySpawnHook {
-    fn plan<'a>(
-        &'a self,
-        kind: &'a str,
-        argv: &'a [String],
-        cwd: &'a Path,
-    ) -> crate::worktree::git::BoxFuture<'a, Option<Box<dyn crate::worktree::git::SpawnTicket>>>
-    {
-        Box::pin(async move {
-            let kind = ProcKind::from_db_str(kind).unwrap_or(ProcKind::Probe);
-            let plan = SpawnPlan::new(kind, argv.to_vec(), cwd);
-            match self.supervisor.plan_spawn(plan).await {
-                Ok(guard) => Some(Box::new(guard) as Box<dyn crate::worktree::git::SpawnTicket>),
-                Err(err) => {
-                    // Refusing to run `git` because the registry is unwritable
-                    // would make a database problem look like a git problem.
-                    // The spawn proceeds untracked and says so, loudly.
-                    tracing::error!(
-                        target: "supervise",
-                        error = %err,
-                        kind = %kind,
-                        "could not plan a git spawn; it will run untracked"
-                    );
-                    None
-                }
-            }
+/// §9.3 enforcement 1 for every launch the supervisor plans:
+/// `REFUSED{notAllowlisted}` when `argv[0]` is not allowlisted for the plan's
+/// kind. Shared by the blocking probe path and `SupervisorApi::plan_spawn`
+/// (A12.8).
+fn check_allowlist(plan: &SpawnPlan) -> Result<()> {
+    let Some(argv0) = plan.argv.first() else {
+        return Err(GildeError::spawn("a spawn plan needs at least argv[0]"));
+    };
+    if crate::supervise::spawn::is_allowed(Path::new(argv0), plan.kind) {
+        Ok(())
+    } else {
+        tracing::warn!(target: "supervise", kind = %plan.kind, "launch refused: not allowlisted");
+        Err(GildeError::Refused {
+            reason: REASON_NOT_ALLOWLISTED.to_string(),
         })
     }
 }
 
-/// Route `worktree::git`'s spawns through the registry. Idempotent — the first
-/// installation wins (`false` on a later call).
-pub fn install_git_spawn_hook(supervisor: Arc<Supervisor>) -> bool {
-    crate::worktree::git::install_spawn_hook(Arc::new(RegistrySpawnHook::new(supervisor)))
+/// The longest turn id a `Turn` spawn may carry (A13.1).
+pub const TURN_ID_MAX_BYTES: usize = 128;
+
+/// A13.1 as amended by A15.1: `generation` is required (≥ 1) for `Sidecar`
+/// and `Turn`, optional (≥ 1 when present) for `Vendorcli` — present exactly
+/// when the sidecar spawns the probe, so the dead-generation sweep finds a
+/// probe orphaned by a sidecar crash — and reserved for every other kind;
+/// `turn_id` is required for `Turn` (≤ 128 bytes, no control characters) and
+/// reserved otherwise. A violation is `INVALID_ARGUMENT{field:
+/// "generation"|"turnId", rule}` (`range` for a `Vendorcli` generation < 1).
+pub fn validate_spawn_ids(
+    kind: crate::contract::process::ProcKind,
+    generation: Option<i64>,
+    turn_id: Option<&str>,
+) -> std::result::Result<(), IpcError> {
+    use crate::contract::process::ProcKind as K;
+    let needs_generation = matches!(kind, K::Sidecar | K::Turn);
+    let may_have_generation = kind == K::Vendorcli;
+    match generation {
+        Some(g) if needs_generation && g >= 1 => {}
+        Some(_) if needs_generation => return Err(IpcError::invalid_argument("generation", "required")),
+        None if needs_generation => return Err(IpcError::invalid_argument("generation", "required")),
+        Some(g) if may_have_generation && g >= 1 => {}
+        Some(_) if may_have_generation => return Err(IpcError::invalid_argument("generation", "range")),
+        Some(_) => return Err(IpcError::invalid_argument("generation", "reserved")),
+        None => {}
+    }
+    match (kind == K::Turn, turn_id) {
+        (true, None | Some("")) => return Err(IpcError::invalid_argument("turnId", "required")),
+        (true, Some(id)) if id.len() > TURN_ID_MAX_BYTES => {
+            return Err(IpcError::invalid_argument("turnId", "maxLength"))
+        }
+        (true, Some(id)) if id.chars().any(char::is_control) => {
+            return Err(IpcError::invalid_argument("turnId", "control"))
+        }
+        (false, Some(_)) => return Err(IpcError::invalid_argument("turnId", "reserved")),
+        _ => {}
+    }
+    Ok(())
+}
+
+/// The required half of [`validate_spawn_ids`] for every plan (the legacy
+/// path included): a `sidecar` or `turn` row without a generation (or a
+/// `turn` row without a valid turn id) would escape the dead-generation
+/// sweep. Legacy sidecar code still stamps generations on other kinds, so
+/// "reserved" is enforced on the `SupervisorApi` path only (A13.1).
+fn check_plan_ids(plan: &SpawnPlan) -> Result<()> {
+    use crate::contract::process::ProcKind as K;
+    let kind = match plan.kind {
+        ProcKind::Sidecar => K::Sidecar,
+        ProcKind::Turn => K::Turn,
+        _ => return Ok(()),
+    };
+    let generation = (plan.generation != 0).then_some(plan.generation);
+    let turn_id = if kind == K::Turn { plan.run_id.as_deref() } else { None };
+    validate_spawn_ids(kind, generation, turn_id).map_err(|e| {
+        GildeError::spawn(format!(
+            "invalid {} ({})",
+            e.params.get("field").and_then(|v| v.as_str()).unwrap_or("?"),
+            e.params.get("rule").and_then(|v| v.as_str()).unwrap_or("?"),
+        ))
+    })
+}
+
+/// `x_<pid>_<start seconds>` → `(pid, start)`.
+pub fn parse_process_key(key: &ProcessKey) -> Option<(i32, i64)> {
+    let rest = key.as_str().strip_prefix("x_")?;
+    let (pid, start) = rest.split_once('_')?;
+    Some((pid.parse().ok()?, start.parse().ok()?))
+}
+
+impl Supervisor {
+    /// The fenced signal behind [`SupervisorApi::signal`] and `health_stop`.
+    ///
+    /// A key that names a live registry row (same pid, start time ±1 s) goes
+    /// through `kill_tree` and its three identity fences; any other process is
+    /// signalled only if its kernel start time still equals the key's, through
+    /// the bare-pid path (no group signal for a process we did not create).
+    /// Vendor CLIs are never escalated to SIGKILL (`supervise::kill`).
+    pub async fn signal_key(
+        &self,
+        target: &ProcessKey,
+        plan: SignalPlan,
+    ) -> std::result::Result<SignalOutcome, IpcError> {
+        let Some((pid, start)) = parse_process_key(target) else {
+            return Err(IpcError::not_found("process"));
+        };
+        // A42.1: a `SignalPlan` never escalates ("the plan type has no
+        // SIGKILL", C5): fenced HUP/TERM, wait the grace, report survivors.
+        let opts = match plan {
+            SignalPlan::Term { grace_ms } => crate::supervise::kill::KillOpts::default()
+                .grace(std::time::Duration::from_millis(u64::from(grace_ms))),
+            SignalPlan::HupThenTerm { grace_ms } => crate::supervise::kill::KillOpts::default()
+                .grace(std::time::Duration::from_millis(u64::from(grace_ms)))
+                .hup_first(true),
+        }
+        .escalate(false);
+        let rows = self
+            .db
+            .read(move |conn| dao::proc::by_pid(conn, i64::from(pid)))
+            .await
+            .map_err(|e| IpcError::from(&e))?;
+        let row = rows.into_iter().find(|r| {
+            r.state.is_live() && r.proc_start_ts.is_some_and(|s| (s - start).abs() <= 1)
+        });
+        let report = match row {
+            Some(row) => crate::supervise::kill::kill_tree(self, &row.spawn_id, opts).await,
+            // A42.1: a pid with no Gilde row is signalled alone.
+            None => match start_time_of(pid) {
+                Some(live) if (live - start).abs() <= 1 => {
+                    crate::supervise::kill::kill_single_pid(self, pid, opts).await
+                }
+                Some(_) => return Err(IpcError::refused("startTimeChanged")),
+                None => {
+                    return Ok(SignalOutcome {
+                        exited: true,
+                        survivor: false,
+                    })
+                }
+            },
+        };
+        if let Some(reason) = report.refused_reason.as_deref() {
+            if reason == crate::supervise::kill::reason::GONE {
+                return Ok(SignalOutcome {
+                    exited: true,
+                    survivor: false,
+                });
+            }
+            return Err(IpcError::refused(reason));
+        }
+        Ok(SignalOutcome {
+            exited: report.survivors.is_empty(),
+            survivor: !report.survivors.is_empty(),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl SupervisorApi for Supervisor {
+    async fn spawn_gate(&self) -> std::result::Result<(), IpcError> {
+        self.gate.wait().await
+    }
+
+    async fn plan_spawn(&self, req: SpawnRequest) -> std::result::Result<SpawnTicket, IpcError> {
+        let guard = self.plan_guarded(req).await?;
+        let ticket = SpawnTicket {
+            spawn_id: guard.spawn_id().to_string(),
+            env_marker: guard.env_marker().to_string(),
+        };
+        self.tickets.lock().insert(ticket.spawn_id.clone(), guard);
+        Ok(ticket)
+    }
+
+    async fn mark_running(&self, ticket: &SpawnTicket, pid: i32) -> std::result::Result<(), IpcError> {
+        let pgid = crate::supervise::spawn::pgid_of(pid).unwrap_or(pid);
+        let tickets = self.tickets.lock();
+        match tickets.get(&ticket.spawn_id) {
+            Some(guard) => guard.mark_running(pid, pgid).map_err(|e| IpcError::from(&e)),
+            None => Err(IpcError::not_found("spawn")),
+        }
+    }
+
+    async fn mark_exited(&self, ticket: &SpawnTicket, exit: ExitInfo) {
+        let guard = self.tickets.lock().remove(&ticket.spawn_id);
+        let result = match guard {
+            Some(guard) => guard.mark_exited(exit.code, exit.signal),
+            None => {
+                let id = ticket.spawn_id.clone();
+                let at = now_ms();
+                self.db
+                    .write(move |conn| {
+                        dao::proc::mark_exited(
+                            conn,
+                            &id,
+                            exit.code.map(i64::from),
+                            exit.signal.map(i64::from),
+                            at,
+                        )?;
+                        Ok(())
+                    })
+                    .await
+            }
+        };
+        if let Err(err) = result {
+            tracing::warn!(target: "supervise", spawn_id = %ticket.spawn_id, error = %err, "could not record an exit");
+        }
+    }
+
+    async fn signal(&self, target: &ProcessKey, plan: SignalPlan) -> std::result::Result<SignalOutcome, IpcError> {
+        self.signal_key(target, plan).await
+    }
+
+    fn is_vendor_cli(&self, exec_path: &str) -> bool {
+        crate::supervise::procscan::vendor_of_argv::<&str>(exec_path, &[]).is_some()
+    }
+
+    fn redact_argv(&self, argv: &[String]) -> Vec<String> {
+        crate::supervise::redact::redact_argv(argv)
+    }
+
+    fn memory_only(&self) -> Option<String> {
+        self.memory_only
+            .reason_str()
+            .or_else(|| self.db.is_memory_only().then(|| "unwritable".to_string()))
+    }
+
+    fn last_scan(&self) -> Option<ProcSnapshot> {
+        self.scans.latest().map(|s| (*s).clone())
+    }
+}
+
+/// [`crate::supervise::procscan::ProbeRegistrar`] over the registry: the
+/// `ps`/`lsof` fallbacks become `probe` rows (contract §3.8).
+pub struct ProbeHook {
+    supervisor: Arc<Supervisor>,
+}
+
+impl ProbeHook {
+    pub fn new(supervisor: Arc<Supervisor>) -> ProbeHook {
+        ProbeHook { supervisor }
+    }
+}
+
+struct ProbeGuardRow(SpawnGuard);
+
+impl crate::supervise::procscan::ProbeRow for ProbeGuardRow {
+    fn env_marker(&self) -> String {
+        self.0.env_marker().to_string()
+    }
+
+    fn running(&self, pid: i32, pgid: i32) {
+        let _ = self.0.mark_running(pid, pgid);
+    }
+
+    fn exited(&self, code: Option<i32>, signal: Option<i32>) {
+        let _ = self.0.mark_exited(code, signal);
+    }
+}
+
+impl crate::supervise::procscan::ProbeRegistrar for ProbeHook {
+    fn plan(&self, argv: &[String]) -> Option<Box<dyn crate::supervise::procscan::ProbeRow>> {
+        let plan = SpawnPlan::new(ProcKind::Probe, argv.to_vec(), "/");
+        match self.supervisor.plan_spawn_blocking(plan) {
+            Ok(guard) => Some(Box::new(ProbeGuardRow(guard))),
+            Err(err) => {
+                tracing::debug!(target: "supervise", error = %err, "probe row not written; the fallback does not run");
+                None
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -811,6 +1323,15 @@ mod tests {
     }
 
     async fn fixture() -> Fixture {
+        // The argv[0]s these tests plan, allowlisted for their kinds (§9.3).
+        for (path, kind) in [
+            ("/bin/agent", ProcKind::Pty),
+            ("/bin/echo", ProcKind::Probe),
+            ("/usr/bin/git", ProcKind::Git),
+            ("/bin/false", ProcKind::Probe),
+        ] {
+            crate::supervise::spawn::allow_executable(Path::new(path), &[kind]);
+        }
         let dir = tempfile::tempdir().expect("tempdir");
         let db = Db::open_in_memory().expect("db");
         let config = Arc::new(ConfigStore::open_at(&dir.path().join("config.json")).expect("config"));
@@ -911,7 +1432,7 @@ mod tests {
             "argv is stored masked: {}",
             row.argv
         );
-        assert!(row.argv.contains(REDACTED));
+        assert!(row.argv.contains(crate::supervise::redact::REDACTED));
         // … but the signature is over the *raw* argv, or fence 2 could never
         // match the live process.
         assert_eq!(row.argv_sig, argv_signature(&plan.argv));
@@ -1200,7 +1721,7 @@ mod tests {
     // -- masking ----------------------------------------------------------
 
     #[test]
-    fn mask_argv_vec_redacts_both_the_joined_and_the_split_forms() {
+    fn mask_argv_vec_is_the_contract_redaction() {
         let masked = mask_argv_vec(&argv(&[
             "/bin/agent",
             "--api-key=sk-abcdefghijklmnopqrst",
@@ -1212,11 +1733,12 @@ mod tests {
         assert_eq!(masked[0], "/bin/agent");
         assert!(!masked[1].contains("sk-abcdefghijklmnopqrst"), "{:?}", masked[1]);
         assert_eq!(masked[2], "--token");
-        assert_eq!(masked[3], REDACTED, "the value after a bare flag is the secret");
+        assert_eq!(masked[3], crate::supervise::redact::REDACTED, "the value after a secret flag");
         assert_eq!(masked[4], "--");
         assert_eq!(
-            masked[5], "write a haiku",
-            "the user's prompt is not a secret and is not masked"
+            masked[5],
+            crate::supervise::redact::PROMPT,
+            "the user's prompt is content (contract §9.7 rule 5)"
         );
     }
 
@@ -1224,16 +1746,6 @@ mod tests {
     fn mask_argv_vec_leaves_ordinary_arguments_alone() {
         let plain = argv(&["/usr/bin/git", "-C", "/repo", "status", "--porcelain=v2"]);
         assert_eq!(mask_argv_vec(&plain), plain);
-    }
-
-    #[test]
-    fn credential_flags_are_matched_exactly() {
-        assert!(is_credential_flag("--token"));
-        assert!(is_credential_flag("--API-KEY"));
-        assert!(is_credential_flag("-password"));
-        assert!(!is_credential_flag("--tokenizer"));
-        assert!(!is_credential_flag("--"));
-        assert!(!is_credential_flag("token"));
     }
 
     #[test]

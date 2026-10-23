@@ -1,0 +1,4 @@
+{"timestamp":"2026-10-21T04:25:05.000Z","type":"session_meta","payload":{"id":"{{SID}}","timestamp":"2026-10-21T04:25:05.000Z","cwd":"{{CWD}}","originator":"codex_cli_rs","cli_version":"0.50.0","instructions":"CANARY-7f3a-CONTENT","source":"cli","git":{"branch":"main"}}}
+{"timestamp":"2026-10-21T04:25:06.000Z","type":"event_msg","payload":{"type":"task_started"}}
+{"timestamp":"2026-10-21T04:25:07.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"CANARY-7f3a-CONTENT"}]}}
+{"timestamp":"2026-10-21T04:25:09.000Z","type":"event_msg","payload":{"type":"task_complete"}}

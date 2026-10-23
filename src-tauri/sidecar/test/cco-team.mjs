@@ -478,7 +478,7 @@ function startSidecar() {
     env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME, LANG: 'en_US.UTF-8' },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
-  const state = { child, pending: new Map(), nextId: 0, buffered: '', snapshots: [], rawSnapshots: [], logs: [], stderr: [] };
+  const state = { child, pending: new Map(), nextId: 0, buffered: '', snapshots: [], envelopes: [], rawSnapshots: [], logs: [], stderr: [] };
   child.stdout.setEncoding('utf8');
   child.stdout.on('data', (chunk) => {
     state.buffered += chunk;
@@ -500,8 +500,12 @@ function startSidecar() {
 function onSidecarLine(state, line) {
   const msg = JSON.parse(line);
   if (typeof msg.method === 'string') {
-    if (msg.method === 'cco.team.snapshot') {
-      state.snapshots.push(msg.params);
+    if (msg.method === 'orch.snapshot') {
+      // Protocol 2 (contract §4.5 OrchSnapshotParams): {generation, rev, team: {teamId, view}}.
+      // Flattened to the old {rev, teamId, view} so every check below reads the same.
+      const p = msg.params;
+      state.envelopes.push(p);
+      state.snapshots.push({ rev: p.rev, teamId: p.team?.teamId, view: p.team?.view });
       state.rawSnapshots.push(line);
     } else if (msg.method === 'host.log') state.logs.push(msg.params);
     if (msg.id !== undefined && msg.id !== null) {
@@ -597,36 +601,54 @@ async function main() {
 
   sc = startSidecar();
 
+  // ── O. presence gating (contract §4.5, §5.10, PM-22) ───────────────────────
+  // The orch.* methods exist only while the host says the orchestrator is present.
+  const beforeHello = await expectError(call(sc, 'orch.team.list', { roots: [PROJECT], panePids: [] }));
+  check('O1 before mesh.hello the orchestrator methods do not exist', beforeHello?.code === -32601, String(beforeHello?.code));
+  const buildId = JSON.parse(readFileSync(join(sidecarDir, 'package.json'), 'utf8')).version;
+  const helloId = process.env.GILDE_BUILD_ID && process.env.GILDE_BUILD_ID !== '' ? process.env.GILDE_BUILD_ID : buildId;
+  await call(sc, 'mesh.hello', { protocol: 2, buildId: helloId, appInstanceId: 'cco-team-test', providers: { orchestrator: false } });
+  const absent = await expectError(call(sc, 'orch.workers', { roots: [PROJECT], panePids: [] }));
+  check('O2 orchestrator absent: orch.workers is an unknown method', absent?.code === -32601, String(absent?.code));
+  await call(sc, 'mesh.configure', { binaries: {}, accounts: [], providers: { orchestrator: true } });
+  const present = await call(sc, 'orch.team.subscribe', { roots: [], panePids: [] });
+  check('O3 orchestrator present: orch.team.subscribe answers like orch.team.list', present?.supported === true || present?.available !== undefined, JSON.stringify(present).slice(0, 120));
+  await call(sc, 'mesh.configure', { binaries: {}, accounts: [], providers: { orchestrator: false } });
+  const gone = await expectError(call(sc, 'orch.team.get', { teamId: TEAM_ID }));
+  check('O4 the orchestrator went away: its methods are removed again', gone?.code === -32601, String(gone?.code));
+  await call(sc, 'mesh.configure', { binaries: {}, accounts: [], providers: { orchestrator: true } });
+
   // ── K0. workers with no host in sight (Plan #3c) ───────────────────────────
   section('K0. workers with no host');
   {
-    const none = await call(sc, 'cco.workers', { roots: [join(HOME, 'no-such-project')], panePids: [] });
+    const none = await call(sc, 'orch.workers', { roots: [join(HOME, 'no-such-project')], panePids: [] });
     check(
       'K0 no host in sight: no snapshot (null, not an empty one), unavailable no-host, not stale',
       none.supported === true && none.snapshot === null && none.unavailable?.reason === 'no-host' && none.stale === false && none.minPollMs === 60_000,
       JSON.stringify(none),
     );
-    const badRefresh = await expectError(call(sc, 'cco.workers', { refresh: 'yes' }));
+    const badRefresh = await expectError(call(sc, 'orch.workers', { refresh: 'yes' }));
     check('K0b a refresh that is not a boolean is -32602', badRefresh !== null && badRefresh.code === -32602, String(badRefresh?.code));
   }
 
   // ── H. params ──────────────────────────────────────────────────────────────
   section('H. params');
   {
-    const bad = await expectError(call(sc, 'cco.team.get', { teamId: '../../etc' }));
+    const bad = await expectError(call(sc, 'orch.team.get', { teamId: '../../etc' }));
     check('H1 a team id that is not TEAM_ID is -32602', bad !== null && bad.code === -32602, String(bad?.code));
-    const badRoots = await expectError(call(sc, 'cco.team.list', { roots: '/', panePids: [] }));
+    const badRoots = await expectError(call(sc, 'orch.team.list', { roots: '/', panePids: [] }));
     check('H2 roots that are not an array are -32602', badRoots !== null && badRoots.code === -32602, String(badRoots?.code));
-    const fsRoot = await call(sc, 'cco.team.list', { roots: ['/'], panePids: [] });
+    const fsRoot = await call(sc, 'orch.team.list', { roots: ['/'], panePids: [] });
     await sleep(settle(300));
     check('H3 a filesystem root is never a scope (nothing connected)', h1.connections === 0 && fsRoot.hosts.length === 0, `${h1.connections} ${JSON.stringify(fsRoot.hosts)}`);
-    const unknown = await call(sc, 'cco.team.get', { teamId: 'tmnotknown12' });
+    const unknown = await call(sc, 'orch.team.get', { teamId: 'tmnotknown12' });
     check('H4 an unknown team is null, not an error', unknown === null, JSON.stringify(unknown));
   }
 
   // ── A. discovery ───────────────────────────────────────────────────────────
   section('A. discovery');
-  const first = await call(sc, 'cco.team.list', { roots: [PROJECT], panePids: [] });
+  const first = await call(sc, 'orch.team.list', { roots: [PROJECT], panePids: [] });
+
   check('A1 supported, data root under HOME, teamMode read from registry.json', first.supported === true && first.dataRoot === DATA_ROOT && first.teamMode === 'on', JSON.stringify({ s: first.supported, d: first.dataRoot, t: first.teamMode }));
   await until(() => h1.subscribes.length > 0);
   check('A2 the related host was connected and greeted as an observer', h1.hellos.length === 1 && h1.hellos[0].role === 'observer' && h1.hellos[0].client === 'gilde' && h1.hellos[0].protocol === 1 && typeof h1.hellos[0].clientPid === 'number', JSON.stringify(h1.hellos));
@@ -639,7 +661,7 @@ async function main() {
   check('B1 a record whose socket is not socketPathFor\'s is never connected to', elsewhere.connections === 0, String(elsewhere.connections));
   check('B2 an unrelated workspace is never connected to', h3.connections === 0, String(h3.connections));
   check('B3 a dead host pid is skipped', h5.connections === 0, String(h5.connections));
-  const listed = await call(sc, 'cco.team.list', { roots: [PROJECT], panePids: [] });
+  const listed = await call(sc, 'orch.team.list', { roots: [PROJECT], panePids: [] });
   const hostKeys = listed.hosts.map((h) => `${h.key}:${h.state}`).sort();
   check('B4 only the good and the no-team host are in sight', JSON.stringify(hostKeys) === JSON.stringify(['s424242:connected', 's727272:no-teams']), JSON.stringify(hostKeys));
   check('B5 the no-team host was greeted once and never listed', h4.hellos.length === 1 && h4.lists === 0, JSON.stringify({ hellos: h4.hellos.length, lists: h4.lists }));
@@ -761,10 +783,10 @@ async function main() {
   const diskView = await until(() => lastView(sc, DISK_TEAM_ID)?.view);
   check('G1 a suspended team on disk is in view as source disk, not live', diskView?.source === 'disk' && diskView.live === false && diskView.state.status === 'suspended', JSON.stringify(diskView?.source));
   check('G2 its feed backlog is read (tail of members/<name>/feed.jsonl)', diskView?.activity?.[0]?.member === 'carol' && diskView.activity[0].lines.length === 3 && diskView.activity[0].lines[2].text === 'Read · file3.ts', JSON.stringify(diskView?.activity));
-  const viaGet = await call(sc, 'cco.team.get', { teamId: DISK_TEAM_ID });
+  const viaGet = await call(sc, 'orch.team.get', { teamId: DISK_TEAM_ID });
   check('G3 cco.team.get answers the same team with a newer rev', viaGet?.teamId === DISK_TEAM_ID && viaGet.rev > diskView.rev, JSON.stringify({ rev: viaGet?.rev }));
   {
-    const withReasons = await call(sc, 'cco.team.list', { roots: [PROJECT], panePids: [] });
+    const withReasons = await call(sc, 'orch.team.list', { roots: [PROJECT], panePids: [] });
     const disk = withReasons.teams.find((t) => t.teamId === DISK_TEAM_ID);
     const owned = withReasons.teams.find((t) => t.teamId === TEAM_ID);
     check('G4 TeamListEntry.reason rides in the summary: one line, no controls or bidi, ≤ 300 chars', typeof disk?.reason === 'string' && disk.reason.startsWith('host gone since rrr') && disk.reason.length === 300 && !/[\n\u0007\u202E]/.test(disk.reason), JSON.stringify(disk?.reason?.slice(0, 40)));
@@ -795,7 +817,7 @@ async function main() {
     conn?.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'cco/team.activity', params: { requestId: h1.sub.id, teamId: TEAM_ID, member: '../../etc', items: [{ ts: 1, turn: 't', k: 'text', s: 'nope' }] } })}\n`);
     await sleep(settle(800));
     const after = lastView(sc, TEAM_ID)?.view;
-    const stillAnswers = await call(sc, 'cco.team.get', { teamId: TEAM_ID });
+    const stillAnswers = await call(sc, 'orch.team.get', { teamId: TEAM_ID });
     check('J2 garbage, another team\'s snapshot and a bad member name change nothing', after?.state?.name === 'demo' && !sc.snapshots.some((p) => p.teamId === 'tmothertea12') && stillAnswers?.state?.name === 'demo' && !(after?.activity ?? []).some((a) => a.member.includes('/')), JSON.stringify({ name: after?.state?.name, before: before?.state?.name }));
 
     // J3: a record that is a SYMLINK (to a well-formed record of its own pid) is never read.
@@ -806,7 +828,7 @@ async function main() {
     const target = join(HOME, 'elsewhere', 'real.json');
     writeFileSync(target, JSON.stringify({ protocol: 1, hostPid: process.pid, hostStartedAt: NOW, session: { pid: 434343, startedAt: NOW }, workspace: PROJECT_REAL, socket: join(RUN_DIR, 's434343.sock'), serverHash: 'x' }));
     symlinkSync(target, join(RUN_DIR, 's434343.json'));
-    await call(sc, 'cco.team.list', { roots: [PROJECT], panePids: [] });
+    await call(sc, 'orch.team.list', { roots: [PROJECT], panePids: [] });
     await sleep(settle(1_200));
     check('J3 a symlinked host record is never followed', linked.connections === 0, String(linked.connections));
 
@@ -822,10 +844,10 @@ async function main() {
   // ── I. scope ───────────────────────────────────────────────────────────────
   section('I. scope');
   const closedBefore = h1.conns.size;
-  await call(sc, 'cco.team.list', { roots: [], panePids: [] });
+  await call(sc, 'orch.team.list', { roots: [], panePids: [] });
   const withdrawn = await until(() => lastView(sc, TEAM_ID)?.view === null && lastView(sc, DISK_TEAM_ID)?.view === null, hang(3_000));
   check('I1 an empty scope withdraws every view (view: null) and closes the host', withdrawn === true && (await until(() => h1.conns.size === 0, hang(2_000))) === true, JSON.stringify({ closedBefore, now: h1.conns.size }));
-  const paneList = await call(sc, 'cco.team.list', { roots: [], panePids: [424242] });
+  const paneList = await call(sc, 'orch.team.list', { roots: [], panePids: [424242] });
   await until(() => lastView(sc, TEAM_ID)?.view?.live === true, hang(8_000));
   const paneView = lastView(sc, TEAM_ID)?.view;
   check('I2 a Gilde pane pid alone brings its host back, tagged with the pane', paneView?.paneSessionPid === 424242 && paneList.hosts.some((h) => h.key === 's424242' && h.pane === true), JSON.stringify({ pane: paneView?.paneSessionPid, hosts: paneList.hosts }));
@@ -863,24 +885,24 @@ async function allWorkspacesSection(h1, h3) {
     }),
   );
 
-  const badFlag = await expectError(call(sc, 'cco.team.list', { roots: [PROJECT], panePids: [], allWorkspaces: 'yes' }));
+  const badFlag = await expectError(call(sc, 'orch.team.list', { roots: [PROJECT], panePids: [], allWorkspaces: 'yes' }));
   check('L1 allWorkspaces that is not a boolean is -32602', badFlag !== null && badFlag.code === -32602, String(badFlag?.code));
 
   const h3Before = h3.connections;
-  await call(sc, 'cco.team.list', { roots: [PROJECT], panePids: [], allWorkspaces: false });
+  await call(sc, 'orch.team.list', { roots: [PROJECT], panePids: [], allWorkspaces: false });
   await sleep(settle(600));
-  const scoped = await call(sc, 'cco.team.list', { roots: [PROJECT], panePids: [], allWorkspaces: false });
+  const scoped = await call(sc, 'orch.team.list', { roots: [PROJECT], panePids: [], allWorkspaces: false });
   check(
     'L2 allWorkspaces false: a team in an unrelated workspace is NOT listed, its host never connected',
     !scoped.teams.some((t) => t.teamId === FAR_TEAM_ID) && !scoped.hosts.some((h) => h.key === 's626262') && h3.connections === h3Before,
     JSON.stringify({ teams: scoped.teams.map((t) => t.teamId), hosts: scoped.hosts.map((h) => h.key), h3: h3.connections }),
   );
 
-  await call(sc, 'cco.team.list', { roots: [PROJECT], panePids: [], allWorkspaces: true });
+  await call(sc, 'orch.team.list', { roots: [PROJECT], panePids: [], allWorkspaces: true });
   let everywhere;
   const deadline = Date.now() + hang(8_000);
   for (;;) {
-    everywhere = await call(sc, 'cco.team.list', { roots: [PROJECT], panePids: [], allWorkspaces: true });
+    everywhere = await call(sc, 'orch.team.list', { roots: [PROJECT], panePids: [], allWorkspaces: true });
     if ((everywhere.teams.some((t) => t.teamId === FAR_TEAM_ID) && h3.connections > h3Before) || Date.now() > deadline) break;
     await sleep(100);
   }
@@ -898,9 +920,9 @@ async function allWorkspacesSection(h1, h3) {
   // Back to the scope the next section expects (I2's): the far team and host drop out again.
   // Views are forwarded coalesced; wait for the far team's before narrowing again.
   const farForwarded = await until(() => (lastView(sc, FAR_TEAM_ID)?.view ? lastView(sc, FAR_TEAM_ID) : undefined), hang(4_000));
-  await call(sc, 'cco.team.list', PANE_SCOPE);
+  await call(sc, 'orch.team.list', PANE_SCOPE);
   const narrowed = await until(() => lastView(sc, FAR_TEAM_ID)?.view === null && h3.conns.size === 0, hang(4_000));
-  const after = await call(sc, 'cco.team.list', PANE_SCOPE);
+  const after = await call(sc, 'orch.team.list', PANE_SCOPE);
   check(
     'L5 narrowing the scope again withdraws the far team (view: null) and closes its host',
     farForwarded?.view?.teamId === FAR_TEAM_ID && narrowed === true && !after.teams.some((t) => t.teamId === FAR_TEAM_ID),
@@ -912,7 +934,7 @@ async function allWorkspacesSection(h1, h3) {
   // sight again, the team must be live again through the pane host — what a fresh sidecar
   // with this scope would forward.
   const backLive = await until(() => isLiveVia(TEAM_ID, 's424242'), hang(8_000));
-  const backList = await call(sc, 'cco.team.list', PANE_SCOPE);
+  const backList = await call(sc, 'orch.team.list', PANE_SCOPE);
   check(
     'L6 back to the pane scope: the team is live again through the pane host (view and list)',
     backLive === true && backList.teams.some((t) => t.teamId === TEAM_ID && t.live === true && t.paneSessionPid === 424242),
@@ -942,9 +964,9 @@ async function sharedTeamSection(h1, h3) {
   // narrowing must hand it back to the pane host.
   const rounds = [];
   for (let round = 1; round <= 2; round += 1) {
-    await call(sc, 'cco.team.list', WIDE);
+    await call(sc, 'orch.team.list', WIDE);
     const taken = await until(() => isLiveVia(TEAM_ID, 's626262'), hang(8_000));
-    await call(sc, 'cco.team.list', PANE_SCOPE);
+    await call(sc, 'orch.team.list', PANE_SCOPE);
     const back = await until(() => isLiveVia(TEAM_ID, 's424242'), hang(8_000));
     rounds.push({ round, taken: taken === true, back: back === true, last: viewSummary(TEAM_ID) });
   }
@@ -952,7 +974,7 @@ async function sharedTeamSection(h1, h3) {
 
   // M2: no scope change at all — the other claimant stops claiming (its list no longer says
   // ownedHere, as after a lease moves back): the team is followed through the pane host again.
-  await call(sc, 'cco.team.list', WIDE);
+  await call(sc, 'orch.team.list', WIDE);
   const taken = await until(() => isLiveVia(TEAM_ID, 's626262'), hang(8_000));
   // M3: while BOTH claim it, the team stays with the claimant that has it — no flapping:
   // once each host has been list-polled again (the 5 s discovery tick, a poll at most every
@@ -970,7 +992,7 @@ async function sharedTeamSection(h1, h3) {
   );
   h3.ownsTeam = false;
   const handedBack = await until(() => isLiveVia(TEAM_ID, 's424242'), hang(8_000));
-  const wideList = await call(sc, 'cco.team.list', WIDE);
+  const wideList = await call(sc, 'orch.team.list', WIDE);
   check(
     'M2 the other host stops claiming the team (scope unchanged): live again through the pane host',
     taken === true && handedBack === true && wideList.teams.some((t) => t.teamId === TEAM_ID && t.live === true && t.hostKey === 's424242'),
@@ -978,7 +1000,7 @@ async function sharedTeamSection(h1, h3) {
   );
   // Back to the scope the next section expects: h3 out of sight, the team live via the pane host.
   h3.ownsTeam = true;
-  await call(sc, 'cco.team.list', PANE_SCOPE);
+  await call(sc, 'orch.team.list', PANE_SCOPE);
   await until(() => h3.conns.size === 0 && isLiveVia(TEAM_ID, 's424242'), hang(8_000));
 }
 
@@ -990,7 +1012,7 @@ async function workersSection(h1) {
   section('K. worker accounts');
   // K1: three consumers at once share ONE host call; the snapshot is the fixture, by value.
   h1.workers = { mode: 'snapshot' };
-  const [a, b, c] = await Promise.all([call(sc, 'cco.workers', PANE_SCOPE), call(sc, 'cco.workers', PANE_SCOPE), call(sc, 'cco.workers', PANE_SCOPE)]);
+  const [a, b, c] = await Promise.all([call(sc, 'orch.workers', PANE_SCOPE), call(sc, 'orch.workers', PANE_SCOPE), call(sc, 'orch.workers', PANE_SCOPE)]);
   const generatedAt = a.snapshot?.generatedAt;
   check('K1 concurrent requests share one tools/call list_workers {name, arguments:{}}', h1.toolCalls.length === 1 && h1.toolCalls[0].params?.name === 'list_workers' && canonical(h1.toolCalls[0].params?.arguments) === '{}', JSON.stringify(h1.toolCalls.map((t) => t.params)));
   check('K2 the answer is the fixture snapshot (times shifted to now), unchanged by the value checks', a.snapshot !== null && h1.workersServed !== undefined && canonical(a.snapshot) === canonical(h1.workersServed), canonical(a.snapshot).slice(0, 300));
@@ -998,9 +1020,9 @@ async function workersSection(h1) {
   check('K3 fresh: not stale, not from cache, no unavailable, the host and the receive time named', a.stale === false && a.fromCache === false && a.unavailable === null && a.hostKey === 's424242' && typeof a.receivedAt === 'number' && b.snapshot?.generatedAt === generatedAt && c.snapshot?.generatedAt === generatedAt, JSON.stringify({ stale: a.stale, fromCache: a.fromCache, u: a.unavailable, host: a.hostKey }));
 
   // K4: the 60 s floor — a second request (any consumer) gets the held snapshot, its generatedAt.
-  const again = await call(sc, 'cco.workers', PANE_SCOPE);
+  const again = await call(sc, 'orch.workers', PANE_SCOPE);
   check('K4 inside the 60 s floor: the cached snapshot with its own generatedAt, no host call', again.fromCache === true && again.snapshot?.generatedAt === generatedAt && h1.toolCalls.length === 1 && again.nextPollAt >= (a.receivedAt ?? 0) + 59_000, JSON.stringify({ fromCache: again.fromCache, calls: h1.toolCalls.length, next: again.nextPollAt - (a.receivedAt ?? 0) }));
-  const early = await call(sc, 'cco.workers', { ...PANE_SCOPE, refresh: true });
+  const early = await call(sc, 'orch.workers', { ...PANE_SCOPE, refresh: true });
   check('K5 an explicit refresh within 5 s of the last call is still served from cache', early.fromCache === true && h1.toolCalls.length === 1, String(h1.toolCalls.length));
 
   // K6: hostile values from the host are checked by value.
@@ -1025,7 +1047,7 @@ async function workersSection(h1) {
   };
   h1.workers = { mode: 'raw', structuredContent: hostile };
   await sleep(REFRESH_WAIT_MS);
-  const checked = await call(sc, 'cco.workers', { ...PANE_SCOPE, refresh: true });
+  const checked = await call(sc, 'orch.workers', { ...PANE_SCOPE, refresh: true });
   const acc = checked.snapshot?.accounts ?? [];
   const w = acc[0]?.windows ?? [];
   check('K6 a refresh past 5 s is a plain call to the host', h1.toolCalls.length === 2 && checked.fromCache === false, String(h1.toolCalls.length));
@@ -1041,31 +1063,31 @@ async function workersSection(h1) {
   // K11: an older host — text only. No snapshot from it; the text is never parsed.
   h1.workers = { mode: 'text-only' };
   await sleep(REFRESH_WAIT_MS);
-  const old = await call(sc, 'cco.workers', { ...PANE_SCOPE, refresh: true });
+  const old = await call(sc, 'orch.workers', { ...PANE_SCOPE, refresh: true });
   check('K11 no structuredContent → host-too-old; the held snapshot is kept, marked stale; the text is not parsed', old.unavailable?.reason === 'host-too-old' && old.stale === true && old.snapshot?.generatedAt === heldAt && !JSON.stringify(old).includes('cooling down'), JSON.stringify({ u: old.unavailable, stale: old.stale }));
 
   // K12: a schema this Gilde does not know — shown as newer/older, NOT parsed.
   h1.workers = { mode: 'schema', schema: 'cco.workers/2' };
   await sleep(REFRESH_WAIT_MS);
-  const newer = await call(sc, 'cco.workers', { ...PANE_SCOPE, refresh: true });
+  const newer = await call(sc, 'orch.workers', { ...PANE_SCOPE, refresh: true });
   check('K12 schema cco.workers/2 → schema-unknown naming it; nothing of that answer is read', newer.unavailable?.reason === 'schema-unknown' && newer.unavailable?.detail === 'cco.workers/2' && newer.stale === true && newer.snapshot?.generatedAt === heldAt && !JSON.stringify(newer).includes('from-a-newer-schema'), JSON.stringify({ u: newer.unavailable }));
 
   // K13: isError (an unreadable registry) → host-error with the host's line, as text.
   h1.workers = { mode: 'is-error', text: 'worker registry unreadable: <i>/x</i>\nsecond line' };
   await sleep(REFRESH_WAIT_MS);
-  const err = await call(sc, 'cco.workers', { ...PANE_SCOPE, refresh: true });
+  const err = await call(sc, 'orch.workers', { ...PANE_SCOPE, refresh: true });
   check('K13 isError → host-error with its one line; the held snapshot stays, stale', err.unavailable?.reason === 'host-error' && err.unavailable?.detail === 'worker registry unreadable: <i>/x</i> second line' && err.stale === true, JSON.stringify(err.unavailable));
 
   // K14: an older role table refuses the tool → host-too-old.
   h1.workers = { mode: 'forbidden' };
   await sleep(REFRESH_WAIT_MS);
-  const refused = await call(sc, 'cco.workers', { ...PANE_SCOPE, refresh: true });
+  const refused = await call(sc, 'orch.workers', { ...PANE_SCOPE, refresh: true });
   check('K14 RPC roleForbidden → host-too-old', refused.unavailable?.reason === 'host-too-old' && refused.stale === true, JSON.stringify(refused.unavailable));
 
   // K15: good again — this time the HOST says it answered from its own observer cache.
   h1.workers = { mode: 'raw', structuredContent: { ...shiftedFixture(Date.now()), servedFromCache: true } };
   await sleep(REFRESH_WAIT_MS);
-  const good = await call(sc, 'cco.workers', { ...PANE_SCOPE, refresh: true });
+  const good = await call(sc, 'orch.workers', { ...PANE_SCOPE, refresh: true });
   const goodAt = good.snapshot?.generatedAt;
   check('K15 a good answer clears unavailable and staleness', good.unavailable === null && good.stale === false && goodAt > heldAt && good.snapshot?.accounts.length === WORKERS_FIXTURE.accounts.length, JSON.stringify({ u: good.unavailable, stale: good.stale }));
   check('K15b servedFromCache: true from the host is passed through (distinct from Gilde\'s own fromCache)', good.snapshot?.servedFromCache === true && good.fromCache === false, JSON.stringify({ host: good.snapshot?.servedFromCache, gilde: good.fromCache }));
@@ -1080,10 +1102,10 @@ async function workersSection(h1) {
   // On a loaded machine 150 ms may not be enough for the sidecar to see the drop: wait for
   // its own log line saying so (it comes before the ~1 s reconnect backoff ends).
   await until(() => closedLogs() > closedBefore, hang(3_000));
-  const dropped = await call(sc, 'cco.workers', PANE_SCOPE);
+  const dropped = await call(sc, 'orch.workers', PANE_SCOPE);
   {
     // K16b: the reason a team is listed with lives only while the host that said it is connected.
-    const listDropped = await call(sc, 'cco.team.list', PANE_SCOPE);
+    const listDropped = await call(sc, 'orch.team.list', PANE_SCOPE);
     const diskDropped = listDropped.teams.find((t) => t.teamId === DISK_TEAM_ID);
     check('K16b once the host is gone, its TeamListEntry.reason is gone from the summary', diskDropped !== undefined && !('reason' in diskDropped), JSON.stringify(diskDropped));
   }
@@ -1093,7 +1115,7 @@ async function workersSection(h1) {
   await h1.close();
   unlinkSync(join(RUN_DIR, 's424242.json'));
   await sleep(REFRESH_WAIT_MS);
-  const gone = await call(sc, 'cco.workers', PANE_SCOPE);
+  const gone = await call(sc, 'orch.workers', PANE_SCOPE);
   check('K17 no host at all: no-host, the last snapshot kept and stale', gone.unavailable?.reason === 'no-host' && gone.stale === true && gone.snapshot?.generatedAt === goodAt, JSON.stringify({ u: gone.unavailable, stale: gone.stale }));
 
   // K18: the host restarts (a new host process on the session's socket) → asked at once, inside the 60 s floor.
@@ -1103,10 +1125,19 @@ async function workersSection(h1) {
   writeRecord(424242, { hostPid: process.ppid });
   await until(() => restarted.hellos.length > 0, hang(8_000));
   await sleep(REFRESH_WAIT_MS);
-  const back = await call(sc, 'cco.workers', PANE_SCOPE);
+  const back = await call(sc, 'orch.workers', PANE_SCOPE);
   check('K18 a restarted host is asked inside the old floor (its predecessor is gone): fresh again', restarted.toolCalls.length === 1 && back.stale === false && back.unavailable === null && back.snapshot?.generatedAt > goodAt, JSON.stringify({ calls: restarted.toolCalls.length, u: back.unavailable, stale: back.stale }));
-  const floored = await call(sc, 'cco.workers', PANE_SCOPE);
+  const floored = await call(sc, 'orch.workers', PANE_SCOPE);
   check('K19 and the floor holds for it', floored.fromCache === true && restarted.toolCalls.length === 1, String(restarted.toolCalls.length));
+
+  check(
+    'O5 every orch.snapshot is {generation, rev, team: {teamId, view}} from the second observer (generation 2)',
+    sc.envelopes.length > 0 &&
+      sc.envelopes.every(
+        (e) => Object.keys(e).sort().join(',') === 'generation,rev,team' && e.generation === 2 && Object.keys(e.team ?? {}).sort().join(',') === 'teamId,view',
+      ),
+    JSON.stringify(sc.envelopes.slice(0, 2)).slice(0, 200),
+  );
 }
 
 const guard = setTimeout(() => {

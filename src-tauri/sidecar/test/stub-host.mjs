@@ -8,17 +8,25 @@
  * assertion surface — the supervision contract (DESIGN §5-5, §8-3) is *ordering*
  * plus *identity*, and both are only observable from the host side:
  *
- *   A. handshake                 — mesh.hello answers with protocol 1, the four
- *                                  adapters, and capabilities read off the
- *                                  adapter instances (not a hardcoded matrix).
+ *   A. handshake                 — mesh.hello (protocol 2, contract §4.5) answers
+ *                                  `{protocol, buildId, adapters}`: the four
+ *                                  contract vendors with capabilities read off
+ *                                  the adapter instances (not a hardcoded matrix).
+ *   K. build id (T-buildId-rule, the sidecar half, A8.1) — esbuild.mjs's rule
+ *                                  rejects every bad class, accepts the version
+ *                                  and a release-style id, treats empty as unset;
+ *                                  the bundle carries its id as a string literal.
  *   B. exec ordering             — `fake_agent normal 0` produces exactly
  *                                  registerSpawn → spawned → exited, in that
  *                                  order, all three carrying the same spawnId,
- *                                  and `envKeys` never carries a VALUE.
+ *                                  the registration is exactly the contract's
+ *                                  RegisterSpawnParams, and `envKeys` never
+ *                                  carries a VALUE.
  *   C. pid identity + timeout    — `fake_agent hang` under a wall-clock cap: the
  *                                  pid the sidecar reported is the pid the OS
  *                                  shows running that argv (`ps -p`), and the cap
- *                                  kills the whole group and reports timedOut.
+ *                                  ends the whole group with SIGTERM (never
+ *                                  SIGKILL, C5) and reports timedOut.
  *   D. env marker                — the child really sees `GILDE_SPAWN_ID` = the
  *                                  envMarker this host handed back.
  *   E. garbage tolerance         — an unparseable line, a non-JSON-RPC line, and a
@@ -27,14 +35,14 @@
  *   F. line stream               — the streaming seam registers the same way and
  *                                  calls `onEnd` exactly once.
  *   J. duplex spawner            — the stdin-open spawner behind the claude quota
- *                                  probe registers as kind 'probe' under the
- *                                  introspect run.
+ *                                  probe registers as kind 'probe' with no turn.
  *   H. stream hardening          — console.log and a direct process.stdout.write
  *                                  from inside the sidecar land on stderr and
  *                                  never corrupt a frame.
- *   I. backpressure              — with the host not reading, `mesh.event`
- *                                  notifications are dropped at the 4096 cap
- *                                  while every response still arrives.
+ *   I. backpressure              — with the host not reading, lossy
+ *                                  `orch.snapshot` notifications are dropped at
+ *                                  the 4096 cap while every response — and every
+ *                                  `turn.event` — still arrives.
  *
  * Run:  node test/stub-host.mjs            (from src-tauri/sidecar)
  * Exit: 0 all green, 1 on the first failed assertion.
@@ -55,12 +63,18 @@ const sidecarDir = join(dirname(fileURLToPath(import.meta.url)), '..');
 const bundle = join(sidecarDir, 'sidecar.cjs');
 const repoRoot = join(sidecarDir, '..', '..');
 
-const PROTOCOL = 1;
+import { resolveBuildId } from '../esbuild.mjs';
+
+const PROTOCOL = 2;
 const APP_INSTANCE = 'stub-host-instance';
+const SIDECAR_VERSION = JSON.parse(readFileSync(join(sidecarDir, 'package.json'), 'utf8')).version;
+/** The id esbuild.mjs baked into the bundle under test (the same rule, the same env). */
+const BUILD_ID = resolveBuildId(process.env.GILDE_BUILD_ID, SIDECAR_VERSION);
 
 // ── fixture resolution ───────────────────────────────────────────────────────
-const fakeAgent = ['debug', 'release']
-  .map((profile) => join(repoRoot, 'src-tauri', 'target', profile, 'fake_agent'))
+const targetDirs = [process.env.CARGO_TARGET_DIR, join(repoRoot, 'src-tauri', 'target')].filter(Boolean);
+const fakeAgent = targetDirs
+  .flatMap((dir) => ['debug', 'release'].map((profile) => join(dir, profile, 'fake_agent')))
   .find((p) => existsSync(p));
 
 const NODE = process.execPath;
@@ -127,6 +141,8 @@ const child = spawn(NODE, [bundle], {
 const journal = [];
 /** spawnId → envMarker we handed out. */
 const markers = new Map();
+/** Notifications received, by method. */
+const noteCounts = new Map();
 
 const pending = new Map();
 let nextId = 0;
@@ -185,7 +201,10 @@ function onLine(line) {
     if (msg.method.startsWith('host.') && msg.method !== 'host.log') {
       journal.push({ method: msg.method, params: msg.params });
     }
-    if (msg.id === undefined || msg.id === null) return; // notification
+    if (msg.id === undefined || msg.id === null) {
+      noteCounts.set(msg.method, (noteCounts.get(msg.method) ?? 0) + 1);
+      return; // notification
+    }
 
     let result = { ok: true };
     if (msg.method === 'host.registerSpawn') {
@@ -227,42 +246,34 @@ async function main() {
   // ── A. handshake ───────────────────────────────────────────────────────────
   const hello = await call('mesh.hello', {
     protocol: PROTOCOL,
-    hostVersion: '0.1.0-stub',
+    buildId: BUILD_ID,
     appInstanceId: APP_INSTANCE,
-    bootId: 'stub-boot',
-    binaries: {},
-    defaults: { timeoutMs: 45 * 60_000, permissionMode: 'acceptEdits' },
+    providers: { orchestrator: false },
   });
   eq('A1 hello.protocol', hello.protocol, PROTOCOL);
-  check('A2 hello.node is this runtime', hello.node === process.version, hello.node);
-  // The expectation is the exact pin set in package.json, not a literal: `mesh.hello`
-  // must report every one of the five packages at the version this build pins, so a
-  // bump that leaves one package behind (or a caret that floats) fails here.
-  const pinned = Object.fromEntries(
-    Object.entries(JSON.parse(readFileSync(join(sidecarDir, 'package.json'), 'utf8')).dependencies ?? {})
-      .filter(([name]) => name.startsWith('@toragonite/agent-mesh')),
-  );
-  check(
-    `A3 hello.packages reports the five exact pins (${pinned['@toragonite/agent-mesh']})`,
-    Object.keys(pinned).length === 5 &&
-      Object.values(pinned).every((v) => /^\d+\.\d+\.\d+$/.test(v)) &&
-      JSON.stringify(Object.entries(hello.packages ?? {}).sort()) === JSON.stringify(Object.entries(pinned).sort()),
-    JSON.stringify({ reported: hello.packages, pinned }),
-  );
+  eq('A2 hello.buildId is the bundle\'s', hello.buildId, BUILD_ID);
+  check('A3 hello answers exactly {protocol, buildId, adapters}', Object.keys(hello).sort().join(',') === 'adapters,buildId,protocol', Object.keys(hello).join(','));
   const vendors = (hello.adapters ?? []).map((a) => a.vendor);
-  check('A4 four adapters registered', vendors.join(',') === 'claude,codex,cursor,gemini', vendors.join(','));
-  const caps = Object.fromEntries((hello.adapters ?? []).map((a) => [a.vendor, a.capabilities]));
-  check('A5 claude capabilities read from the instance', caps.claude?.stream === true && caps.claude?.quota === true, JSON.stringify(caps.claude));
-  // agent-mesh 0.1.3: codex gained a `lineStream` seam and streams; cursor (HTTP usage
-  // endpoint) and gemini (`agy -p /usage` through the exec seam) gained quota. The
-  // sidecar reads these off the instances, so the expectations track the pinned
-  // packages — and a capability flipping back is still caught here.
-  check('A6 codex reports stream:true (0.1.3)', caps.codex?.stream === true, JSON.stringify(caps.codex));
-  check('A7 cursor reports quota:true (0.1.3)', caps.cursor?.quota === true, JSON.stringify(caps.cursor));
-  check('A8 gemini reports quota:true (0.1.3)', caps.gemini?.quota === true, JSON.stringify(caps.gemini));
+  check('A4 four adapters, contract vendor names', vendors.join(',') === 'claude,codex,cursor,agy', vendors.join(','));
+  const caps = Object.fromEntries((hello.adapters ?? []).map((a) => [a.vendor, a]));
+  check(
+    'A5 every adapter row is exactly {vendor, resume, stream, quota, installed}',
+    (hello.adapters ?? []).every((a) => Object.keys(a).sort().join(',') === 'installed,quota,resume,stream,vendor'),
+    JSON.stringify(hello.adapters),
+  );
+  // Read off the instances (agent-mesh 0.1.3+: codex streams; cursor and agy have quota).
+  check('A6 claude streams and has quota', caps.claude?.stream === true && caps.claude?.quota === true, JSON.stringify(caps.claude));
+  check('A7 codex reports stream:true', caps.codex?.stream === true, JSON.stringify(caps.codex));
+  check('A8 cursor and agy report quota:true', caps.cursor?.quota === true && caps.agy?.quota === true, JSON.stringify([caps.cursor, caps.agy]));
+  check('A9 nothing is installed before mesh.configure', (hello.adapters ?? []).every((a) => a.installed === false), JSON.stringify(hello.adapters));
+  check(
+    'A10 the five exact agent-mesh pins are logged at start',
+    stderrLines.some((l) => l.includes('"@toragonite/agent-mesh":"0.1.4"') && l.includes('agent-mesh-gemini')),
+    stderrLines.slice(0, 2).join(' | '),
+  );
 
-  const ping = await call('mesh.ping', { nonce: 'n1' });
-  eq('A9 ping echoes the nonce', ping.nonce, 'n1');
+  const ping = await call('mesh.ping', { nonce: 1 });
+  eq('A11 ping echoes the nonce', ping.nonce, 1);
 
   // ── B. exec ordering ───────────────────────────────────────────────────────
   const normal = fixture('normal', 0);
@@ -272,8 +283,8 @@ async function main() {
     args: normal.args,
     cwd: sidecarDir,
     env: { PATH: process.env.PATH ?? '', GILDE_TEST_SECRET: 'super-secret-value' },
-    runId: 'run-b',
-    vendor: 'claude',
+    turnId: 'turn-b',
+    vendor: 'codex',
     timeoutMs: 30_000,
   });
   const bEntries = journal.slice(before);
@@ -286,8 +297,13 @@ async function main() {
   const bRegister = bEntries[0]?.params ?? {};
   const bSpawned = bEntries[1]?.params ?? {};
   const bExited = bEntries[2]?.params ?? {};
-  eq('B2 registerSpawn carries the runId', bRegister.runId, 'run-b');
-  eq('B3 registerSpawn kind is headless', bRegister.kind, 'headless');
+  eq('B2 registerSpawn carries the turnId', bRegister.turnId, 'turn-b');
+  eq('B3 registerSpawn kind is turn', bRegister.kind, 'turn');
+  check(
+    'B3b registerSpawn is exactly the contract RegisterSpawnParams',
+    Object.keys(bRegister).sort().join(',') === 'args,cmd,cwd,envKeys,kind,spawnId,turnId,vendor',
+    Object.keys(bRegister).join(','),
+  );
   check('B4 registerSpawn carries argv', bRegister.cmd === normal.cmd, bRegister.cmd);
   check(
     'B5 envKeys are KEYS only — no env value crosses the channel',
@@ -311,7 +327,7 @@ async function main() {
     args: canary.args,
     cwd: sidecarDir,
     env: { PATH: process.env.PATH ?? '' },
-    runId: 'run-b2',
+    turnId: 'turn-b2',
     vendor: 'claude',
     timeoutMs: 30_000,
   });
@@ -324,7 +340,7 @@ async function main() {
     cmd: canary.cmd,
     args: canary.args,
     cwd: sidecarDir,
-    runId: 'run-b3',
+    turnId: 'turn-b3',
     vendor: 'claude',
     timeoutMs: 30_000,
   });
@@ -339,7 +355,7 @@ async function main() {
   const beforeC = journal.length;
   const cPromise = call(
     'dev.exec',
-    { cmd: hang.cmd, args: hang.args, cwd: sidecarDir, runId: 'run-c', vendor: 'codex', timeoutMs: 1500 },
+    { cmd: hang.cmd, args: hang.args, cwd: sidecarDir, turnId: 'turn-c', vendor: 'codex', timeoutMs: 1500 },
     30_000,
   );
   // Give the child a moment to exist, then verify the reported pid IS that child.
@@ -357,10 +373,11 @@ async function main() {
   const cExited = journal.slice(beforeC).find((e) => e.method === 'host.exited');
   eq('C4 host.exited reports timedOut', cExited?.params?.timedOut, true);
   check(
-    'C5 the child is gone after the timeout kill',
+    'C5 the child is gone after the timeout signal',
     cSpawned === undefined || psArgs(cSpawned.params.pid) === '',
     psArgs(cSpawned?.params?.pid ?? 0),
   );
+  check('C6 the timeout signal was SIGTERM, never SIGKILL (C5)', cExited?.params?.signal === 'SIGTERM', JSON.stringify(cExited?.params));
 
   // ── D. env marker reaches the child ────────────────────────────────────────
   const printEnv = fixture('print-env', 'GILDE_SPAWN_ID');
@@ -369,8 +386,8 @@ async function main() {
     cmd: printEnv.cmd,
     args: printEnv.args,
     cwd: sidecarDir,
-    runId: 'run-d',
-    vendor: 'gemini',
+    turnId: 'turn-d',
+    vendor: 'agy',
     timeoutMs: 30_000,
   });
   const dRegister = journal.slice(beforeD).find((e) => e.method === 'host.registerSpawn');
@@ -385,14 +402,14 @@ async function main() {
   child.stdin.write('this is not json at all\n');
   child.stdin.write(`${JSON.stringify({ id: 1, method: 'mesh.ping' })}\n`); // no jsonrpc field
   child.stdin.write('\n');
-  const afterGarbage = await call('mesh.ping', { nonce: 'n2' });
-  eq('E1 the session survives garbage lines', afterGarbage.nonce, 'n2');
+  const afterGarbage = await call('mesh.ping', { nonce: 2 });
+  eq('E1 the session survives garbage lines', afterGarbage.nonce, 2);
 
   // A 9 MiB line is past MAX_LINE_BYTES (8 MiB): the buffer is dropped and the
   // rest of that line discarded, so memory stays bounded and framing recovers.
   child.stdin.write(`${'x'.repeat(9 * 1024 * 1024)}\n`);
-  const afterOversize = await call('mesh.ping', { nonce: 'n3' });
-  eq('E2 the session survives a 9 MiB line', afterOversize.nonce, 'n3');
+  const afterOversize = await call('mesh.ping', { nonce: 3 });
+  eq('E2 the session survives a 9 MiB line', afterOversize.nonce, 3);
   check(
     'E3 the oversize line was reported as a protocol violation',
     stderrLines.some((l) => l.includes('MAX_LINE_BYTES')),
@@ -406,7 +423,7 @@ async function main() {
     cmd: emit.cmd,
     args: emit.args,
     cwd: sidecarDir,
-    runId: 'run-f',
+    turnId: 'turn-f',
     vendor: 'cursor',
     timeoutMs: 30_000,
   });
@@ -425,7 +442,6 @@ async function main() {
     cmd: printEnv.cmd,
     args: printEnv.args,
     cwd: sidecarDir,
-    runId: 'introspect',
     vendor: 'claude',
     timeoutMs: 30_000,
   });
@@ -437,7 +453,7 @@ async function main() {
     trace(jSpawnId).join(' → '),
   );
   eq('J2 the duplex child is registered as kind "probe"', jEntries[0]?.params?.kind, 'probe');
-  eq('J3 the duplex child is attributed to the introspect run', jEntries[0]?.params?.runId, 'introspect');
+  eq('J3 the duplex child belongs to no turn', jEntries[0]?.params?.turnId, null);
   check(
     'J4 the duplex child carries GILDE_SPAWN_ID too',
     jResult.stdout.trim() === markers.get(jSpawnId),
@@ -452,26 +468,57 @@ async function main() {
     stderrLines.slice(stderrBefore).filter((l) => l.includes('POLLUTION-MARKER')).length >= 3,
     stderrLines.slice(stderrBefore).join(' | ').slice(0, 200),
   );
-  const stillAlive = await call('mesh.ping', { nonce: 'n4' });
-  eq('H2 the channel is intact after the pollution', stillAlive.nonce, 'n4');
+  const stillAlive = await call('mesh.ping', { nonce: 4 });
+  eq('H2 the channel is intact after the pollution', stillAlive.nonce, 4);
 
   // ── I. outbound backpressure ───────────────────────────────────────────────
-  // Stop reading so the pipe fills, flood mesh.event, then resume: the lossy
-  // notifications are discarded at the cap while every response still arrives.
+  // Stop reading so the pipe fills, flood orch.snapshot (lossy) and turn.event (not
+  // lossy), then resume: the snapshots are discarded at the cap while every
+  // response and every turn event still arrives.
   child.stdout.pause();
-  const floodPromise = call('dev.floodEvents', { count: 20000 }, 60_000);
+  const floodPromise = call('dev.floodEvents', { count: 20000, turnEvents: 5000 }, 60_000);
   await new Promise((r) => setTimeout(r, 500));
   child.stdout.resume();
   const flood = await floodPromise;
   eq('I1 the flood response arrived (responses are never dropped)', flood.sent, 20000);
   const stats = await call('dev.stats', {});
   check(
-    'I2 mesh.event notifications were dropped at the queue cap',
+    'I2 orch.snapshot notifications were dropped at the queue cap',
     stats.droppedNotifications > 0,
     JSON.stringify(stats),
   );
-  const afterFlood = await call('mesh.ping', { nonce: 'n5' });
-  eq('I3 the channel still works after the flood', afterFlood.nonce, 'n5');
+  const afterFlood = await call('mesh.ping', { nonce: 5 });
+  eq('I3 the channel still works after the flood', afterFlood.nonce, 5);
+  eq('I4 every turn.event arrived (never dropped, contract §4.5)', noteCounts.get('turn.event') ?? 0, 5000);
+
+  // ── K. T-buildId-rule, the sidecar half (A8.1) ─────────────────────────────
+  const rejects = (env) => {
+    try {
+      resolveBuildId(env, SIDECAR_VERSION);
+      return false;
+    } catch (err) {
+      return String(err.message).includes('GILDE_BUILD_ID');
+    }
+  };
+  eq('K1 unset → the version', resolveBuildId(undefined, SIDECAR_VERSION), SIDECAR_VERSION);
+  eq('K2 empty → unset → the version', resolveBuildId('', SIDECAR_VERSION), SIDECAR_VERSION);
+  eq('K3 a release-style id is accepted as is', resolveBuildId('2.0.0+b425b5e.20261022T073000', SIDECAR_VERSION), '2.0.0+b425b5e.20261022T073000');
+  for (const [label, bad] of [
+    ['whitespace inside', '2.0 .0'],
+    ['a leading space (never trimmed)', ' 2.0.0'],
+    ['a trailing newline from $(…)', '2.0.0\n'],
+    ['a slash', '2.0/0'],
+    ['a leading dot', '.2.0.0'],
+    ['a leading dash', '-2.0.0'],
+    ['65 bytes', 'a'.repeat(65)],
+    ['non-ASCII', '2.0.0-é'],
+    ['a shell metacharacter', '2.0.0;rm'],
+  ]) {
+    check(`K4 rejected, naming GILDE_BUILD_ID: ${label}`, rejects(bad));
+  }
+  check('K5 64 bytes is still accepted', resolveBuildId('a'.repeat(64), SIDECAR_VERSION) === 'a'.repeat(64));
+  check('K6 a bad version fallback fails too', (() => { try { resolveBuildId(undefined, 'x y'); return false; } catch { return true; } })());
+  check('K7 the bundle carries its build id as a string literal', readFileSync(bundle, 'utf8').includes(JSON.stringify(BUILD_ID)));
 
   // ── G. no stray stdout ─────────────────────────────────────────────────────
   check(

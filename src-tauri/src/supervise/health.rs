@@ -76,7 +76,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
-use crate::model::graph::PressureLevel;
+use crate::supervise::PressureLevel;
 use crate::sidecar::{CcoHostInfo, CcoTeamView};
 use crate::store::models::ProcRow as RegistryRow;
 use crate::supervise::procscan::Snapshot;
@@ -1175,7 +1175,7 @@ impl HealthBuilder {
             }
         }
         // Longest path first: a nested worktree wins over its parent.
-        worktrees.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        worktrees.sort_by_key(|w| std::cmp::Reverse(w.0.len()));
         // The kernel reports a cwd with symlinks resolved (`/var` →
         // `/private/var`); the engine records the path it was given. Both forms
         // are matched, the resolved one read once per path.
@@ -1880,7 +1880,7 @@ impl HealthBuilder {
         };
         if let Some(severity) = pressure_severity {
             let mut ranked: Vec<&Built> = built.iter().collect();
-            ranked.sort_by(|a, b| b.agent.rss_bytes.cmp(&a.agent.rss_bytes));
+            ranked.sort_by_key(|b| std::cmp::Reverse(b.agent.rss_bytes));
             let top: Vec<serde_json::Value> = ranked
                 .iter()
                 .take(3)
@@ -2087,6 +2087,533 @@ impl HealthBuilder {
         }
 
         out
+    }
+}
+
+// ===========================================================================
+// Gilde 2: process records and leftovers (contract §3.4.10, §4.2.7, §8.1 Q8)
+// ===========================================================================
+//
+// One pass per shared scan (`procscan::ScanHub`): every agent-ish process
+// becomes a `ProcessRecord` (`health_processes`); a record is a **leftover**
+// only after its reason held for [`LEFTOVER_SCANS`] consecutive scans. Nothing
+// here signals — the Clean-up sheet (`health_stop`) does, after a preview,
+// an identity re-check and the 10 s undo window.
+
+use crate::contract::common::Vendor as CVendor;
+use crate::contract::ids::ProcessKey as CProcessKey;
+use crate::contract::process::{Leftover, LeftoverReason, ProcRole, ProcessRecord};
+use crate::contract::services::{ProcInfo, ProcSnapshot};
+
+fn default_signatures() -> &'static crate::supervise::procscan::Signatures {
+    static SIGS: std::sync::OnceLock<crate::supervise::procscan::Signatures> = std::sync::OnceLock::new();
+    SIGS.get_or_init(crate::supervise::procscan::Signatures::defaults)
+}
+
+/// Scans a reason must hold before a record is a leftover.
+pub const LEFTOVER_SCANS: u8 = 2;
+
+/// `claude <argv[1]>` invocations that are helpers or short-lived commands,
+/// never sessions (contract §5.2.2) [F-47].
+pub const VENDOR_HELPER_ARGV1: [&str; 8] =
+    ["daemon", "bg-pty-host", "agents", "stop", "logs", "rm", "--version", "-v"];
+
+/// What the registry knows about one live `(pid, start)`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RegistryFact {
+    pub spawn_id: String,
+    pub kind: Option<crate::store::models::ProcKind>,
+    /// The row belongs to this running instance.
+    pub current_instance: bool,
+    pub parent_uid: Option<String>,
+    pub crash_leftover: bool,
+    pub quit_survivor: bool,
+    /// A40.3: a hosted pane whose processes survived its lead's exit
+    /// (`reaper::note_lead_gone_survivor`).
+    pub lead_gone_survivor: bool,
+    /// A41.2: a process carrying a stopped row's marker outside its tree
+    /// (`kill::escapees`); `spawn_id`/`parent_uid` name where it came from.
+    pub escapee: bool,
+}
+
+impl RegistryFact {
+    /// A43.1: the leftover is Gilde's own record (the boot sweep, the quit,
+    /// a lead's exit, a stop that left an escapee), not inferred from scans:
+    /// it is a leftover from the first scan, without the 2-scan hold.
+    pub fn proves_leftover(&self) -> bool {
+        self.crash_leftover || self.quit_survivor || self.lead_gone_survivor || self.escapee
+    }
+}
+
+/// `(pid, start_sec)` → registry fact, for every row of this `GILDE_HOME`
+/// (any instance: own rows win over `OtherGilde`, N-05).
+pub type RegistryView = HashMap<(i32, i64), RegistryFact>;
+
+/// Memory as the store shows it: 10 MiB steps below 1 GiB, 100 MiB above.
+pub fn quantize_bytes(bytes: u64) -> u64 {
+    const MIB: u64 = 1 << 20;
+    let step = if bytes < 1 << 30 { 10 * MIB } else { 100 * MIB };
+    (bytes + step / 2) / step * step
+}
+
+fn exec_basename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+fn swarm_lead_pid(argv: &[String]) -> Option<i32> {
+    let mut it = argv.iter();
+    while let Some(a) = it.next() {
+        let value = if a == "-L" {
+            it.next().map(String::as_str)
+        } else {
+            a.strip_prefix("-L")
+        };
+        if let Some(name) = value.and_then(|v| v.strip_prefix("claude-swarm-")) {
+            return name.parse().ok();
+        }
+    }
+    None
+}
+
+/// The role of one scanned process (contract §3.4.10).
+pub fn role_of(p: &ProcInfo, fact: Option<&RegistryFact>) -> ProcRole {
+    let exec = p.exec_path.as_deref().unwrap_or("");
+    if exec_basename(exec) == "tmux" && swarm_lead_pid(&p.argv_redacted).is_some() {
+        return ProcRole::PaneServer;
+    }
+    if p.labels.agent_id.is_some() && p.labels.agent_name.is_some() && p.labels.team_name.is_some() {
+        return ProcRole::Teammate;
+    }
+    if p.vendor == Some(CVendor::Claude)
+        && p.argv_redacted.get(1).is_some_and(|a| VENDOR_HELPER_ARGV1.contains(&a.as_str()))
+    {
+        return ProcRole::VendorHelper;
+    }
+    if let Some(kind) = fact.and_then(|f| f.kind) {
+        use crate::store::models::ProcKind as K;
+        if matches!(kind, K::Sidecar | K::Probe | K::Git | K::Ide | K::Vendorcli) {
+            return ProcRole::GildeHelper;
+        }
+    }
+    if p.vendor.is_some() {
+        return ProcRole::Session;
+    }
+    let joined = p.argv_redacted.join(" ");
+    if default_signatures().is_mcp_server(&joined) {
+        return ProcRole::ToolServer;
+    }
+    ProcRole::Other
+}
+
+/// Whether a scanned process is shown at all (agent CLIs, swarm servers, tool
+/// servers, Gilde's own rows).
+pub fn is_candidate(p: &ProcInfo, fact: Option<&RegistryFact>) -> bool {
+    fact.is_some()
+        || p.vendor.is_some()
+        || exec_basename(p.exec_path.as_deref().unwrap_or("")) == "tmux"
+        || default_signatures().is_mcp_server(&p.argv_redacted.join(" "))
+}
+
+/// The leftover condition of one record this scan, before the 2-scan hold.
+pub fn leftover_condition(
+    p: &ProcInfo,
+    role: ProcRole,
+    fact: Option<&RegistryFact>,
+    alive: &HashSet<i32>,
+) -> Option<LeftoverReason> {
+    if let Some(f) = fact {
+        if f.quit_survivor {
+            return Some(LeftoverReason::QuitSurvivor);
+        }
+        if f.crash_leftover {
+            return Some(LeftoverReason::GildeCrashLeftover);
+        }
+        if f.lead_gone_survivor {
+            return Some(LeftoverReason::TeammateOfGoneLead);
+        }
+        if f.escapee {
+            return Some(LeftoverReason::ToolServerOfEndedSession);
+        }
+        if f.current_instance {
+            return None;
+        }
+    }
+    let parent_gone = p.ppid <= 1 || !alive.contains(&p.ppid);
+    match role {
+        ProcRole::Teammate if parent_gone => Some(LeftoverReason::TeammateOfGoneLead),
+        ProcRole::PaneServer => match swarm_lead_pid(&p.argv_redacted) {
+            Some(lead) if !alive.contains(&lead) => Some(LeftoverReason::PaneServerOfDeadLead),
+            _ => None,
+        },
+        ProcRole::ToolServer if p.ppid <= 1 => Some(LeftoverReason::ToolServerOfEndedSession),
+        _ => None,
+    }
+}
+
+/// Holds leftover reasons across scans (keyed by `(pid, start)`).
+#[derive(Debug, Default)]
+pub struct LeftoverTracker {
+    held: HashMap<String, (LeftoverReason, i64, u8)>,
+}
+
+impl LeftoverTracker {
+    /// One scan: every candidate as a record; `leftover` only after the same
+    /// reason held [`LEFTOVER_SCANS`] scans in a row — except a leftover
+    /// Gilde's own records prove ([`RegistryFact::proves_leftover`], A43.1),
+    /// which is one from the first scan.
+    pub fn observe(&mut self, snap: &ProcSnapshot, registry: &RegistryView) -> Vec<ProcessRecord> {
+        let alive: HashSet<i32> = snap.procs.iter().map(|p| p.pid).collect();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut out = Vec::new();
+        for p in &snap.procs {
+            let fact = registry.get(&(p.pid, p.start_sec));
+            if !is_candidate(p, fact) {
+                continue;
+            }
+            let role = role_of(p, fact);
+            let key = p.key.as_str().to_string();
+            let leftover = match leftover_condition(p, role, fact, &alive) {
+                Some(reason) => {
+                    let entry = self.held.entry(key.clone()).or_insert((reason, snap.taken_at, 0));
+                    if entry.0 != reason {
+                        *entry = (reason, snap.taken_at, 0);
+                    }
+                    entry.2 = entry.2.saturating_add(1);
+                    seen.insert(key.clone());
+                    // A43.1: the 2-scan hold applies to inferred leftovers only.
+                    let proven = fact.is_some_and(RegistryFact::proves_leftover);
+                    (proven || entry.2 >= LEFTOVER_SCANS).then_some(Leftover {
+                        reason,
+                        since: entry.1,
+                        held_scans: entry.2,
+                    })
+                }
+                None => None,
+            };
+            out.push(ProcessRecord {
+                key: p.key.clone(),
+                pid: p.pid,
+                start_sec: p.start_sec,
+                vendor: p.vendor,
+                role,
+                session_uid: fact
+                    .and_then(|f| f.parent_uid.as_deref())
+                    .and_then(|u| crate::contract::ids::SessionUid::parse(u).ok()),
+                gilde_owned: fact.is_some(),
+                rss_bytes: quantize_bytes(p.rss_bytes),
+                leftover,
+            });
+        }
+        self.held.retain(|k, _| seen.contains(k));
+        out
+    }
+}
+
+/// The parent chain of `pid` in `snap` as `name (pid)` strings, nearest first
+/// (names only, never arguments).
+pub fn parent_chain(snap: &ProcSnapshot, pid: i32) -> Vec<String> {
+    let by_pid: HashMap<i32, &ProcInfo> = snap.procs.iter().map(|p| (p.pid, p)).collect();
+    let mut out = Vec::new();
+    let mut cur = by_pid.get(&pid).map(|p| p.ppid);
+    let mut guard = 0;
+    while let Some(ppid) = cur {
+        if ppid <= 0 || guard > 64 {
+            break;
+        }
+        guard += 1;
+        match by_pid.get(&ppid) {
+            Some(p) => {
+                let name = exec_basename(p.exec_path.as_deref().unwrap_or("?"));
+                out.push(format!("{name} ({ppid})"));
+                cur = Some(p.ppid);
+            }
+            None => {
+                out.push(format!("({ppid})"));
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// A process key for `(pid, start)`.
+pub fn process_key(pid: i32, start_sec: i64) -> CProcessKey {
+    CProcessKey::new(pid.max(0) as u32, start_sec.max(0) as u64)
+}
+
+/// The registry view of one scan: every row with a pid in a state where its
+/// process may still live, of any instance of this `GILDE_HOME` (own rows win
+/// over `OtherGilde`, N-05), with this run's crash-leftover and quit-survivor
+/// marks.
+pub async fn registry_view(sup: &crate::supervise::registry::Supervisor) -> RegistryView {
+    let me = sup.app_instance_id().to_string();
+    let rows = sup
+        .db()
+        .read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT spawn_id, app_instance, kind, pid, proc_start_ts, parent_uid, session_id
+                   FROM proc_registry
+                  WHERE pid IS NOT NULL AND proc_start_ts IS NOT NULL
+                    AND state IN ('running','adopted','kill_incomplete','planned')",
+            )?;
+            let mapped = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for row in mapped {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+        .await
+        .unwrap_or_default();
+    let crash = crate::supervise::reaper::crash_leftover_spawn_ids();
+    let quit = crate::supervise::reaper::quit_survivor_spawn_ids();
+    let lead_gone = crate::supervise::reaper::lead_gone_survivor_spawn_ids();
+    let mut view = RegistryView::new();
+    for (spawn_id, inst, kind, pid, start, parent, session) in rows {
+        view.insert(
+            (pid as i32, start),
+            RegistryFact {
+                kind: crate::store::models::ProcKind::from_db_str(&kind),
+                current_instance: inst == me,
+                parent_uid: parent.or(session),
+                crash_leftover: crash.contains(&spawn_id),
+                quit_survivor: quit.contains(&spawn_id),
+                lead_gone_survivor: lead_gone.contains(&spawn_id),
+                escapee: false,
+                spawn_id,
+            },
+        );
+    }
+    // A41.2: escapees of stopped rows, where no row names the process.
+    for ((pid, start), e) in crate::supervise::kill::escapees() {
+        view.entry((pid, start)).or_insert_with(|| RegistryFact {
+            spawn_id: e.spawn_id,
+            kind: None,
+            current_instance: true,
+            parent_uid: e.session_uid,
+            crash_leftover: false,
+            quit_survivor: false,
+            lead_gone_survivor: false,
+            escapee: true,
+        });
+    }
+    view
+}
+
+/// One previewed stop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedStop {
+    pub key: CProcessKey,
+    pub hup_first: bool,
+}
+
+/// The health surface of Gilde 2: records, leftovers, the Clean-up flow.
+pub struct HealthState {
+    tracker: parking_lot::Mutex<LeftoverTracker>,
+    records: parking_lot::RwLock<Vec<ProcessRecord>>,
+    snapshot: parking_lot::RwLock<Option<std::sync::Arc<ProcSnapshot>>>,
+    tokens: crate::lifecycle::quit::ConfirmTokens,
+    previews: parking_lot::Mutex<HashMap<String, Vec<PlannedStop>>>,
+    groups: std::sync::Arc<parking_lot::Mutex<HashMap<String, std::sync::Arc<std::sync::atomic::AtomicBool>>>>,
+}
+
+impl std::fmt::Debug for HealthState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HealthState")
+            .field("records", &self.records.read().len())
+            .finish()
+    }
+}
+
+impl Default for HealthState {
+    fn default() -> Self {
+        HealthState {
+            tracker: parking_lot::Mutex::new(LeftoverTracker::default()),
+            records: parking_lot::RwLock::new(Vec::new()),
+            snapshot: parking_lot::RwLock::new(None),
+            tokens: crate::lifecycle::quit::ConfirmTokens::new(),
+            previews: parking_lot::Mutex::new(HashMap::new()),
+            groups: std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl HealthState {
+    pub fn new() -> std::sync::Arc<HealthState> {
+        std::sync::Arc::new(HealthState::default())
+    }
+
+    /// One scan: refresh the records; returns the leftovers (for the store).
+    pub fn observe(&self, snap: std::sync::Arc<ProcSnapshot>, registry: &RegistryView) -> Vec<ProcessRecord> {
+        let records = self.tracker.lock().observe(&snap, registry);
+        let leftovers = records.iter().filter(|r| r.leftover.is_some()).cloned().collect();
+        *self.records.write() = records;
+        *self.snapshot.write() = Some(snap);
+        leftovers
+    }
+
+    /// `health_processes` (argv never included).
+    pub fn records(&self) -> Vec<ProcessRecord> {
+        self.records.read().clone()
+    }
+
+    pub fn leftovers(&self) -> Vec<ProcessRecord> {
+        self.records.read().iter().filter(|r| r.leftover.is_some()).cloned().collect()
+    }
+
+    /// `health_process_detail`: the redacted command line, names of the
+    /// parent chain, the start time. `NOT_FOUND{process}` when not scanned.
+    pub fn detail(
+        &self,
+        key: &CProcessKey,
+    ) -> Result<crate::contract::ipc::HealthProcessDetailRes, crate::contract::IpcError> {
+        let snap = self.snapshot.read().clone();
+        let Some(snap) = snap else {
+            return Err(crate::contract::IpcError::not_found("process"));
+        };
+        let Some(p) = snap.procs.iter().find(|p| &p.key == key) else {
+            return Err(crate::contract::IpcError::not_found("process"));
+        };
+        let mut command = p.argv_redacted.clone();
+        if command.is_empty() {
+            if let Some(exec) = &p.exec_path {
+                command.push(exec.clone());
+            }
+        }
+        Ok(crate::contract::ipc::HealthProcessDetailRes {
+            command_redacted: crate::supervise::redact::redact_argv(&command),
+            parent_chain: parent_chain(&snap, p.pid),
+            started_at: p.start_sec.saturating_mul(1000),
+        })
+    }
+
+    /// `health_stop_preview`: each key must be a current leftover and still
+    /// the same process (start time); everything else is `refused`.
+    pub fn stop_preview(&self, keys: &[CProcessKey]) -> crate::contract::ipc::HealthStopPreviewRes {
+        use crate::contract::ipc::{StopMethod, StopRefusal, StopTarget};
+        let records = self.records.read().clone();
+        let mut targets = Vec::new();
+        let mut refused = Vec::new();
+        let mut planned = Vec::new();
+        for key in keys {
+            let Some(rec) = records.iter().find(|r| &r.key == key && r.leftover.is_some()) else {
+                refused.push(StopRefusal { process_key: key.clone(), reason: "notLeftover".into() });
+                continue;
+            };
+            match crate::supervise::procscan::start_time_of(rec.pid) {
+                Some(s) if (s - rec.start_sec).abs() <= 1 => {}
+                Some(_) => {
+                    refused.push(StopRefusal { process_key: key.clone(), reason: "identityChanged".into() });
+                    continue;
+                }
+                None => {
+                    refused.push(StopRefusal { process_key: key.clone(), reason: "gone".into() });
+                    continue;
+                }
+            }
+            let reason = rec.leftover.as_ref().map(|l| l.reason).unwrap_or(LeftoverReason::GildeCrashLeftover);
+            let what = match (rec.vendor, rec.role) {
+                (Some(v), role) => format!("{} · {:?} ({})", v.as_str(), role, rec.pid),
+                (None, role) => format!("{role:?} ({})", rec.pid),
+            };
+            targets.push(StopTarget {
+                process_key: key.clone(),
+                what,
+                why: reason,
+                memory_bytes: rec.rss_bytes,
+                how: if rec.gilde_owned { StopMethod::Fenced } else { StopMethod::TermAfterIdentity },
+            });
+            planned.push(PlannedStop {
+                key: key.clone(),
+                hup_first: matches!(rec.role, ProcRole::PaneServer),
+            });
+        }
+        let parts: Vec<String> = planned.iter().map(|p| p.key.as_str().to_string()).collect();
+        let token = self.tokens.issue(crate::lifecycle::quit::digest_of(&parts));
+        self.previews.lock().insert(token.as_str().to_string(), planned);
+        crate::contract::ipc::HealthStopPreviewRes { targets, refused, confirm_token: token }
+    }
+
+    /// `health_stop`: redeem the token (the previewed targets must still be
+    /// leftovers), then stop them **after the 10 s undo window**, each with an
+    /// identity re-check at execution and never SIGKILL for a vendor CLI.
+    pub fn stop(
+        &self,
+        token: &crate::contract::ids::ConfirmToken,
+        sup: std::sync::Arc<crate::supervise::registry::Supervisor>,
+        window: std::time::Duration,
+    ) -> Result<crate::contract::ipc::HealthStopRes, crate::contract::IpcError> {
+        let planned = self
+            .previews
+            .lock()
+            .remove(token.as_str())
+            .ok_or_else(|| crate::contract::IpcError::conflict("token"))?;
+        let live: HashSet<String> = self
+            .leftovers()
+            .into_iter()
+            .map(|r| r.key.as_str().to_string())
+            .collect();
+        let still: Vec<PlannedStop> = planned
+            .iter()
+            .filter(|p| live.contains(p.key.as_str()))
+            .cloned()
+            .collect();
+        let parts_now: Vec<String> = still.iter().map(|p| p.key.as_str().to_string()).collect();
+        self.tokens
+            .redeem(token, &crate::lifecycle::quit::digest_of(&parts_now), "targets")?;
+        if still.is_empty() {
+            return Ok(crate::contract::ipc::HealthStopRes { stopped: 0, survivors: 0, undo_token: None });
+        }
+        let undo = crate::contract::ids::UndoToken::mint();
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.groups.lock().insert(undo.as_str().to_string(), cancelled.clone());
+        let n = still.len() as u32;
+        let token_key = undo.as_str().to_string();
+        let groups = self.groups.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(window).await;
+            // The window closed: the token is spent either way.
+            let armed = groups.lock().remove(&token_key).is_some();
+            if !armed || cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            for stop in still {
+                let plan = if stop.hup_first {
+                    crate::contract::services::SignalPlan::HupThenTerm { grace_ms: 1_500 }
+                } else {
+                    crate::contract::services::SignalPlan::Term { grace_ms: 2_000 }
+                };
+                match sup.signal_key(&stop.key, plan).await {
+                    Ok(out) if out.survivor => {
+                        tracing::info!(target: "supervise", "a leftover survived its stop; it stays a leftover");
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        let (code, key, _) = err.log_fields();
+                        tracing::info!(target: "supervise", code, key, "a leftover stop was refused at execution");
+                    }
+                }
+            }
+        });
+        Ok(crate::contract::ipc::HealthStopRes { stopped: n, survivors: 0, undo_token: Some(undo) })
+    }
+
+    /// `undo_cancel` for a Clean-up group. `false` once expired or unknown.
+    pub fn undo(&self, token: &str) -> bool {
+        match self.groups.lock().remove(token) {
+            Some(flag) => !flag.swap(true, std::sync::atomic::Ordering::SeqCst),
+            None => false,
+        }
     }
 }
 

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-agents-rescan"
+description = "Enables the agents_rescan command without any pre-configured scope."
+commands.allow = ["agents_rescan"]
+
+[[permission]]
+identifier = "deny-agents-rescan"
+description = "Denies the agents_rescan command without any pre-configured scope."
+commands.deny = ["agents_rescan"]

@@ -1,0 +1,259 @@
+[
+  {
+    "id": "u-0001",
+    "seq": 1099511627776,
+    "at": 1792638000000,
+    "kind": {
+      "kind": "userText",
+      "text": "Please read src/main.rs and fix the typo.",
+      "origin": "human",
+      "delivery": null,
+      "clientMsgId": null
+    },
+    "truncated": false
+  },
+  {
+    "id": "r-0001",
+    "seq": 1099511627777,
+    "at": 1792638060000,
+    "kind": {
+      "kind": "thinking",
+      "seconds": 2,
+      "text": "Let me look at the file."
+    },
+    "truncated": false
+  },
+  {
+    "id": "r-0002",
+    "seq": 1099511627778,
+    "at": 1792638070000,
+    "kind": {
+      "kind": "assistantText",
+      "markdown": "I'll read the file first.",
+      "streaming": false,
+      "agent": null
+    },
+    "truncated": false
+  },
+  {
+    "id": "r-0003",
+    "seq": 1099511627779,
+    "at": 1792638080000,
+    "kind": {
+      "kind": "toolCall",
+      "toolUseId": "toolu_01Read",
+      "summary": {
+        "tool": "Read",
+        "verb": "read",
+        "object": "src/main.rs"
+      },
+      "inputPreview": "{\n  \"file_path\": \"/w/demo/src/main.rs\"\n}",
+      "status": "ok",
+      "resultPreview": "fn mian() {}\n",
+      "fileChange": null,
+      "incomplete": false
+    },
+    "truncated": false
+  },
+  {
+    "id": "r-0004",
+    "seq": 1099511627780,
+    "at": 1792638120000,
+    "kind": {
+      "kind": "toolCall",
+      "toolUseId": "toolu_02Edit",
+      "summary": {
+        "tool": "Edit",
+        "verb": "edit",
+        "object": "src/main.rs"
+      },
+      "inputPreview": "{\n  \"file_path\": \"/w/demo/src/main.rs\",\n  \"new_string\": \"fn main() {}\",\n  \"old_string\": \"fn mian() {}\"\n}",
+      "status": "ok",
+      "resultPreview": "The file /w/demo/src/main.rs has been updated.",
+      "fileChange": {
+        "pathRel": "src/main.rs",
+        "added": 1,
+        "removed": 1,
+        "change": "modified"
+      },
+      "incomplete": false
+    },
+    "truncated": false
+  },
+  {
+    "id": "r-0005",
+    "seq": 1099511627781,
+    "at": 1792638180000,
+    "kind": {
+      "kind": "toolCall",
+      "toolUseId": "toolu_03Bash",
+      "summary": {
+        "tool": "Bash",
+        "verb": "run",
+        "object": "cargo build"
+      },
+      "inputPreview": "cargo build\ncargo test",
+      "status": "denied",
+      "resultPreview": "The user doesn't want to proceed with this tool use. The tool use was rejected.",
+      "fileChange": null,
+      "incomplete": false
+    },
+    "truncated": false
+  },
+  {
+    "id": "s-0001",
+    "seq": 1099511627782,
+    "at": 1792638200000,
+    "kind": {
+      "kind": "system",
+      "note": {
+        "kind": "apiRetry",
+        "attempt": 2
+      },
+      "text": null
+    },
+    "truncated": false
+  },
+  {
+    "id": "r-0006",
+    "seq": 1099511627783,
+    "at": 1792638240000,
+    "kind": {
+      "kind": "assistantText",
+      "markdown": "Fixed the typo in src/main.rs.",
+      "streaming": false,
+      "agent": null
+    },
+    "truncated": false
+  },
+  {
+    "id": "u-0005",
+    "seq": 1099511627784,
+    "at": 1792638300000,
+    "kind": {
+      "kind": "userText",
+      "text": "Now write a README please",
+      "origin": "human",
+      "delivery": null,
+      "clientMsgId": null
+    },
+    "truncated": false
+  },
+  {
+    "id": "r-0007",
+    "seq": 1099511627785,
+    "at": 1792638310000,
+    "kind": {
+      "kind": "toolCall",
+      "toolUseId": "toolu_04Write",
+      "summary": {
+        "tool": "Write",
+        "verb": "create",
+        "object": "README.md"
+      },
+      "inputPreview": "{\n  \"content\": \"# Demo\\n\\nHello\\n\",\n  \"file_path\": \"/w/demo/README.md\"\n}",
+      "status": "ok",
+      "resultPreview": "File created successfully at: /w/demo/README.md",
+      "fileChange": {
+        "pathRel": "README.md",
+        "added": 3,
+        "removed": 0,
+        "change": "added"
+      },
+      "incomplete": false
+    },
+    "truncated": false
+  },
+  {
+    "id": "u-0007",
+    "seq": 1099511627786,
+    "at": 1792638330000,
+    "kind": {
+      "kind": "system",
+      "note": {
+        "kind": "interrupted"
+      },
+      "text": null
+    },
+    "truncated": false
+  },
+  {
+    "id": "s-0003",
+    "seq": 1099511627787,
+    "at": 1792638360000,
+    "kind": {
+      "kind": "system",
+      "note": {
+        "kind": "compactBoundary"
+      },
+      "text": null
+    },
+    "truncated": false
+  },
+  {
+    "id": "u-0008",
+    "seq": 1099511627788,
+    "at": 1792638420000,
+    "kind": {
+      "kind": "userText",
+      "text": "Please run the tests.",
+      "origin": "teammate",
+      "delivery": null,
+      "clientMsgId": null
+    },
+    "truncated": false
+  },
+  {
+    "id": "a-0002",
+    "seq": 1099511627789,
+    "at": 1792638430000,
+    "kind": {
+      "kind": "userText",
+      "text": "Status?",
+      "origin": "peer",
+      "delivery": null,
+      "clientMsgId": null
+    },
+    "truncated": false
+  },
+  {
+    "id": "r-0008",
+    "seq": 1099511627790,
+    "at": 1792638440000,
+    "kind": {
+      "kind": "system",
+      "note": {
+        "kind": "error",
+        "sub": {
+          "kind": "usageLimit",
+          "accountId": null,
+          "resetsAt": 1792700000000
+        }
+      },
+      "text": "Claude AI usage limit reached|1792700000"
+    },
+    "truncated": false
+  },
+  {
+    "id": "r-0010",
+    "seq": 1099511627791,
+    "at": 1792638490000,
+    "kind": {
+      "kind": "unknown",
+      "typeName": "container_upload"
+    },
+    "truncated": false
+  },
+  {
+    "id": "r-0009",
+    "seq": 1099511627792,
+    "at": 1792638480000,
+    "kind": {
+      "kind": "assistantText",
+      "markdown": "� broken",
+      "streaming": false,
+      "agent": null
+    },
+    "truncated": false
+  }
+]

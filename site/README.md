@@ -38,54 +38,53 @@ grep -rl 'github.com/Toragonite/gilde' site | xargs sed -i '' 's#github.com/Tora
 
 ## Screenshots
 
-The four capability sections have slots for real screenshots:
+The six capability sections each show a screenshot of Gilde 2:
 
-| File | Shows |
-| --- | --- |
-| `assets/shot-team.png` | the Team view |
-| `assets/shot-workers.png` | the Worker accounts view |
-| `assets/shot-health.png` | the health popover over the status bar |
-| `assets/shot-grouping.png` | the Team sidebar grouped by repository |
+| File | Shows | Showcase URL |
+| --- | --- | --- |
+| `assets/shot-home.png` | Home with an approval as its first card | `/?scene=home&teams=orchestrator` |
+| `assets/shot-session.png` | a Conversation session with an approval card | `/?scene=session` |
+| `assets/shot-split.png` | Split with four sessions | `/?scene=split` |
+| `assets/shot-team.png` | a team as a Floor | `/?scene=team-floor` |
+| `assets/shot-history.png` | History | `/?scene=history` |
+| `assets/shot-accounts.png` | Accounts and health | `/?scene=accounts` |
 
-Each slot is 16:10 (the app's default window is 1280 × 800); capture the
-window at 2× (2560 × 1600) and save it under that name. Until a file exists
-the slot shows a placeholder drawn in the app's style, labelled "Screenshot".
-A missing file is still requested, so the browser console lists one 404 per
-missing screenshot; nothing else should appear there.
+Each slot is 16:10 (the app's default window is 1280 × 800); the files are
+2560 × 1600, the window at 2×. Until a file exists the slot shows a
+placeholder drawn in the app's style, labelled "Screenshot". A missing file is
+still requested, so the browser console lists one 404 per missing screenshot;
+nothing else should appear there.
 
 ### Capture them from the showcase
 
 Every screenshot comes from **demo data**, never from a real machine: the
 showcase build runs the real UI in a plain browser, with no Tauri runtime and
-no account, path or e-mail of anyone's (a team at `acme/checkout`, accounts
-named `main`, `work`, `ci-bot`, `codex`, `cursor`). It shows the app exactly as
-it looks; only the data is made up.
+no account, path or e-mail of anyone's (projects `checkout-service`,
+`infra-live`, `mobile-app`, `docs-site`; teams `auth-split`, `cache-rework`,
+`docs-refresh`). It shows the app exactly as it looks; only the data is made
+up.
 
 ```sh
-VITE_GILDE_SHOWCASE=1 npx vite               # serves http://localhost:1420
+VITE_GILDE_SHOWCASE=1 npx vite build --outDir <dir>   # or: VITE_GILDE_SHOWCASE=1 npx vite
 ```
 
-Open each scene in a browser with the viewport at 1280 × 800 and the device scale
-factor at 2 (the developer tools' device mode), and capture the viewport:
+Open each URL above with `&lang=en&theme=light&live=0` in **headless** Chrome
+with a fresh temporary profile and `--use-mock-keychain` (the browser gates'
+`scripts/gates/lib/cdp.mjs` and `static-server.mjs` do exactly this), at a
+1280 × 800 viewport with device scale factor 2. Wait for
+`<html data-showcase-ready>` and about three more seconds (an approval card
+arms its buttons a moment after it appears), then capture the viewport.
 
-| URL | Save as |
-| --- | --- |
-| `http://localhost:1420/?scene=team` | `assets/shot-team.png` |
-| `http://localhost:1420/?scene=workers` | `assets/shot-workers.png` |
-| `http://localhost:1420/?scene=health` | `assets/shot-health.png` |
-| `http://localhost:1420/?scene=grouping` | `assets/shot-grouping.png` |
-| `http://localhost:1420/?scene=health-snoozed` | — (no page slot) |
+`teams=orchestrator` on Home makes the first card one you can answer; with the
+default world it is a teammate's approval that is answered at its lead.
 
-`health-snoozed` is the health scene after the alert's toast was closed: the
-alert is snoozed for ten minutes, the popover says so and when it comes back,
-and still offers its clean-up — the app never reads "all well" while the
-leftover processes run. It is there to check that state, not for the page.
+The committed files are reduced to a 256-colour palette by merging the rarest
+anti-aliasing shades into their nearest neighbour (under 0.5 % of pixels
+change; every UI colour stays exact), which halves their size.
 
-Append `&lang=ko` for the Korean UI, `&theme=dark` or `&theme=light` to fix
-the theme (default: the system's), and on the Team scene `&member=none` (or
-another member's name) to change whose details are open. A normal build
-contains none of the showcase; `node scripts/check-showcase-tree-shaking.mjs`
-proves it.
+Append `&lang=ko` for the Korean UI or `&theme=dark` for the dark theme. A
+normal build contains none of the showcase;
+`node scripts/check-showcase-tree-shaking.mjs` proves it.
 
 ## Text and translations
 
@@ -94,8 +93,9 @@ Every translatable element carries `data-i18n="key"` (or
 `data-i18n-attr="attr:key"` for `aria-label` / `alt`), and `I18N` in
 `main.js` holds both languages for each key. When you change English text in
 `index.html`, change `I18N.en` and `I18N.ko` for the same key too. Korean uses
-the app's own terms from `src/i18n/ko.ts` (팀, 멤버, 작업자 계정, 워크트리,
-저장소, 정리, …).
+the app's own terms and its -습니다 style from `src/i18n/areas/*.ts` (세션,
+승인 대기, 지켜보는 중, 기록, 계정·상태, 분할, 패널·보드·작업장, 남은 프로세스,
+정리, …). The hero's Home card uses the app's own strings in both languages.
 
 ## Design
 
@@ -103,7 +103,8 @@ The tokens at the top of `styles.css` are the app's (`src/styles/tokens.css`):
 the neutral scale `--n0`…`--n12`, one accent for links and focus, four
 semantic colours for status, one border, two radii. The page is dark by
 default and follows `prefers-color-scheme`; `prefers-reduced-motion` turns off
-the one pulsing status dot and smooth scrolling.
+the one pulsing status dot and smooth scrolling. No emoji, and the page names
+the agent CLIs only as the app does (`claude`, `codex`, `cursor-agent`, `agy`).
 
 ## Publish with GitHub Pages
 

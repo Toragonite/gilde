@@ -1,200 +1,201 @@
-//! Graph patch coalescer: one `gilde://graph/patch` per 100 ms tick, with a
-//! separate 1 s lane for metric-only ops.
-//!
-//! DESIGN §4 caps `gilde://graph/patch` at 10 Hz. The metric lane rides *inside*
-//! every tenth tick rather than emitting on its own timer, so the total event
-//! rate stays at or below 10 per second no matter how hard the producers push.
-//!
-//! The single most important property here: **ops are applied to `GraphState`
-//! at flush time, in exactly the order they are published.** A client that
-//! replays the published patches onto an empty state therefore reaches a
-//! byte-identical snapshot (DESIGN R18).
+//! Coalescing (owner T09): the store-patch edge of `store_subscribe`
+//! ([`StoreCoalescer`], contract §4.3). The legacy graph-patch coalescer went
+//! with the graph projection (A22.3).
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::time::Duration;
-
-use parking_lot::RwLock;
-use tokio::sync::mpsc::UnboundedReceiver;
-use tokio::time::{interval, MissedTickBehavior};
-
-use crate::events::bus::PatchSink;
-use crate::events::now_ms;
-use crate::model::graph::{GraphOp, GraphPatch, GraphState};
-use crate::model::status::NodeMetrics;
 
 /// One coalescer tick. Ten of these per second.
 pub const TICK: Duration = Duration::from_millis(100);
-/// The metric lane drains every Nth tick, i.e. once per second.
-pub const METRIC_EVERY_TICKS: u64 = 10;
 
-/// Which lane an op was pushed onto.
-#[derive(Debug)]
-pub enum Lane {
-    /// Structural / status ops. Flushed on every tick.
-    Normal(GraphOp),
-    /// Metric-only ops. Merged per node and flushed once per second.
-    Metric(GraphOp),
+// ---------------------------------------------------------------------------
+// store patches (contract §4.3)
+// ---------------------------------------------------------------------------
+
+use crate::contract::store::{Entity, StoreOp, StorePatch, MAX_OPS_PER_PATCH};
+
+/// At most this many store patches leave per second (one per [`TICK`]).
+pub const STORE_MAX_PER_SEC: usize = 10;
+
+/// Merges the patches of one 100 ms window for one subscriber.
+///
+/// * consecutive patches merge into one (`fromRev` of the first, `toRev` of
+///   the last); ops for the same entity collapse to the last one;
+/// * a patch whose `fromRev` is not the previous `toRev` (a gap or a reorder)
+///   turns the stream into one `Resync`, after which nothing more is sent —
+///   the WebView resubscribes, which replaces this channel;
+/// * a merged patch above [`MAX_OPS_PER_PATCH`] ops is replaced by `Resync`.
+#[derive(Debug, Default)]
+pub struct StoreCoalescer {
+    pending: Option<StorePatch>,
+    last_to: Option<u64>,
+    resynced: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct CoalescerConfig {
-    pub tick: Duration,
-    pub metric_every_ticks: u64,
-}
-
-impl Default for CoalescerConfig {
-    fn default() -> Self {
-        Self {
-            tick: TICK,
-            metric_every_ticks: METRIC_EVERY_TICKS,
+impl StoreCoalescer {
+    pub fn push(&mut self, patch: StorePatch) {
+        if self.resynced {
+            return;
         }
-    }
-}
-
-/// Accumulates metric-only patches so that a node never produces more than one
-/// op per metric flush, however often the watchdog samples it.
-#[derive(Default)]
-struct MetricLane {
-    per_node: BTreeMap<String, NodeMetrics>,
-    /// Anything pushed onto the metric lane that is not a metric-only patch.
-    passthrough: Vec<GraphOp>,
-}
-
-impl MetricLane {
-    fn push(&mut self, op: GraphOp) {
-        match op {
-            GraphOp::PatchNode {
-                id,
-                status: None,
-                confidence: None,
-                evidence: None,
-                badges: None,
-                metrics: Some(metrics),
-            } => {
-                self.per_node.entry(id).or_default().merge_from(&metrics);
+        if let Some(last) = self.last_to {
+            if patch.from_rev != last {
+                self.resync(patch.to_rev.max(last));
+                return;
             }
-            other => self.passthrough.push(other),
         }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.per_node.is_empty() && self.passthrough.is_empty()
-    }
-
-    fn drain(&mut self) -> Vec<GraphOp> {
-        let mut ops: Vec<GraphOp> = std::mem::take(&mut self.per_node)
-            .into_iter()
-            .map(|(id, metrics)| GraphOp::PatchNode {
-                id,
-                status: None,
-                confidence: None,
-                evidence: None,
-                badges: None,
-                metrics: Some(metrics),
-            })
-            .collect();
-        ops.append(&mut self.passthrough);
-        ops
-    }
-}
-
-/// Apply a batch under the write lock and publish it as one patch.
-fn flush(ops: Vec<GraphOp>, graph: &Arc<RwLock<GraphState>>, sink: &Arc<dyn PatchSink>) {
-    if ops.is_empty() {
-        return;
-    }
-    let at = now_ms();
-    let rev = {
-        let mut state = graph.write();
-        state.apply_batch(ops.iter().cloned(), at)
-    };
-    sink.emit_patch(&GraphPatch { rev, ops });
-}
-
-/// Drive the coalescer until every sender has been dropped.
-pub async fn run(
-    mut rx: UnboundedReceiver<Lane>,
-    graph: Arc<RwLock<GraphState>>,
-    sink: Arc<dyn PatchSink>,
-    config: CoalescerConfig,
-) {
-    let mut ticker = interval(config.tick);
-    // Never try to "catch up" after a stall: bursting ten patches at once is
-    // exactly the behaviour the 10 Hz cap exists to prevent.
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    // The first tick completes immediately; consume it so the first real flush
-    // happens one tick in.
-    ticker.tick().await;
-
-    let mut normal: Vec<GraphOp> = Vec::new();
-    let mut metric = MetricLane::default();
-    let mut tick_count: u64 = 0;
-    let metric_every = config.metric_every_ticks.max(1);
-
-    loop {
-        tokio::select! {
-            received = rx.recv() => match received {
-                Some(Lane::Normal(op)) => normal.push(op),
-                Some(Lane::Metric(op)) => metric.push(op),
-                None => break,
-            },
-            _ = ticker.tick() => {
-                tick_count = tick_count.wrapping_add(1);
-                let mut ops = std::mem::take(&mut normal);
-                if tick_count % metric_every == 0 && !metric.is_empty() {
-                    ops.append(&mut metric.drain());
-                }
-                flush(ops, &graph, &sink);
+        self.last_to = Some(patch.to_rev);
+        let forced_resync = patch.ops.iter().any(|op| matches!(op, StoreOp::Resync));
+        match &mut self.pending {
+            None => self.pending = Some(patch),
+            Some(p) => {
+                p.to_rev = patch.to_rev;
+                p.ops.extend(patch.ops);
+            }
+        }
+        if forced_resync {
+            let to = self.last_to.unwrap_or(0);
+            self.resync(to);
+            return;
+        }
+        if let Some(p) = &mut self.pending {
+            collapse_ops(&mut p.ops);
+            if p.ops.len() > MAX_OPS_PER_PATCH {
+                let to = p.to_rev;
+                self.resync(to);
             }
         }
     }
 
-    // Senders are gone: publish whatever is still buffered so no op is lost.
-    let mut ops = std::mem::take(&mut normal);
-    ops.append(&mut metric.drain());
-    flush(ops, &graph, &sink);
+    /// The merged patch of this window, if any.
+    pub fn take(&mut self) -> Option<StorePatch> {
+        self.pending.take()
+    }
+
+    pub fn is_resynced(&self) -> bool {
+        self.resynced
+    }
+
+    fn resync(&mut self, to_rev: u64) {
+        let from = self
+            .pending
+            .as_ref()
+            .map(|p| p.from_rev)
+            .or(self.last_to)
+            .unwrap_or(to_rev);
+        self.pending = Some(StorePatch {
+            from_rev: from,
+            to_rev,
+            ops: vec![StoreOp::Resync],
+        });
+        self.resynced = true;
+    }
+}
+
+/// The identity of what an op writes: ops with the same key collapse to the
+/// last one within a window. `None` = never collapsed.
+fn op_key(op: &StoreOp) -> Option<String> {
+    Some(match op {
+        StoreOp::Upsert { entity } => entity_key(entity),
+        StoreOp::Remove { entity_kind, id } => format!("{entity_kind:?}:{id}"),
+        StoreOp::Queue { .. } => "queue".into(),
+        StoreOp::Boot { .. } => "boot".into(),
+        StoreOp::Notices { .. } => "notices".into(),
+        StoreOp::Compat { .. } => "compat".into(),
+        StoreOp::Sources { .. } => "sources".into(),
+        StoreOp::Integrations { .. } => "integrations".into(),
+        StoreOp::Quit { .. } => "quit".into(),
+        StoreOp::Resync => return None,
+    })
+}
+
+fn entity_key(entity: &Entity) -> String {
+    match entity {
+        Entity::Project { value } => format!("Project:{}", value.id.as_str()),
+        Entity::Location { value } => format!("Location:{}", value.id.as_str()),
+        Entity::Session { value } => format!("Session:{}", value.uid.as_str()),
+        Entity::Team { value } => format!("Team:{}", value.key.as_str()),
+        Entity::Member { value } => format!("Member:{}", value.key.as_str()),
+        Entity::Task { value } => format!("Task:{}", value.key.as_str()),
+        Entity::Message { value } => format!("Message:{}", value.key.as_str()),
+        Entity::Account { value } => format!("Account:{}", value.id.as_str()),
+        Entity::Leftover { value } => format!("Leftover:{}", value.key.as_str()),
+    }
+}
+
+/// Keep only the last op per key, in order.
+fn collapse_ops(ops: &mut Vec<StoreOp>) {
+    let mut last: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (i, op) in ops.iter().enumerate() {
+        if let Some(k) = op_key(op) {
+            last.insert(k, i);
+        }
+    }
+    let mut i = 0usize;
+    ops.retain(|op| {
+        let keep = match op_key(op) {
+            Some(k) => last.get(&k) == Some(&i),
+            None => true,
+        };
+        i += 1;
+        keep
+    });
 }
 
 #[cfg(test)]
-mod tests {
+mod store_tests {
     use super::*;
-    use crate::model::graph::{GraphNode, NodeKind, NodeStatus};
+    use crate::contract::store::{BootStatus, EntityKind};
 
-    #[test]
-    fn metric_lane_merges_per_node() {
-        let mut lane = MetricLane::default();
-        for i in 0..100u64 {
-            lane.push(GraphOp::PatchNode {
-                id: format!("session:{}", i % 4),
-                status: None,
-                confidence: None,
-                evidence: None,
-                badges: None,
-                metrics: Some(NodeMetrics {
-                    rss_bytes: Some(i),
-                    ..Default::default()
-                }),
-            });
+    fn boot(n: bool) -> StoreOp {
+        StoreOp::Boot {
+            status: BootStatus {
+                spawn_gate_open: n,
+                first_discovery_done: false,
+                agents_detected: false,
+                memory_only: None,
+                agents: Vec::new(),
+                agents_scanned_at: None,
+                recovery: None,
+            },
         }
-        let ops = lane.drain();
-        assert_eq!(ops.len(), 4, "one op per node, not one per sample");
-        match &ops[0] {
-            GraphOp::PatchNode { id, metrics, .. } => {
-                assert_eq!(id, "session:0");
-                assert_eq!(metrics.as_ref().unwrap().rss_bytes, Some(96));
-            }
-            other => panic!("unexpected op {other:?}"),
-        }
-        assert!(lane.is_empty());
+    }
+
+    fn patch(from: u64, to: u64, ops: Vec<StoreOp>) -> StorePatch {
+        StorePatch { from_rev: from, to_rev: to, ops }
     }
 
     #[test]
-    fn metric_lane_passes_structural_ops_through() {
-        let mut lane = MetricLane::default();
-        lane.push(GraphOp::UpsertNode {
-            node: GraphNode::new("session:a", NodeKind::Session, "a", NodeStatus::Idle, 1),
-        });
-        assert_eq!(lane.drain().len(), 1);
+    fn consecutive_patches_merge_and_same_entity_ops_collapse() {
+        let mut c = StoreCoalescer::default();
+        c.push(patch(1, 2, vec![boot(false)]));
+        c.push(patch(2, 3, vec![boot(true), StoreOp::Remove { entity_kind: EntityKind::Leftover, id: "x".into() }]));
+        let p = c.take().unwrap();
+        assert_eq!((p.from_rev, p.to_rev), (1, 3));
+        assert_eq!(p.ops.len(), 2);
+        assert_eq!(p.ops[0], boot(true));
+        assert!(c.take().is_none());
+        c.push(patch(3, 4, vec![boot(false)]));
+        assert_eq!(c.take().unwrap().from_rev, 3);
+    }
+
+    #[test]
+    fn a_rev_gap_becomes_one_resync_and_silence() {
+        let mut c = StoreCoalescer::default();
+        c.push(patch(1, 2, vec![boot(false)]));
+        c.push(patch(5, 6, vec![boot(true)]));
+        let p = c.take().unwrap();
+        assert_eq!(p.ops, vec![StoreOp::Resync]);
+        assert!(c.is_resynced());
+        c.push(patch(6, 7, vec![boot(true)]));
+        assert!(c.take().is_none());
+    }
+
+    #[test]
+    fn too_many_ops_become_resync() {
+        let mut c = StoreCoalescer::default();
+        let ops: Vec<StoreOp> = (0..=MAX_OPS_PER_PATCH)
+            .map(|i| StoreOp::Remove { entity_kind: EntityKind::Leftover, id: format!("k{i}") })
+            .collect();
+        c.push(patch(1, 2, ops));
+        assert_eq!(c.take().unwrap().ops, vec![StoreOp::Resync]);
     }
 }

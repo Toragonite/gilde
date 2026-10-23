@@ -1,0 +1,3 @@
+{"type":"user","message":{"role":"user","content":"CANARY-7f3a-CONTENT do the thing"},"uuid":"u1","timestamp":"2026-10-21T06:00:00.000Z","sessionId":"{{SID}}","cwd":"{{CWD}}","entrypoint":"cli","version":"2.1.306"}
+{"type":"system","subtype":"api_error","error":{"type":"error","error":{"type":"overloaded_error"}},"retryAttempt":1,"timestamp":"2026-10-21T06:00:01.000Z","sessionId":"{{SID}}"}
+{"type":"assistant","message":{"id":"msg_1","role":"assistant","content":[{"type":"text","text":"CANARY-7f3a-CONTENT done"}],"stop_reason":"end_turn"},"uuid":"a1","timestamp":"2026-10-21T06:00:05.000Z","sessionId":"{{SID}}"}

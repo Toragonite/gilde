@@ -1,12 +1,13 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 
-import App from './App';
+// The shared base styles load first, so every screen's own sheet can refine them.
 import './styles/global.css';
+import App from './App';
 
 async function start(): Promise<void> {
-  // The showcase (`VITE_GILDE_SHOWCASE=1`, `SHOWCASE` in src/features.ts) seeds
-  // the store with its demo data before the first paint. Only this guarded
+  // The showcase (`VITE_GILDE_SHOWCASE=1`, `SHOWCASE` in src/features.ts)
+  // installs its demo backend before the first paint. Only this guarded
   // dynamic import reaches `src/showcase/`. The guard is `SHOWCASE`'s own
   // expression, spelled out here on purpose: the bundler folds it inside this
   // module and then never emits the showcase chunk at all, whereas an imported

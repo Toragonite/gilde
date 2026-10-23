@@ -863,8 +863,8 @@ fn overall_is_the_highest_severity_of_the_alerts_not_dismissed() {
 
 // -- cost --------------------------------------------------------------------------
 
-#[test]
-fn eight_hundred_processes_cost_under_twenty_milliseconds_and_cwd_only_for_agents() {
+/// An 800-process machine with two agents every 50 rows (the §11.1 shape).
+fn eight_hundred() -> Vec<PsRow> {
     let mut rows = machine();
     for i in 0..800 {
         let pid = 10_000 + i;
@@ -876,27 +876,43 @@ fn eight_hundred_processes_cost_under_twenty_milliseconds_and_cwd_only_for_agent
         let parent = if i % 7 == 0 { 1 } else { 10_000 + i - 1 };
         rows.push(ps(pid, parent, pid, 10, 0.1, &args));
     }
-    let w = World::new(rows, facts(vec![live_team()]));
+    rows
+}
+
+/// The functional half (A10.7): on 800 processes the build reads a cwd only
+/// for agent rows, and a second tick reads none (cached per pid + start).
+#[test]
+fn eight_hundred_processes_read_cwd_only_for_agents_and_cache_it() {
+    let w = World::new(eight_hundred(), facts(vec![live_team()]));
     let mut b = HealthBuilder::new(HealthConfig::default());
-    // Warm-up (first cwd reads), then the measured steady-state tick.
-    let started = Instant::now();
     let first = w.tick(&mut b, 1);
-    let cold = started.elapsed();
     let agent_rows = first.agents.len();
+    assert!(agent_rows > 0, "the fixture has agents");
     assert!(
         b.last_cwd_lookups <= agent_rows,
         "cwd only for agent rows: {} lookups for {agent_rows} agents",
         b.last_cwd_lookups
     );
+    let _ = w.tick(&mut b, 2);
+    assert_eq!(b.last_cwd_lookups, 0, "cached per pid + start time");
+}
+
+/// G5 benchmark (A10.7: no wall-clock budget in a functional test): a warm
+/// health build over 800 processes adds < 20 ms to a tick. Run by the perf
+/// harness: `cargo test --lib -- --ignored health_bench`.
+#[test]
+#[ignore = "G5 benchmark (A10.7): wall-clock budget, run by the perf harness"]
+fn health_bench_eight_hundred_processes_cost_under_twenty_milliseconds() {
+    let w = World::new(eight_hundred(), facts(vec![live_team()]));
+    let mut b = HealthBuilder::new(HealthConfig::default());
+    let started = Instant::now();
+    let _ = w.tick(&mut b, 1);
+    let cold = started.elapsed();
     let started = Instant::now();
     let _ = w.tick(&mut b, 2);
     let warm = started.elapsed();
-    assert_eq!(b.last_cwd_lookups, 0, "cached per pid + start time");
     println!("health build over {} rows: cold {cold:?}, warm {warm:?}", w.rows.len());
-    assert!(
-        warm.as_millis() < 20,
-        "a tick's health build must add < 20 ms (took {warm:?})"
-    );
+    assert!(warm.as_millis() < 20, "a tick's health build must add < 20 ms (took {warm:?})");
 }
 
 // -- wire --------------------------------------------------------------------------

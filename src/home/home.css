@@ -1,0 +1,511 @@
+/*
+ * Focus Home [M15]: one column, calm. The focus card is the only boxed
+ * element that draws attention (its border takes the item's tone); the rest
+ * are quiet one-line rows, chips and lines. No colour beyond the tokens, no
+ * gradients, transitions ≤ 160 ms, nothing moves under reduced motion.
+ */
+
+.fh-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.fh-col {
+  max-width: var(--home-col);
+  margin: 0 auto;
+  padding: var(--sp-24);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-24);
+}
+
+.fh-head {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.fh-title {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--n12);
+}
+
+.fh-sum {
+  margin: 0;
+  color: var(--n8);
+  font-size: var(--fs-sub);
+  font-variant-numeric: tabular-nums;
+}
+
+/* -- the one notice -------------------------------------------------------- */
+.fh-notice,
+.fh-warn {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-8) var(--sp-12);
+  padding: var(--sp-6) var(--sp-8) var(--sp-6) var(--sp-12);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--n1);
+  font-size: var(--fs-sub);
+  color: var(--n10);
+}
+
+.fh-notice-text,
+.fh-warn-text {
+  flex: 1 1 220px;
+  min-width: 0;
+}
+
+.fh-warn {
+  border-color: color-mix(in srgb, var(--warn) 40%, var(--border));
+}
+
+.fh-warn > .i {
+  color: var(--warn);
+}
+
+/* -- the focus card -------------------------------------------------------- */
+.fh {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-8);
+}
+
+.fh-path {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-6);
+  min-width: 0;
+  font-size: var(--fs-sub);
+  color: var(--n9);
+}
+
+.fh-project {
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+.fh-name {
+  flex: 0 1 auto;
+  min-width: 0;
+  font-weight: 600;
+  color: var(--n12);
+}
+
+.fh-meta {
+  flex: 0 1 auto;
+  min-width: 0;
+  color: var(--n8);
+}
+
+.fh-card,
+.hc {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-12);
+  padding: var(--sp-12) var(--sp-16);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--n1);
+  outline: none;
+}
+
+.fh-card[data-tone='warn'],
+.hc {
+  border-color: color-mix(in srgb, var(--warn) 55%, var(--border));
+}
+
+.fh-card[data-tone='error'] {
+  border-color: color-mix(in srgb, var(--error) 40%, var(--border));
+}
+
+.fh-card:focus-visible,
+.hc:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.fh-state,
+.hc-title {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-6);
+  min-width: 0;
+  font-size: var(--fs-sub);
+  color: var(--n9);
+}
+
+.fh-word,
+.hc-state {
+  font-weight: 600;
+  flex: none;
+}
+
+.fh-word[data-tone='warn'],
+.hc-state {
+  color: var(--warn);
+}
+
+.fh-word[data-tone='error'] {
+  color: var(--error);
+}
+
+.fh-word[data-tone='ok'] {
+  color: var(--ok);
+}
+
+.fh-age {
+  font-size: var(--fs-label);
+  color: var(--n8);
+}
+
+.fh-text {
+  margin: 0;
+  color: var(--n11);
+  font-size: var(--fs-body);
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.fh-what {
+  color: var(--n12);
+}
+
+.fh-actions,
+.hc-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-6);
+}
+
+.fh-actions .btn,
+.hc-actions .btn {
+  height: 28px;
+  padding: 0 var(--sp-12);
+  max-width: 100%;
+}
+
+.hc-actions .btn .kbd {
+  margin: 0 var(--sp-2) 0 0;
+}
+
+.hc-object {
+  margin: 0;
+  padding: var(--sp-8) var(--sp-12);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--n0);
+  color: var(--n12);
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.hc-lines {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  color: var(--n10);
+  font-size: var(--fs-sub);
+}
+
+.hc-note {
+  margin: 0;
+  color: var(--n9);
+  font-size: var(--fs-sub);
+}
+
+.fh-ghost {
+  flex-direction: row;
+  align-items: center;
+  gap: var(--sp-8);
+  color: var(--n9);
+}
+
+.fh-ghost-name {
+  min-width: 0;
+  color: var(--n10);
+}
+
+/* -- sections, rows ------------------------------------------------------- */
+.fh-sec {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.fh-lbl {
+  margin: 0 0 var(--sp-4);
+  padding: 0 var(--sp-8);
+  display: flex;
+  align-items: center;
+  gap: var(--sp-6);
+  font-size: var(--fs-label);
+  font-weight: 400;
+  color: var(--n8);
+}
+
+.fh-lbl-hint {
+  margin-left: auto;
+}
+
+.hr-list,
+.fh-teams {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.hr-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-8);
+  height: 34px;
+  padding: 0 var(--sp-8);
+  border-radius: var(--r-sm);
+  color: var(--n11);
+  font-size: var(--fs-body);
+  min-width: 0;
+  outline: none;
+  cursor: default;
+}
+
+.hr-row:hover,
+.hr-row:focus-within {
+  background: var(--n2);
+}
+
+.hr-row:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.hr-name {
+  flex: 0 1 auto;
+  max-width: 50%;
+  min-width: 0;
+  color: var(--n12);
+  font-weight: 500;
+}
+
+.hr-where,
+.hr-what {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--n8);
+  font-size: var(--fs-sub);
+}
+
+/* M15: the state word shows on hover/focus only; the glyph shape stays distinct. */
+.hr-word {
+  display: none;
+  flex: none;
+  color: var(--n9);
+  font-size: var(--fs-sub);
+  font-weight: 500;
+}
+
+.hr-row:hover .hr-word,
+.hr-row:focus-within .hr-word {
+  display: inline;
+}
+
+.hr-age {
+  flex: none;
+  color: var(--n8);
+  font-size: var(--fs-label);
+}
+
+.hr-actions {
+  display: none;
+  flex: none;
+  gap: var(--sp-6);
+}
+
+.hr-row:hover .hr-actions,
+.hr-row:focus-within .hr-actions {
+  display: flex;
+}
+
+.hr-row:hover .hr-age,
+.hr-row:focus-within .hr-age {
+  display: none;
+}
+
+.hr-ghost {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-8);
+  height: 34px;
+  padding: 0 var(--sp-8);
+  color: var(--n8);
+  font-size: var(--fs-sub);
+}
+
+.hr-ghost .hr-name {
+  color: var(--n8);
+  font-weight: 400;
+}
+
+.fh-more {
+  align-self: flex-start;
+  margin: var(--sp-2) 0 0 var(--sp-4);
+}
+
+/* -- chips ---------------------------------------------------------------- */
+.fh-chips {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-6);
+  padding: 0 var(--sp-8);
+}
+
+.fh-chips .fh-lbl {
+  margin: 0 var(--sp-2) 0 0;
+  padding: 0;
+}
+
+.fh-chip {
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-6);
+  padding: 0 var(--sp-8);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--n0);
+  color: var(--n10);
+  font-size: var(--fs-sub);
+  white-space: nowrap;
+}
+
+.fh-chip:hover {
+  background: var(--n2);
+}
+
+.fh-chip[aria-expanded='true'] {
+  background: var(--n3);
+  border-color: var(--n6);
+  color: var(--n12);
+}
+
+.fh-chip-n {
+  color: var(--n9);
+  font-size: var(--fs-label);
+}
+
+/* -- teams ---------------------------------------------------------------- */
+.fh-team {
+  width: 100%;
+  min-height: 36px;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-8);
+  padding: var(--sp-2) var(--sp-8);
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--n11);
+  font-size: var(--fs-body);
+  text-align: left;
+}
+
+.fh-team:hover {
+  background: var(--n2);
+}
+
+.fh-team-name {
+  min-width: 0;
+  font-weight: 600;
+  color: var(--n12);
+}
+
+.fh-team-project {
+  min-width: 0;
+  color: var(--n8);
+  font-size: var(--fs-sub);
+}
+
+.fh-team-bar {
+  width: 72px;
+  flex: none;
+}
+
+.fh-team-frac {
+  color: var(--n9);
+  font-size: var(--fs-label);
+}
+
+.fh-bottleneck {
+  padding: 0 var(--sp-6);
+  border: 1px solid color-mix(in srgb, var(--warn) 45%, var(--border));
+  border-radius: var(--r-sm);
+  color: var(--warn);
+  font-size: var(--fs-label);
+  font-weight: 600;
+  line-height: 18px;
+  white-space: nowrap;
+}
+
+/* -- running line, calm --------------------------------------------------- */
+.fh-run {
+  align-self: flex-start;
+  margin: 0;
+  padding: 0 var(--sp-8);
+  color: var(--n8);
+  font-size: var(--fs-sub);
+  font-variant-numeric: tabular-nums;
+}
+
+.fh-calm {
+  margin: var(--sp-8) 0 0;
+  color: var(--n9);
+  font-size: 14px;
+}
+
+.fh-scroll .empty {
+  align-items: flex-start;
+  padding: var(--sp-8) 0;
+  font-size: var(--fs-body);
+  color: var(--n9);
+}
+
+/* The focus card's title is its Open control (⏎ on the card does the same). */
+.fh-open {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  font-weight: 600;
+  color: var(--n12);
+  text-align: left;
+  cursor: default;
+}
+
+.fh-open:hover {
+  text-decoration: underline;
+}
+
+/* Later shows while the focus card is hovered or focused (L works there too). */
+.fh-later {
+  display: none;
+}
+
+.fh:hover .fh-later,
+.fh:focus-within .fh-later {
+  display: inline-flex;
+}

@@ -1,6 +1,12 @@
 /**
  * methods/fleet.ts — `fleet.route`, the ONLY routing surface (DESIGN §5-4).
  *
+ * NOT PART OF PROTOCOL 2 (contract §2.2.3: "KEEP, routing unused in v1"): this
+ * module is kept for v1.x and is not registered on the channel (`index.ts`), so a
+ * `fleet.route` request is `-32601 unknown method`. It still type-checks against
+ * the protocol-2 fleet: the agent-mesh `Fleet` is assembled from the current
+ * adapters on each call.
+ *
  * Routing is deliberately isolated in one method. `mesh.run`, `mesh.stream` and
  * `mesh.resume` all demand an explicit vendor and will never pick one for you:
  * a dispatch that silently re-targets itself would send a user's prompt to a
@@ -19,15 +25,17 @@
  * turn "everything is exhausted, this is a guess" into a confident answer.
  */
 
+import { Fleet } from '@toragonite/agent-mesh';
 import type { RoutePolicy, RunTask } from '@toragonite/agent-mesh';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
-import { INTROSPECT_RUN_ID, runCtx } from '../exec-registered';
+import { runCtx } from '../exec-registered';
 import type { SidecarState } from '../fleet';
 import { RpcError, RPC_INVALID_PARAMS } from '../rpc';
 import type { Rpc } from '../rpc';
-import { toRpcFailure } from './mesh';
+import { classifyError } from './turns';
+import { RPC_ADAPTER_ERROR } from './wire';
 
 /** Strategies `Fleet.route` understands; anything else is a caller mistake. */
 const STRATEGIES = new Set(['prefer-order', 'most-quota', 'lowest-latency']);
@@ -135,15 +143,21 @@ export function registerFleetMethods(rpc: Rpc, requireState: () => SidecarState)
     try {
       // `Fleet.route` probes quota and model catalogs; those children belong to the
       // introspection run, not to whatever dispatch is about to be created.
-      const decision = await runCtx.run({ runId: INTROSPECT_RUN_ID, vendor: 'fleet' }, () =>
-        state.built.fleet.route(task, policy),
+      const fleet = new Fleet();
+      for (const adapter of state.built.adapters.values()) fleet.register(adapter);
+      const decision = await runCtx.run({ turnId: null, vendor: null, kind: 'probe' }, () =>
+        fleet.route(task, policy),
       );
       return decision.note === undefined
         ? { vendor: decision.adapter.vendor }
         : { vendor: decision.adapter.vendor, note: decision.note };
     } catch (err) {
       // NoRouteError arrives here as `data.name = 'NoRouteError'`.
-      throw toRpcFailure(err);
+      const name = err instanceof Error ? err.name : 'UnknownError';
+      throw new RpcError(RPC_ADAPTER_ERROR, err instanceof Error ? err.message : String(err), {
+        name,
+        class: classifyError(err),
+      });
     }
   });
 }

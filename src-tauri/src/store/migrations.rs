@@ -338,12 +338,121 @@ CREATE INDEX ix_message_conversation ON message(conversation_id, seq);
 CREATE INDEX ix_message_parent ON message(parent_id) WHERE parent_id IS NOT NULL;
 "#;
 
+/// Migration v2 "gilde2" (contract §3.9) — **metadata only**.
+///
+/// Drops the reserved content tables, adds the Gilde 2 metadata tables, and
+/// extends three existing ones. Notes against the contract's SQL:
+///
+/// * `account.label`, `account.is_default` and `account.source` already exist
+///   since v1 (`label` NOT NULL), so only the two quota columns are added —
+///   re-adding a column is an error in SQLite;
+/// * `app_instance.window_visible_at` is the B5 timestamp T-boot-2 compares
+///   every `proc_registry.planned_at` against (§2.4);
+/// * `proc_registry.parent_uid` is the owning session of a row (§3.8: rows
+///   "carry `parent_uid` where a session owns them");
+/// * `pty_session.title` (a v1 column that could hold terminal titles, i.e.
+///   content) is dropped with the content tables under `secure_delete`, so
+///   the rewritten rows leave no title bytes behind; PTY titles live in
+///   memory only (A12.4). [`apply_through`] checkpoints the WAL right after
+///   this migration so no older frame keeps them either.
+const M0002_GILDE2: &str = r#"
+-- ---------------------------------------------------------------- §3.9
+-- The reserved content tables and the v1 PTY title column go, and their
+-- freed bytes are overwritten (A12.4).
+PRAGMA secure_delete = ON;
+DROP TABLE IF EXISTS message;
+DROP TABLE IF EXISTS conversation;
+ALTER TABLE pty_session DROP COLUMN title;
+PRAGMA secure_delete = OFF;
+
+CREATE TABLE session_meta (
+  uid               TEXT PRIMARY KEY,
+  vendor            TEXT NOT NULL CHECK (vendor IN ('claude','codex','cursor','agy')),
+  account_id        TEXT,
+  vendor_session_id TEXT,
+  project_id        TEXT, location_path TEXT, cwd TEXT, transcript_path TEXT,
+  origin_last       TEXT, control_mode_last TEXT, permission_mode_last TEXT, model_last TEXT,
+  cli_path_last     TEXT, cli_version_last TEXT,
+  team_key          TEXT, agent_id TEXT, teammate_name TEXT, parent_session_id TEXT,
+  parent_uid        TEXT,
+  first_seen_at     INTEGER NOT NULL, started_at INTEGER, ended_at INTEGER,
+  last_activity_at  INTEGER, last_seen_at INTEGER,
+  usage_day TEXT, usage_in INTEGER, usage_out INTEGER, usage_cached INTEGER, cost_micros INTEGER,
+  absent_since      INTEGER,
+  updated_at        INTEGER NOT NULL,
+  UNIQUE (vendor, account_id, vendor_session_id)
+);
+CREATE INDEX ix_session_meta_absent ON session_meta(absent_since) WHERE absent_since IS NOT NULL;
+CREATE INDEX ix_session_meta_project ON session_meta(project_id) WHERE project_id IS NOT NULL;
+
+CREATE TABLE history_index (
+  path TEXT PRIMARY KEY, vendor TEXT NOT NULL, account_id TEXT, vendor_session_id TEXT,
+  size INTEGER NOT NULL, mtime_ms INTEGER NOT NULL, inode INTEGER NOT NULL,
+  cwd TEXT, git_branch TEXT, entrypoint TEXT, is_teammate INTEGER NOT NULL DEFAULT 0,
+  team_name TEXT, teammate_name TEXT, continued_in TEXT, turns INTEGER,
+  first_row_at INTEGER, last_row_at INTEGER, scanned_at INTEGER NOT NULL
+);
+CREATE INDEX ix_history_index_session ON history_index(vendor, vendor_session_id);
+
+CREATE TABLE quit_record (
+  id TEXT PRIMARY KEY,
+  cause TEXT NOT NULL CHECK (cause IN ('quit','crash')),
+  created_at INTEGER NOT NULL,
+  resolved_at INTEGER
+);
+CREATE INDEX ix_quit_record_open ON quit_record(created_at) WHERE resolved_at IS NULL;
+
+CREATE TABLE quit_record_item (
+  record_id TEXT NOT NULL REFERENCES quit_record(id) ON DELETE CASCADE,
+  uid TEXT NOT NULL, control_mode TEXT NOT NULL, permission_mode TEXT, model TEXT,
+  was_waiting TEXT CHECK (was_waiting IN ('approval','answer')),
+  team_lead INTEGER NOT NULL DEFAULT 0,
+  survivor INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (record_id, uid)
+);
+
+CREATE TABLE claude_compat_observed (
+  version TEXT NOT NULL, conversation TEXT, pane_hosting TEXT,
+  source TEXT NOT NULL,
+  binary_fingerprint TEXT,
+  static_result TEXT, handshake_ok INTEGER, features_json TEXT,
+  note TEXT, observed_at INTEGER NOT NULL,
+  PRIMARY KEY (version, binary_fingerprint)
+);
+
+CREATE TABLE project_prefs (
+  project_id TEXT PRIMARY KEY,
+  last_vendor TEXT, last_account_id TEXT, last_model TEXT, last_control_mode TEXT,
+  last_location_kind TEXT,
+  updated_at INTEGER NOT NULL
+);
+
+ALTER TABLE account ADD COLUMN quota_json TEXT;
+ALTER TABLE account ADD COLUMN quota_at INTEGER;
+
+ALTER TABLE app_instance ADD COLUMN window_visible_at INTEGER;
+
+ALTER TABLE proc_registry ADD COLUMN parent_uid TEXT;
+CREATE INDEX ix_proc_parent ON proc_registry(parent_uid) WHERE parent_uid IS NOT NULL;
+"#;
+
 /// The ordered, forward-only set. Append only.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "initial",
-    sql: M0001_INITIAL,
-}];
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "initial",
+        sql: M0001_INITIAL,
+    },
+    Migration {
+        version: 2,
+        name: "gilde2",
+        sql: M0002_GILDE2,
+    },
+];
+
+/// Migrations that remove content (A12.4): the WAL is checkpointed and
+/// truncated right after them.
+const SCRUBBING: &[u32] = &[2];
 
 /// Highest version this build knows about.
 pub fn latest_version() -> u32 {
@@ -410,6 +519,12 @@ pub fn inspect(conn: &Connection) -> Result<Option<SchemaError>> {
 /// Returns the version in force afterwards. Re-running is a no-op: already
 /// applied migrations are only checksum-verified, never re-executed.
 pub fn apply_all(conn: &Connection, now: i64) -> Result<u32> {
+    apply_through(conn, now, latest_version())
+}
+
+/// [`apply_all`], stopping after `max_version` — the v1→v2 migration test
+/// builds a v1 database with it. Boot always calls [`apply_all`].
+pub fn apply_through(conn: &Connection, now: i64, max_version: u32) -> Result<u32> {
     conn.execute_batch(BOOTSTRAP_SQL)?;
 
     if let Some(problem) = inspect(conn)? {
@@ -426,8 +541,9 @@ pub fn apply_all(conn: &Connection, now: i64) -> Result<u32> {
         out
     };
 
+    let mut scrubbed = false;
     for m in MIGRATIONS {
-        if applied.contains(&m.version) {
+        if applied.contains(&m.version) || m.version > max_version {
             continue;
         }
         let tx = conn.unchecked_transaction()?;
@@ -438,33 +554,54 @@ pub fn apply_all(conn: &Connection, now: i64) -> Result<u32> {
             rusqlite::params![m.version, now, m.checksum(), m.name],
         )?;
         tx.commit()?;
+        scrubbed |= SCRUBBING.contains(&m.version);
         tracing::info!(version = m.version, name = m.name, "applied migration");
+    }
+    if scrubbed {
+        // The removed content may still sit in older WAL frames: copy the
+        // zeroed pages into the main file and truncate the WAL (A12.4).
+        // A rollback-journal or in-memory database answers without effect.
+        if let Err(err) = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(())) {
+            tracing::warn!(error = %err, "could not checkpoint the WAL after a scrubbing migration");
+        }
     }
 
     current_version(conn)
 }
 
-/// Table names migration 1 must have created. Used by the schema test and by
+/// Table names the full migration set creates. Used by the schema test and by
 /// `app_diagnostics()`.
 pub const EXPECTED_TABLES: &[&str] = &[
     "account",
     "agent_binary",
     "app_instance",
-    "conversation",
+    "claude_compat_observed",
     "dispatch_run",
     "dispatch_task",
     "event_log",
-    "message",
+    "history_index",
     "proc_registry",
     "proc_sample",
     "project",
+    "project_prefs",
     "pty_session",
+    "quit_record",
+    "quit_record_item",
     "run_event",
     "schema_migrations",
+    "session_meta",
     "settings_kv",
     "worktree",
     "worktree_alias",
 ];
+
+/// Tables v1 created that v2 drops (the reserved content tables, §3.9).
+pub const DROPPED_IN_V2: &[&str] = &["conversation", "message"];
+
+/// Legacy tables Gilde 2 never reads or writes (§3.9): kept for the user's old
+/// data until a Settings → Storage action removes them (v1.x). The schema
+/// privacy scan (T-priv-1) reports their content columns separately.
+pub const LEGACY_TABLES: &[&str] = &["dispatch_task", "dispatch_run", "run_event"];
 
 /// Indexes DESIGN §8-2 names explicitly. Their absence is a schema bug.
 pub const REQUIRED_PROC_INDEXES: &[&str] = &[
@@ -496,10 +633,10 @@ mod tests {
     }
 
     #[test]
-    fn migration_one_creates_every_table_and_index() {
+    fn the_migration_set_creates_every_table_and_index() {
         let conn = mem();
         assert_eq!(current_version(&conn).unwrap(), 0);
-        assert_eq!(apply_all(&conn, 1_000).unwrap(), 1);
+        assert_eq!(apply_all(&conn, 1_000).unwrap(), latest_version());
 
         let tables = table_names(&conn);
         for expected in EXPECTED_TABLES {
@@ -533,8 +670,8 @@ mod tests {
         assert_eq!(applied_at, 1_000);
 
         // A second (and third) run must not rewrite the row or re-run the DDL.
-        assert_eq!(apply_all(&conn, 2_000).unwrap(), 1);
-        assert_eq!(apply_all(&conn, 3_000).unwrap(), 1);
+        assert_eq!(apply_all(&conn, 2_000).unwrap(), latest_version());
+        assert_eq!(apply_all(&conn, 3_000).unwrap(), latest_version());
         let applied_at: i64 = conn
             .query_row("SELECT applied_at FROM schema_migrations WHERE version=1", [], |r| r.get(0))
             .unwrap();
@@ -542,7 +679,7 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(count, MIGRATIONS.len() as i64);
     }
 
     #[test]
@@ -574,9 +711,35 @@ mod tests {
         .unwrap();
         assert!(matches!(
             inspect(&conn).unwrap(),
-            Some(SchemaError::FromTheFuture { found: 999, known: 1 })
+            Some(SchemaError::FromTheFuture { found: 999, known: 2 })
         ));
         assert!(apply_all(&conn, 2_000).is_err(), "boot must abort");
+    }
+
+    #[test]
+    fn v2_on_top_of_v1_drops_content_tables_and_keeps_rows() {
+        let conn = mem();
+        assert_eq!(apply_through(&conn, 1_000, 1).unwrap(), 1);
+        conn.execute_batch(
+            "INSERT INTO conversation (id, source, source_session_id, source_locator, title,
+               created_at, updated_at, resumability, imported_at, schema_variant)
+             VALUES ('c1','claude','s','f','secret title',1,1,'native_resume',1,'cc-2.1');
+             INSERT INTO account (id, vendor, label, source, imported_at) VALUES ('a1','claude','Work','manual',1);",
+        )
+        .unwrap();
+        assert_eq!(apply_all(&conn, 2_000).unwrap(), 2);
+        let tables = table_names(&conn);
+        for gone in DROPPED_IN_V2 {
+            assert!(!tables.iter().any(|t| t == gone), "{gone} survived v2");
+        }
+        let label: String = conn
+            .query_row("SELECT label FROM account WHERE id='a1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(label, "Work");
+        let quota: Option<String> = conn
+            .query_row("SELECT quota_json FROM account WHERE id='a1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(quota, None);
     }
 
     #[test]

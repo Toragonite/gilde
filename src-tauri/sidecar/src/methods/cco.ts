@@ -105,16 +105,26 @@ import type {
  * Wire names (sidecar ⇄ Rust). Mirrored in src-tauri/src/sidecar/protocol.rs.
  * ------------------------------------------------------------------------- */
 
-/** host → sidecar requests. */
+/**
+ * host → sidecar requests (contract §4.5: the existing `cco.*` methods, renamed
+ * `orch.*`, registered only while the orchestrator is present — methods/orch.ts).
+ */
 export const CCO_METHOD = {
   /** `{roots, panePids, allWorkspaces?}` → CcoTeamListResult. Also sets what is watched. */
-  list: 'cco.team.list',
+  list: 'orch.team.list',
   /** `{teamId}` → CcoTeamView | null. */
-  get: 'cco.team.get',
+  get: 'orch.team.get',
+  /** Same params and answer as `list`; the name the contract gives starting the observer. */
+  subscribe: 'orch.team.subscribe',
 } as const;
 
-/** sidecar → host notification: `{rev, teamId, view: CcoTeamView | null}`. Lossy, latest wins. */
-export const CCO_SNAPSHOT_NOTIFICATION = 'cco.team.snapshot';
+/**
+ * sidecar → host notification (contract §4.5 `OrchSnapshotParams`):
+ * `{generation, rev, team: {teamId, view: CcoTeamView | null}}`. Lossy, latest
+ * wins by `(generation, rev)`; `generation` is this observer's epoch (a new
+ * observer — the orchestrator came back — restarts `rev`).
+ */
+export const CCO_SNAPSHOT_NOTIFICATION = 'orch.snapshot';
 
 /* ------------------------------------------------------------------------- *
  * Bounds
@@ -1961,18 +1971,26 @@ export function scopeOf(params: unknown): { roots: string[]; panePids: number[];
  */
 export function registerCcoMethods(
   rpc: Rpc,
-  opts: { log: CcoObserverOptions['log']; dataRoot?: string },
+  opts: { log: CcoObserverOptions['log']; dataRoot?: string; generation?: number },
 ): CcoObserver {
+  const generation = opts.generation ?? 1;
   const observer = new CcoObserver({
-    forward: (params) => rpc.notify(CCO_SNAPSHOT_NOTIFICATION, params),
+    forward: (params) =>
+      rpc.notify(CCO_SNAPSHOT_NOTIFICATION, {
+        generation,
+        rev: params.rev,
+        team: { teamId: params.teamId, view: params.view },
+      }),
     log: opts.log,
     ...(opts.dataRoot !== undefined ? { dataRoot: opts.dataRoot } : {}),
   });
-  rpc.on(CCO_METHOD.list, (params: unknown) => {
+  const listHandler = (params: unknown): ReturnType<CcoObserver['list']> => {
     const scope = scopeOf(params);
     observer.setScope(scope.roots, scope.panePids, scope.allWorkspaces);
     return observer.list();
-  });
+  };
+  rpc.on(CCO_METHOD.list, listHandler);
+  rpc.on(CCO_METHOD.subscribe, listHandler);
   rpc.on(CCO_METHOD.get, (params: unknown) => {
     const teamId = isRecord(params) ? params.teamId : undefined;
     if (typeof teamId !== 'string' || !TEAM_ID.test(teamId)) throw invalid('teamId must be a team id (tm…)');

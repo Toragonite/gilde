@@ -43,8 +43,7 @@ pub enum SessionStatus {
 }
 
 impl SessionStatus {
-    /// Stable discriminant string, useful for persistence and for mapping onto
-    /// [`crate::model::graph::NodeStatus`].
+    /// Stable discriminant string, useful for persistence.
     pub fn kind(&self) -> &'static str {
         match self {
             SessionStatus::Starting => "starting",
@@ -108,6 +107,16 @@ pub enum StatusEvidence {
     #[serde(rename_all = "camelCase")]
     ScreenStable { ms: u64 },
     Bell,
+    /// A screen prompt (or an unnumbered setup menu) was read off the grid
+    /// (contract §6.2.4). No label text: the evidence carries shape only.
+    #[serde(rename_all = "camelCase")]
+    ScreenPrompt { options: u8, setup: bool },
+    /// The vendor's ready signature is on a settled grid (§6.2.6).
+    ReadySignature,
+    /// The grid has been settled this long with no prompt and no menu: the
+    /// fallback for a vendor without a ready signature (§6.2.6, N-03).
+    #[serde(rename_all = "camelCase")]
+    SettledGrid { ms: u64 },
     #[serde(rename_all = "camelCase")]
     ChildExited {
         #[serde(default, skip_serializing_if = "Option::is_none")]

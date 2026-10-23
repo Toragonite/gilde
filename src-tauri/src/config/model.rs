@@ -251,29 +251,6 @@ impl Default for SidecarConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
-pub struct DispatchConfig {
-    pub default_timeout_minutes: u32,
-    /// Free-form on purpose: vendors keep adding modes (`ipc.ts` types this as
-    /// a union **plus** `string`).
-    pub permission_mode: String,
-    pub max_concurrent_runs: u32,
-    #[serde(flatten)]
-    pub extra: Extra,
-}
-
-impl Default for DispatchConfig {
-    fn default() -> Self {
-        Self {
-            default_timeout_minutes: 45,
-            permission_mode: "acceptEdits".to_string(),
-            max_concurrent_runs: 4,
-            extra: Extra::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
 pub struct WorktreeConfig {
     pub root: String,
     pub archive_root: String,
@@ -384,30 +361,77 @@ impl Default for TerminalConfig {
     }
 }
 
+/// Attention settings (contract §3.5.2, §9.6 ordinary class).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
-pub struct LayoutConfig {
-    pub sidebar_width: u32,
-    pub inspector_open: bool,
-    pub inspector_width: u32,
-    /// Opaque to Rust: the pane tree is the frontend's shape (DESIGN §9-1).
-    pub panes: Map<String, Value>,
-    pub tabs: Vec<Value>,
+pub struct AttentionConfig {
+    /// No progress after this long (60..=3600, default 300).
+    pub no_progress_after_secs: u32,
+    /// "Finished turns from sessions started elsewhere" (default Show) [ux-ia §6.1].
+    pub watched_finished_turns: bool,
     #[serde(flatten)]
     pub extra: Extra,
 }
 
-impl Default for LayoutConfig {
+impl Default for AttentionConfig {
     fn default() -> Self {
         Self {
-            sidebar_width: 280,
-            inspector_open: true,
-            inspector_width: 360,
-            panes: Map::new(),
-            tabs: Vec::new(),
+            no_progress_after_secs: 300,
+            watched_finished_turns: true,
             extra: Extra::new(),
         }
     }
+}
+
+/// Notification settings (contract §8.4, §9.6 ordinary class).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct NotifyConfig {
+    /// "Notify about sessions started elsewhere" (default on, after 60 s) [M8].
+    pub watched_sessions: bool,
+    /// One system sound for band 1 only (default off, §8.3).
+    pub sound: bool,
+    /// "알림에 내용 표시" / "Show details in notifications" (default off) [F-31].
+    pub show_details: bool,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+impl Default for NotifyConfig {
+    fn default() -> Self {
+        Self {
+            watched_sessions: true,
+            sound: false,
+            show_details: false,
+            extra: Extra::new(),
+        }
+    }
+}
+
+/// `ide.editor ∈ {vscode, cursor}` (contract §9.4); no `ide.cli` key [C9].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct IdeConfig {
+    pub editor: Option<String>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// Discovery knobs (contract §5); owned by the discovery task's semantics,
+/// stored here so they round-trip.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DiscoveryConfig {
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// Team knobs (contract §7); stored here so they round-trip.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TeamsConfig {
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -461,14 +485,17 @@ pub struct AppConfig {
     pub projects: Vec<ProjectConfig>,
     pub agents: AgentsConfig,
     pub sidecar: SidecarConfig,
-    pub dispatch: DispatchConfig,
     pub worktree: WorktreeConfig,
     pub supervision: SupervisionConfig,
     pub status: StatusConfig,
     pub terminal: TerminalConfig,
-    pub layout: LayoutConfig,
     pub accounts: AccountsConfig,
     pub notifications: NotificationsConfig,
+    pub attention: AttentionConfig,
+    pub notify: NotifyConfig,
+    pub ide: IdeConfig,
+    pub discovery: DiscoveryConfig,
+    pub teams: TeamsConfig,
     /// Keys written by a newer build. Never interpreted, never dropped.
     #[serde(flatten)]
     pub extra: Extra,
@@ -483,14 +510,17 @@ impl Default for AppConfig {
             projects: Vec::new(),
             agents: AgentsConfig::default(),
             sidecar: SidecarConfig::default(),
-            dispatch: DispatchConfig::default(),
             worktree: WorktreeConfig::default(),
             supervision: SupervisionConfig::default(),
             status: StatusConfig::default(),
             terminal: TerminalConfig::default(),
-            layout: LayoutConfig::default(),
             accounts: AccountsConfig::default(),
             notifications: NotificationsConfig::default(),
+            attention: AttentionConfig::default(),
+            notify: NotifyConfig::default(),
+            ide: IdeConfig::default(),
+            discovery: DiscoveryConfig::default(),
+            teams: TeamsConfig::default(),
             extra: Extra::new(),
         }
     }
@@ -500,6 +530,142 @@ impl AppConfig {
     /// The configured absolute path for one agent kind, if the user pinned one.
     pub fn agent_binary(&self, kind: &str) -> Option<&str> {
         self.agents.binaries.get(kind).and_then(|v| v.as_deref())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the contract's `Settings` (§9.6): ordinary and executable classes
+// ---------------------------------------------------------------------------
+
+impl AppConfig {
+    /// `settings_get` (§4.2.8): the ordinary keys and, read-only, the
+    /// executable-class values.
+    pub fn to_settings(&self) -> crate::contract::ipc::Settings {
+        use crate::contract::common::AbsPath;
+        use crate::contract::ipc::{
+            AttentionSettings, EditorKind, ExecutableSettings, IdeSettings, LocaleSetting,
+            NotifySettings, Settings, Theme,
+        };
+        let abs = |v: Option<&str>| v.and_then(|p| AbsPath::parse(p.to_string()).ok());
+        Settings {
+            locale: match self.locale {
+                Locale::System => LocaleSetting::System,
+                Locale::Ko => LocaleSetting::Ko,
+                Locale::En => LocaleSetting::En,
+            },
+            theme: match self.theme {
+                ThemePreference::System => Theme::System,
+                ThemePreference::Light => Theme::Light,
+                ThemePreference::Dark => Theme::Dark,
+            },
+            attention: AttentionSettings {
+                no_progress_after_secs: self.attention.no_progress_after_secs.clamp(60, 3600),
+                watched_finished_turns: self.attention.watched_finished_turns,
+            },
+            notify: NotifySettings {
+                watched_sessions: self.notify.watched_sessions,
+                sound: self.notify.sound,
+                show_details: self.notify.show_details,
+            },
+            ide: IdeSettings {
+                editor: match self.ide.editor.as_deref() {
+                    Some("vscode") => Some(EditorKind::VsCode),
+                    Some("cursor") => Some(EditorKind::Cursor),
+                    _ => None,
+                },
+            },
+            executable: ExecutableSettings {
+                claude_binary: abs(self.agent_binary("claude")),
+                codex_binary: abs(self.agent_binary("codex")),
+                cursor_binary: abs(self.agent_binary("cursorAgent").or(self.agent_binary("cursor"))),
+                agy_binary: abs(self.agent_binary("agy")),
+                sidecar_node_path: abs(self.sidecar.node_path.as_deref()),
+                paths_override: abs(self.agents.path_override.as_deref()),
+                env_passthrough: self.agents.env_passthrough.clone(),
+            },
+        }
+    }
+
+    /// `settings_set`: the JSON patch of `config.json` that applies an
+    /// ordinary-keys patch (whole-patch validated by the caller). Executable
+    /// keys cannot be reached from here (§9.6).
+    pub fn ordinary_patch_json(patch: &crate::contract::ipc::SettingsPatch) -> Value {
+        use crate::contract::ipc::{EditorKind, LocaleSetting, Theme};
+        let mut root = Map::new();
+        if let Some(l) = patch.locale {
+            let v = match l {
+                LocaleSetting::System => "system",
+                LocaleSetting::Ko => "ko",
+                LocaleSetting::En => "en",
+            };
+            root.insert("locale".into(), Value::from(v));
+        }
+        if let Some(t) = patch.theme {
+            let v = match t {
+                Theme::System => "system",
+                Theme::Light => "light",
+                Theme::Dark => "dark",
+            };
+            root.insert("theme".into(), Value::from(v));
+        }
+        if let Some(a) = &patch.attention {
+            let mut m = Map::new();
+            if let Some(v) = a.no_progress_after_secs {
+                m.insert("noProgressAfterSecs".into(), Value::from(v));
+            }
+            if let Some(v) = a.watched_finished_turns {
+                m.insert("watchedFinishedTurns".into(), Value::from(v));
+            }
+            root.insert("attention".into(), Value::Object(m));
+        }
+        if let Some(n) = &patch.notify {
+            let mut m = Map::new();
+            if let Some(v) = n.watched_sessions {
+                m.insert("watchedSessions".into(), Value::from(v));
+            }
+            if let Some(v) = n.sound {
+                m.insert("sound".into(), Value::from(v));
+            }
+            if let Some(v) = n.show_details {
+                m.insert("showDetails".into(), Value::from(v));
+            }
+            root.insert("notify".into(), Value::Object(m));
+        }
+        if let Some(i) = &patch.ide {
+            if let Some(e) = i.editor {
+                let v = match e {
+                    EditorKind::VsCode => "vscode",
+                    EditorKind::Cursor => "cursor",
+                };
+                root.insert("ide".into(), serde_json::json!({ "editor": v }));
+            }
+        }
+        Value::Object(root)
+    }
+
+    /// `settings_set_executable`: the JSON patch for one executable key
+    /// (after the native confirmation and the file checks, §4.2.8).
+    pub fn executable_patch_json(
+        key: crate::contract::ipc::ExecutableKey,
+        value: &crate::contract::ipc::ExecutableValue,
+    ) -> Value {
+        use crate::contract::ipc::{ExecutableKey as K, ExecutableValue as V};
+        let path = match value {
+            V::Path { path } => path.as_ref().map(|p| Value::from(p.as_str())).unwrap_or(Value::Null),
+            V::EnvNames { .. } => Value::Null,
+        };
+        match (key, value) {
+            (K::EnvPassthrough, V::EnvNames { names }) => {
+                serde_json::json!({ "agents": { "envPassthrough": names } })
+            }
+            (K::ClaudeBinary, _) => serde_json::json!({ "agents": { "binaries": { "claude": path } } }),
+            (K::CodexBinary, _) => serde_json::json!({ "agents": { "binaries": { "codex": path } } }),
+            (K::CursorBinary, _) => serde_json::json!({ "agents": { "binaries": { "cursorAgent": path } } }),
+            (K::AgyBinary, _) => serde_json::json!({ "agents": { "binaries": { "agy": path } } }),
+            (K::SidecarNodePath, _) => serde_json::json!({ "sidecar": { "nodePath": path } }),
+            (K::PathsOverride, _) => serde_json::json!({ "agents": { "pathOverride": path } }),
+            (K::EnvPassthrough, _) => Value::Object(Map::new()),
+        }
     }
 }
 
@@ -564,10 +730,9 @@ mod tests {
         );
 
         assert_eq!(value["sidecar"], json!({ "enabled": true, "nodePath": null, "pingIntervalSeconds": 10 }));
-        assert_eq!(
-            value["dispatch"],
-            json!({ "defaultTimeoutMinutes": 45, "permissionMode": "acceptEdits", "maxConcurrentRuns": 4 })
-        );
+        // The legacy `dispatch` table is gone (A22.3); a file that still has
+        // one keeps it in `extra`, untouched.
+        assert!(value.get("dispatch").is_none());
         assert_eq!(
             value["worktree"],
             json!({
@@ -606,25 +771,45 @@ mod tests {
                 "shell": null
             })
         );
-        assert_eq!(
-            value["layout"],
-            json!({
-                "sidebarWidth": 280,
-                "inspectorOpen": true,
-                "inspectorWidth": 360,
-                "panes": {},
-                "tabs": []
-            })
-        );
         assert_eq!(value["accounts"], json!({ "registryMode": "import-once" }));
         assert_eq!(value["notifications"], json!({ "system": true }));
+        assert_eq!(
+            value["attention"],
+            json!({ "noProgressAfterSecs": 300, "watchedFinishedTurns": true })
+        );
+        assert_eq!(
+            value["notify"],
+            json!({ "watchedSessions": true, "sound": false, "showDetails": false })
+        );
+        assert_eq!(value["ide"], json!({ "editor": null }));
+        assert!(value.get("layout").is_none(), "the graph layout section is gone (Gilde 2)");
 
-        // Exactly the sections DESIGN §10-3 lists, plus `notifications` — no more, no less.
+        // The Gilde 2 sections (contract §2.2.1 config/model.rs) — no more, no
+        // less (18 before the legacy `dispatch` table went, A22.3).
         assert_eq!(
             value.as_object().expect("object").len(),
-            14,
+            17,
             "unexpected top-level keys: {value:#?}"
         );
+    }
+
+    /// A22.3: the legacy `dispatch` table is gone from the model, but a
+    /// user's existing one survives a load/save round trip untouched (it
+    /// lands in `extra`, which is never interpreted and never dropped).
+    #[test]
+    fn a_legacy_dispatch_table_round_trips_untouched() {
+        let dispatch = json!({
+            "defaultTimeoutMinutes": 90,
+            "permissionMode": "bypassPermissions",
+            "maxConcurrentRuns": 7,
+            "someFutureKey": {"nested": [1, 2, 3]}
+        });
+        let file = json!({ "locale": "en", "dispatch": dispatch.clone() });
+        let cfg: AppConfig = serde_json::from_value(file).expect("parse");
+        let saved = serde_json::to_value(&cfg).expect("serialize");
+        assert_eq!(saved["dispatch"], dispatch, "kept exactly as the user had it");
+        let again: AppConfig = serde_json::from_value(saved.clone()).expect("reparse");
+        assert_eq!(serde_json::to_value(&again).expect("serialize")["dispatch"], dispatch);
     }
 
     #[test]
@@ -636,7 +821,6 @@ mod tests {
         assert_eq!(cfg.terminal.font_size, 18.0);
         // Everything else fell back to the documented default.
         assert_eq!(cfg.terminal.font_family, "SF Mono, Menlo, monospace");
-        assert_eq!(cfg.dispatch.default_timeout_minutes, 45);
         assert_eq!(cfg.schema_version, SCHEMA_VERSION);
     }
 

@@ -1,0 +1,11 @@
+{"type":"agent-setting","agentSetting":"default","sessionId":"{{SID}}"}
+{"type":"permission-mode","permissionMode":"default","sessionId":"{{SID}}"}
+{"type":"user","message":{"role":"user","content":"CANARY-7f3a-CONTENT first prompt about the parser"},"uuid":"u1","timestamp":"2026-10-21T04:25:06.000Z","sessionId":"{{SID}}","cwd":"{{CWD}}","gitBranch":"main","entrypoint":"cli","version":"2.1.306"}
+{"type":"attachment","attachment":{"type":"queued_command"},"timestamp":"2026-10-21T04:25:06.100Z","sessionId":"{{SID}}"}
+{"type":"assistant","message":{"id":"msg_1","role":"assistant","content":[{"type":"thinking","thinking":"CANARY-7f3a-CONTENT"}],"stop_reason":null},"uuid":"a1","timestamp":"2026-10-21T04:25:08.000Z","sessionId":"{{SID}}","cwd":"{{CWD}}"}
+{"type":"assistant","message":{"id":"msg_1","role":"assistant","content":[{"type":"tool_use","id":"toolu_01","name":"Bash","input":{"command":"CANARY-7f3a-CONTENT ls"}}],"stop_reason":"tool_use"},"uuid":"a2","timestamp":"2026-10-21T04:25:09.000Z","sessionId":"{{SID}}","cwd":"{{CWD}}"}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"CANARY-7f3a-CONTENT output"}]},"permissionDecision":{"decision":"accept","source":"config"},"uuid":"u2","timestamp":"2026-10-21T04:25:10.000Z","sessionId":"{{SID}}","cwd":"{{CWD}}"}
+{"type":"assistant","message":{"id":"msg_2","role":"assistant","content":[{"type":"text","text":"CANARY-7f3a-CONTENT final reply"}],"stop_reason":"end_turn"},"uuid":"a3","timestamp":"2026-10-21T04:25:12.000Z","sessionId":"{{SID}}","cwd":"{{CWD}}"}
+{"type":"system","subtype":"turn_duration","durationMs":6000,"timestamp":"2026-10-21T04:25:12.500Z","sessionId":"{{SID}}"}
+{"type":"ai-title","aiTitle":"CANARY-7f3a-CONTENT ai title","sessionId":"{{SID}}"}
+{"type":"last-prompt","lastPrompt":"CANARY-7f3a-CONTENT","leafUuid":"a3","sessionId":"{{SID}}"}

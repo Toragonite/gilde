@@ -38,7 +38,7 @@ export interface DuplexRequest {
   args: string[];
   cwd?: string;
   env?: Record<string, string | undefined>;
-  /** Wall-clock cap. On expiry the group gets SIGTERM, then SIGKILL after 5s. */
+  /** Wall-clock cap. On expiry the group gets SIGTERM, then a second SIGTERM after 5s (never SIGKILL, C5). */
   timeoutMs?: number;
 }
 
@@ -60,7 +60,11 @@ export interface DuplexHandle {
   stderrTail(): string;
   /** True once the wall-clock cap tripped. */
   timedOut(): boolean;
-  /** Signal the child's process group (default SIGTERM, escalating to SIGKILL). */
+  /**
+   * Signal the child's process group: SIGTERM, repeated once after the grace.
+   * A vendor CLI is never sent SIGKILL (contract §9.8, C5) — asking for it sends
+   * SIGTERM.
+   */
   kill(signal?: NodeJS.Signals): void;
   /** Resolves when the child has closed. Never rejects. */
   readonly closed: Promise<DuplexExit>;
@@ -77,13 +81,18 @@ export async function registeredDuplexSpawn(
   appInstanceId: string,
   req: DuplexRequest,
 ): Promise<DuplexHandle> {
-  const { spawnId, env } = await registerSpawn(rpc, appInstanceId, 'probe', {
-    cmd: req.cmd,
-    args: req.args,
-    cwd: req.cwd,
-    env: req.env,
-    timeoutMs: req.timeoutMs,
-  });
+  const { spawnId, env } = await registerSpawn(
+    rpc,
+    appInstanceId,
+    {
+      cmd: req.cmd,
+      args: req.args,
+      cwd: req.cwd,
+      env: req.env,
+      timeoutMs: req.timeoutMs,
+    },
+    'probe',
+  );
 
   let child: ChildProcess;
   try {
@@ -104,14 +113,14 @@ export async function registeredDuplexSpawn(
   const stdout = child.stdout;
   const stderr = child.stderr;
   if (stdin === null || stdout === null || stderr === null) {
-    killProcessGroup(child, 'SIGKILL');
+    killProcessGroup(child, 'SIGTERM');
     await reportExited(rpc, spawnId, null, null, false);
     throw new Error(`duplex spawn of ${req.cmd} did not yield all three pipes`);
   }
 
   let timedOut = false;
   let stderrTail = '';
-  let killTimer: NodeJS.Timeout | undefined;
+  let repeatTimer: NodeJS.Timeout | undefined;
   let timeoutTimer: NodeJS.Timeout | undefined;
 
   stdin.on('error', () => {
@@ -130,17 +139,21 @@ export async function registeredDuplexSpawn(
   const closed = new Promise<DuplexExit>((resolve) => {
     child.once('close', (code, signal) => {
       if (timeoutTimer !== undefined) clearTimeout(timeoutTimer);
-      if (killTimer !== undefined) clearTimeout(killTimer);
+      if (repeatTimer !== undefined) clearTimeout(repeatTimer);
       void reportExited(rpc, spawnId, code, signal, timedOut).then(() =>
         resolve({ exitCode: code, signal, timedOut }),
       );
     });
   });
 
+  // SIGTERM, then one more SIGTERM after the grace — never SIGKILL (C5).
+  let escalated = false;
   const escalate = (): void => {
     killProcessGroup(child, 'SIGTERM');
-    killTimer = setTimeout(() => killProcessGroup(child, 'SIGKILL'), KILL_GRACE_MS);
-    killTimer.unref?.();
+    if (escalated) return;
+    escalated = true;
+    repeatTimer = setTimeout(() => killProcessGroup(child, 'SIGTERM'), KILL_GRACE_MS);
+    repeatTimer.unref?.();
   };
 
   if (req.timeoutMs !== undefined && req.timeoutMs > 0) {
@@ -171,7 +184,7 @@ export async function registeredDuplexSpawn(
     stderrTail: () => stderrTail,
     timedOut: () => timedOut,
     kill(signal: NodeJS.Signals = 'SIGTERM') {
-      if (signal === 'SIGTERM') {
+      if (signal === 'SIGTERM' || signal === 'SIGKILL') {
         escalate();
         return;
       }

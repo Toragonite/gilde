@@ -1,0 +1,40 @@
+{
+  "schema": 1,
+  "provenance": "Contract §3.10 input 2 as amended by R6 §6 A-P5, R6 §8 item 23, lead ruling 6 and review F-08. Presence only: hit counts are never compared. Every entry is {\"literal\": …} or {\"regex\": …}; literals never pin a minified identifier (the loader lints them). Regexes are matched over bytes with ASCII classes (\\w = [0-9A-Za-z_]).",
+  "evidence": {
+    "conversation": "R6 §6 A-P5 (probes/misc/ap5-canary.tsv): can_use_tool, control_request, control_cancel_request, --permission-prompt-tool, permission_suggestions, pending_permission_requests and --include-partial-messages are present in the global install of 2.1.307 and the editor-bundled 2.1.306. --replay-user-messages was not in the A-P5 byte list; contract §3.10 pins it, and both versions accepted the flag live (R6 §3 LP-01, the 2.1.307 echo re-check).",
+    "paneHosting": "R6 §6 A-P5: claude-swarm, swarm-view, the §7.4.4 argv entries (seen as the arrays \"split-window\",\"-d\",\"-t\" … \"#{pane_id}\"), --agent-id, --parent-session-id and in-process are present in both versions.",
+    "teamStore": "R6 §6 A-P5, lead ruling 6: both shape regexes match 2.1.306 and 2.1.307 and var g=5000 is present in both; the pinned names F$r, _Lr and y0o vanished one patch later, so they are never listed."
+  },
+  "sets": {
+    "conversation": [
+      { "literal": "can_use_tool" },
+      { "literal": "control_request" },
+      { "literal": "control_cancel_request" },
+      { "literal": "--permission-prompt-tool" },
+      { "literal": "permission_suggestions" },
+      { "literal": "pending_permission_requests" },
+      { "literal": "--include-partial-messages" },
+      { "literal": "--replay-user-messages" }
+    ],
+    "paneHosting": [
+      { "literal": "claude-swarm" },
+      { "literal": "swarm-view" },
+      { "literal": "split-window" },
+      { "literal": "respawn-pane" },
+      { "literal": "remain-on-exit" },
+      { "literal": "kill-pane" },
+      { "literal": "has-session" },
+      { "literal": "list-panes" },
+      { "literal": "#{pane_id}" },
+      { "literal": "--agent-id" },
+      { "literal": "--parent-session-id" },
+      { "literal": "in-process" }
+    ],
+    "teamStore": [
+      { "regex": "function [$\\w]+\\(\\)\\{if\\(![$\\w]+\\(\\)\\)return;return\\}" },
+      { "regex": "async function [$\\w]+\\(e\\)\\{if\\(![$\\w]+\\(\\)\\)return\\[\\];return\\[\\]\\}" },
+      { "literal": "var g=5000" }
+    ]
+  }
+}

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-worktree-discard"
+description = "Enables the worktree_discard command without any pre-configured scope."
+commands.allow = ["worktree_discard"]
+
+[[permission]]
+identifier = "deny-worktree-discard"
+description = "Denies the worktree_discard command without any pre-configured scope."
+commands.deny = ["worktree_discard"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-turn-cancel-queued"
+description = "Enables the turn_cancel_queued command without any pre-configured scope."
+commands.allow = ["turn_cancel_queued"]
+
+[[permission]]
+identifier = "deny-turn-cancel-queued"
+description = "Denies the turn_cancel_queued command without any pre-configured scope."
+commands.deny = ["turn_cancel_queued"]

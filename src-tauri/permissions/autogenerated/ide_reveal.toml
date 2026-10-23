@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-ide-reveal"
+description = "Enables the ide_reveal command without any pre-configured scope."
+commands.allow = ["ide_reveal"]
+
+[[permission]]
+identifier = "deny-ide-reveal"
+description = "Denies the ide_reveal command without any pre-configured scope."
+commands.deny = ["ide_reveal"]

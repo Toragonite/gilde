@@ -19,7 +19,14 @@
 //! 4. the same probe without `-i` (some `.zshrc`s refuse to run interactively)
 //! 5. the inherited `PATH`
 //!
-//! and **static candidates are merged into every one of those outcomes**, so a
+//! An **override bounds the search** (contract A38.3): its entries are the
+//! whole answer, followed only by the system floor (`/usr/bin`, `/bin`,
+//! `/usr/sbin`, `/sbin` — sealed system directories, so a child still finds
+//! `sh`, `git`, `ps`). No login shell runs and no static candidate is added,
+//! so a user who pins the search path — and every test rig — sees nothing
+//! outside it.
+//!
+//! For rungs 2–5 the **static candidates are merged into the outcome**, so a
 //! stale cache or a hostile `.zshrc` can never hide `~/.nvm/...` or
 //! `~/.local/bin`. Non-existent directories are dropped, order is preserved,
 //! duplicates collapse to their first occurrence.
@@ -187,10 +194,17 @@ pub fn resolve_path(cfg: &AppConfig, paths: &AppPaths) -> PathReport {
         });
 
     if let Some(raw) = override_raw {
-        let report = finish(split(&raw), PathSource::Override, fingerprint, warnings, &home);
-        // An override is authoritative about *ordering*, not about hiding the
-        // static candidates: DESIGN's rule is that they are always merged.
-        return report;
+        // A38.3: exactly the override, then the system floor. No login-shell
+        // rung, no static ladder, no cache write (the override is not a probe).
+        let mut entries = split(&raw);
+        entries.extend(SYSTEM_FLOOR.iter().map(PathBuf::from));
+        return PathReport {
+            entries: dedupe_existing(entries),
+            source: PathSource::Override,
+            fingerprint,
+            probed_at: now_ms(),
+            warnings,
+        };
     }
 
     // 2. fingerprint-validated cache --------------------------------------
@@ -237,6 +251,7 @@ pub fn resolve_path(cfg: &AppConfig, paths: &AppPaths) -> PathReport {
 }
 
 /// Merge the static candidates, drop what does not exist, dedupe, and stamp.
+/// Rungs 2–5 only: an override never reaches here (A38.3).
 fn finish(
     primary: Vec<PathBuf>,
     source: PathSource,
@@ -261,7 +276,8 @@ fn finish(
 // static candidates
 // ---------------------------------------------------------------------------
 
-/// Directories merged into every resolution (M1-PLAN T09.1).
+/// Directories merged into every resolution without an override (M1-PLAN
+/// T09.1, A38.3).
 ///
 /// nvm first: on this machine `claude` and `codex` live there, and a `node`
 /// earlier on the path than nvm's would silently change which runtime the shims
@@ -382,8 +398,34 @@ fn probe_shell(shell: &Path, interactive: bool) -> Result<Vec<PathBuf>, String> 
         // direct child would leak it.
         .process_group(0);
 
-    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+    // Write-before-spawn (contract §3.8: the PATH login-shell probe is a
+    // `probe` row) once the supervisor installed its hook; a registry that
+    // cannot write means no probe — the cached or inherited `PATH` is used.
+    let argv: Vec<String> = std::iter::once(shell.to_string_lossy().into_owned())
+        .chain(cmd.get_args().map(|a| a.to_string_lossy().into_owned()))
+        .collect();
+    // §9.3: the user's login shell is allowlisted for this probe only.
+    crate::supervise::spawn::allow_executable(shell, &[crate::supervise::spawn::AllowKind::Probe]);
+    let row = match crate::supervise::procscan::register_probe(&argv) {
+        Ok(row) => row,
+        Err(()) => return Err("the probe could not be registered".to_string()),
+    };
+    if let Some(row) = &row {
+        cmd.env(crate::supervise::identity::ENV_SPAWN_ID, row.env_marker());
+    }
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            if let Some(row) = &row {
+                row.exited(None, None);
+            }
+            return Err(e.to_string());
+        }
+    };
     let pid = child.id() as i32;
+    if let Some(row) = &row {
+        row.running(pid, pid);
+    }
 
     let mut stdout = child.stdout.take().ok_or("no stdout pipe")?;
     let (tx, rx) = mpsc::channel();
@@ -410,6 +452,14 @@ fn probe_shell(shell: &Path, interactive: bool) -> Result<Vec<PathBuf>, String> 
         thread::sleep(Duration::from_millis(5));
     }
 
+    if let Some(row) = &row {
+        let status = child.try_wait().ok().flatten();
+        row.exited(
+            status.and_then(|s| s.code()),
+            status.and_then(|s| std::os::unix::process::ExitStatusExt::signal(&s)),
+        );
+    }
+
     // Bounded either way: the reader ends at EOF, and EOF arrives once every
     // copy of the write end is closed.
     let out = rx
@@ -429,7 +479,9 @@ fn probe_shell(shell: &Path, interactive: bool) -> Result<Vec<PathBuf>, String> 
 /// Not routed through `supervise::kill`: that path exists to protect processes
 /// we merely *believe* are ours, verified against the PID registry. This one we
 /// created microseconds ago, into a group of its own, and still hold the
-/// `Child` for — there is nothing to disambiguate.
+/// `Child` for — there is nothing to disambiguate. The login shell is not a
+/// vendor CLI, but its group could hold one (an rc file that runs one): the
+/// `SIGKILL` is skipped then (contract §9.8, C5).
 fn kill_group(pid: i32) {
     use nix::sys::signal::{killpg, Signal};
     use nix::unistd::Pid;
@@ -440,7 +492,9 @@ fn kill_group(pid: i32) {
     let group = Pid::from_raw(pid);
     let _ = killpg(group, Signal::SIGTERM);
     thread::sleep(PROBE_KILL_GRACE);
-    let _ = killpg(group, Signal::SIGKILL);
+    if !crate::supervise::kill::group_has_vendor(pid) {
+        let _ = killpg(group, Signal::SIGKILL);
+    }
 }
 
 /// The text between the sentinels, if both are present in order.
@@ -671,7 +725,10 @@ mod tests {
         );
     }
 
+    // `fingerprint` hashes `$SHELL`, which the `gilde_env` tests change for
+    // a moment: in their serial group, so no call lands inside that window.
     #[test]
+    #[serial_test::serial(gilde_env)]
     fn fingerprint_changes_when_an_rc_file_changes() {
         let dir = tempfile::tempdir().expect("tempdir");
         let home = dir.path();
@@ -820,9 +877,76 @@ mod tests {
         }
     }
 
-    /// Set env vars, run `f`, restore. Serialized by `serial_test` at the call
-    /// sites that need it; the two users here do not overlap in variables with
-    /// any other test in this crate.
+    /// A38.3 (G7-14): an override is the whole search path. No login shell
+    /// runs and no static candidate is merged — not the home ladder (nvm,
+    /// `~/.local/bin`, `~/.cargo/bin`) and not `/opt/homebrew/bin` or
+    /// `/usr/local/bin` — only the system floor follows. Both spellings: the
+    /// `pathOverride` key and `GILDE_PATH_OVERRIDE` (which wins).
+    #[test]
+    #[serial_test::serial(gilde_env)]
+    fn an_override_bounds_the_search_to_its_own_entries() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("home");
+        for ladder in [".local/bin", ".cargo/bin", ".nvm/versions/node/v20.19.2/bin"] {
+            fs::create_dir_all(home.join(ladder)).expect("ladder dir");
+        }
+        let paths = AppPaths::new(dir.path().join("app-data"), home.clone());
+        paths.ensure_all().expect("dirs");
+        assert!(
+            static_candidates(&home).iter().filter(|p| p.is_dir()).count() >= 3,
+            "the ladder would add something here"
+        );
+
+        // A login shell that leaves a mark and answers with a foreign PATH.
+        let mark = dir.path().join("shell-ran");
+        let shell = dir.path().join("marker-shell");
+        fs::write(
+            &shell,
+            format!(
+                "#!/bin/sh\ntouch '{}'\nprintf '__GILDE_B__/opt/homebrew/bin:/usr/local/bin__GILDE_E__'\n",
+                mark.display()
+            ),
+        )
+        .expect("shell");
+        fs::set_permissions(&shell, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let shell = shell.to_string_lossy().into_owned();
+
+        let floor: Vec<PathBuf> = SYSTEM_FLOOR.iter().map(PathBuf::from).filter(|p| p.is_dir()).collect();
+        let bounded = |dir: &Path| -> Vec<PathBuf> {
+            std::iter::once(dir.to_path_buf()).chain(floor.iter().cloned()).collect()
+        };
+
+        // The config key; a missing entry is dropped, not replaced.
+        let pinned = dir.path().join("pinned");
+        fs::create_dir_all(&pinned).expect("pinned");
+        let mut cfg = AppConfig::default();
+        cfg.agents.path_override =
+            Some(format!("{}:{}", pinned.display(), dir.path().join("missing").display()));
+        let report = temp_env(&[("SHELL", Some(&shell)), (PATH_OVERRIDE_ENV, None)], || {
+            resolve_path(&cfg, &paths)
+        });
+        assert_eq!(report.source, PathSource::Override);
+        assert_eq!(report.entries, bounded(&pinned), "exactly the override, then the floor");
+        assert!(!mark.exists(), "an override never runs the login shell");
+        assert!(!paths.path_cache().exists(), "an override is not cached as a probe result");
+
+        // The environment spelling wins over the key and bounds the same way.
+        let env_dir = dir.path().join("env-pinned");
+        fs::create_dir_all(&env_dir).expect("env dir");
+        let env_value = env_dir.to_string_lossy().into_owned();
+        let report = temp_env(
+            &[("SHELL", Some(&shell)), (PATH_OVERRIDE_ENV, Some(&env_value))],
+            || resolve_path(&cfg, &paths),
+        );
+        assert_eq!(report.source, PathSource::Override);
+        assert_eq!(report.entries, bounded(&env_dir));
+        assert!(!mark.exists());
+    }
+
+    /// Set env vars, run `f`, restore. Every test that sets *or reads* these
+    /// variables (`SHELL`, `PATH`, the override; `fingerprint` reads `SHELL`)
+    /// is in the `serial_test` group `gilde_env`.
     fn temp_env<T>(vars: &[(&str, Option<&str>)], f: impl FnOnce() -> T) -> T {
         let saved: Vec<(String, Option<String>)> = vars
             .iter()

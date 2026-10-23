@@ -68,6 +68,9 @@ pub struct Db {
     path: Option<PathBuf>,
     recovered_from_corruption: bool,
     quarantined_to: Option<PathBuf>,
+    /// Memory-only mode (contract §2.4): the shared connection is an in-memory
+    /// stand-in for `path` until [`Db::resume_on_disk`] swaps the file back in.
+    in_memory: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl std::fmt::Debug for Db {
@@ -127,7 +130,61 @@ impl Db {
             path: Some(path.to_path_buf()),
             recovered_from_corruption: recovered,
             quarantined_to,
+            in_memory: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
+    }
+
+    /// Memory-only mode (contract §2.4): an in-memory database with the
+    /// schema applied, standing in for `path` (which could not be written).
+    /// Nothing written here survives the process; spawns are refused while
+    /// [`Db::is_memory_only`] holds.
+    pub fn open_memory_only(path: &Path) -> Result<Self> {
+        let conn = Connection::open_in_memory()?;
+        configure(&conn)?;
+        migrations::apply_all(&conn, now_ms())?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+            path: Some(path.to_path_buf()),
+            recovered_from_corruption: false,
+            quarantined_to: None,
+            in_memory: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        })
+    }
+
+    /// Whether this handle is the in-memory stand-in of memory-only mode.
+    pub fn is_memory_only(&self) -> bool {
+        self.in_memory.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Writes resume (contract §2.4): open `path` on disk (migrating it) and
+    /// swap it in for every clone of this handle. The UI state written while
+    /// in memory (`settings_kv`) is carried over; nothing else was persisted.
+    pub fn resume_on_disk(&self) -> Result<()> {
+        if !self.is_memory_only() {
+            return Ok(());
+        }
+        let Some(path) = self.path.clone() else {
+            return Ok(());
+        };
+        let fresh = Db::open(&path)?;
+        let disk = Arc::try_unwrap(fresh.conn)
+            .map_err(|_| GildeError::internal("fresh db handle shared"))?
+            .into_inner();
+        let mut guard = self.conn.lock();
+        {
+            let mut stmt = guard.prepare("SELECT key, value_json FROM settings_kv")?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            for row in rows {
+                let (k, v) = row?;
+                disk.execute(
+                    "INSERT OR REPLACE INTO settings_kv (key, value_json) VALUES (?1, ?2)",
+                    rusqlite::params![k, v],
+                )?;
+            }
+        }
+        *guard = disk;
+        self.in_memory.store(false, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
     }
 
     /// An in-memory database with the schema applied. Tests only.
@@ -140,6 +197,7 @@ impl Db {
             path: None,
             recovered_from_corruption: false,
             quarantined_to: None,
+            in_memory: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -262,7 +320,7 @@ fn configure(conn: &Connection) -> Result<()> {
     // journal_mode returns a row, so it cannot go through pragma_update.
     // In-memory databases answer "memory" and that is fine.
     let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
-    if mode.to_ascii_lowercase() != "wal" && mode.to_ascii_lowercase() != "memory" {
+    if !mode.eq_ignore_ascii_case("wal") && !mode.eq_ignore_ascii_case("memory") {
         tracing::warn!(mode, "journal_mode is not WAL");
     }
     conn.pragma_update(None, "foreign_keys", true)?;
@@ -387,7 +445,7 @@ mod tests {
         let path = dir.path().join("state.db");
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 1);
+        assert_eq!(db.schema_version().unwrap(), migrations::latest_version());
         let applied_at: i64 = db
             .blocking(|c| {
                 Ok(c.query_row(
@@ -403,7 +461,7 @@ mod tests {
         drop(db);
 
         let db2 = Db::open(&path).unwrap();
-        assert_eq!(db2.schema_version().unwrap(), 1);
+        assert_eq!(db2.schema_version().unwrap(), migrations::latest_version());
         assert!(!db2.recovered_from_corruption());
         let applied_at2: i64 = db2
             .blocking(|c| {
@@ -415,7 +473,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(applied_at, applied_at2, "migration must not re-run");
-        let rows = db2.blocking(|c| dao::app_instance::list_open(c)).unwrap();
+        let rows = db2.blocking(dao::app_instance::list_open).unwrap();
         assert_eq!(rows.len(), 1);
     }
 
@@ -967,13 +1025,15 @@ mod tests {
             event_log::append(c, now - 31 * DAY, "kill", "info", None, "stale", None)?;
 
             let report = run_retention(c, now)?;
-            assert_eq!(report.run_events_deleted, 1);
+            // `run_event` is legacy since Gilde 2: never read or written, so
+            // retention leaves it alone (contract §3.9).
+            assert_eq!(report.run_events_deleted, 0);
             assert_eq!(report.proc_samples_deleted, 1);
             assert_eq!(report.proc_rows_deleted, 1);
             assert_eq!(report.event_log_deleted, 1);
-            assert_eq!(report.total(), 4);
+            assert_eq!(report.total(), 3);
 
-            assert_eq!(dispatch::run_events(c, "run-a", 100)?.len(), 1);
+            assert_eq!(dispatch::run_events(c, "run-a", 100)?.len(), 2);
             assert_eq!(
                 proc_sample::range(c, "session", Some("sess-1"), 0, now + 1)?.len(),
                 1
@@ -995,38 +1055,30 @@ mod tests {
     }
 
     #[test]
-    fn retention_trims_run_events_beyond_the_recent_run_window() {
+    fn retention_expires_unresolved_quit_records_after_seven_days() {
         let db = Db::open_in_memory().unwrap();
         let now: i64 = 1_000 * DAY;
         db.blocking(move |c| {
-            dispatch::task_insert(
-                c,
-                &DispatchTaskRow {
-                    id: "t-1".into(),
-                    project_id: None,
-                    title: "task".into(),
-                    prompt: "p".into(),
-                    task_slug: "task".into(),
-                    base_ref: None,
-                    worktree_strategy: "shared".into(),
-                    permission_mode: None,
-                    timeout_ms: None,
-                    created_at: now,
-                    finished_at: None,
-                    status: "done".into(),
-                },
-            )?;
-            // 205 runs, each with one recent event. Only the newest 200 runs keep theirs.
-            for i in 0..205i64 {
-                let id = format!("run-{i:04}");
-                dispatch::run_insert(c, &run_row(&id, now - (205 - i)))?;
-                dispatch::run_event_append(c, &id, now, "text", None)?;
+            let item = QuitItemRow {
+                uid: "s_01890a5d-ac96-774b-bcce-b302099a8057".into(),
+                control_mode: "conversation".into(),
+                permission_mode: None,
+                model: None,
+                was_waiting: None,
+                team_lead: false,
+                survivor: false,
+            };
+            for (id, at) in [("r_old", now - 8 * DAY), ("r_new", now - DAY)] {
+                quit_record::insert(
+                    c,
+                    &QuitRecordRow { id: id.into(), cause: "quit".into(), created_at: at, resolved_at: None },
+                    std::slice::from_ref(&item),
+                )?;
             }
-            let report = run_retention(c, now)?;
-            assert_eq!(report.run_events_deleted, 5);
-            let remaining: i64 =
-                c.query_row("SELECT COUNT(*) FROM run_event", [], |r| r.get(0))?;
-            assert_eq!(remaining, 200);
+            run_retention(c, now)?;
+            assert!(quit_record::get(c, "r_old")?.is_none(), "expired after 7 days");
+            assert!(quit_record::get(c, "r_new")?.is_some());
+            assert!(quit_record::items(c, "r_old")?.is_empty(), "items go with the record");
             Ok(())
         })
         .unwrap();
@@ -1101,7 +1153,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            db.read(|c| dao::app_instance::list_open(c))
+            db.read(dao::app_instance::list_open)
                 .await
                 .unwrap()
                 .len(),

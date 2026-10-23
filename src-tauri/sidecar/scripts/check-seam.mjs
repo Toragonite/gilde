@@ -68,6 +68,9 @@ const OUR_SEAM_MODULES = new Set(['src/exec-registered.ts', 'src/duplex.ts']);
  * A `ref: true` entry blesses a launcher taken as a value; its `sig` is matched
  * against that whole source line (whitespace removed). Call entries match calls only.
  *
+ * Protocol 2 (2026-10-22, T08): no baseline count changed; cursor's keychain default is
+ * now replaced by a seam that refuses (C6) instead of a registered `security` exec.
+ *
  * agent-mesh 0.1.4 (re-blessed 2026-10-20 from 0.1.3):
  *   claude  nodeExec + nodeLineStream, getLiveUsage                     (unchanged)
  *   codex   nodeExec + nodeLineStream                                   (unchanged)
@@ -136,8 +139,10 @@ const BASELINE = new Map([
       {
         sig: /^KEYCHAIN_BINARY,\[\.\.\.KEYCHAIN_ARGS\],\{/,
         count: 1,
-        why: 'defaultReadCursorKeychain (`/usr/bin/security`), new in 0.1.3',
-        injectedBy: [['src/fleet.ts', /readKeychain: registeredKeychain\(exec\('cursor'\)\)/]],
+        why:
+          'defaultReadCursorKeychain (`/usr/bin/security`), new in 0.1.3 — replaced by a seam that ' +
+          'never reads the keychain (contract §9.7, C6), so `security` is never spawned',
+        injectedBy: [['src/fleet.ts', /readKeychain: refusedKeychain/]],
       },
     ],
   ],

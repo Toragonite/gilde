@@ -1,87 +1,77 @@
 /**
- * fleet.ts — construct the four vendor adapters and the Fleet around them.
+ * fleet.ts — construct the four vendor adapters (contract §4.5, protocol 2).
  *
  * Nothing here forks or reimplements a vendor: every adapter is the published
  * class, configured through its PUBLIC constructor seams (DESIGN §0 rule 1,
- * §5-6). We inject exactly five things:
+ * §5-6). We inject:
  *
  *   - `exec`         the registered run-to-completion spawner (all four),
- *   - `lineStream`   the registered streaming spawner (all four; codex gained the
- *                    seam — and `capabilities.stream === true` — in agent-mesh 0.1.3),
+ *   - `lineStream`   the registered streaming spawner (all four),
  *   - `getUsage`     the registered duplex quota probe (claude only; the CLI's
  *                    control-protocol probe needs an open stdin, which
  *                    `ExecRequest.stdin` cannot express — §5-7),
- *   - `readKeychain` cursor's macOS keychain read (agent-mesh 0.1.3), run through
- *                    the registered `exec` instead of the vendor's own
- *                    `/usr/bin/security` spawn,
  *   - `spawn`        the registered spawner for codex's live model listing
- *                    (`availableModels()` → `codex app-server`, also reached by
- *                    `Fleet.route` for a latency-class policy); the seam is new in
- *                    agent-mesh 0.1.4. The listing used to spawn directly — the
- *                    last unregistered launch. Now it has a registry row (`kind:
- *                    'probe'`) and its own process group, which the adapter's
- *                    `modelsTimeoutMs` kill takes down whole.
+ *                    (`codex app-server`; registry kind `probe`),
+ *   - `readTextFile` the never-open guard (methods/never-open.ts): no adapter ever
+ *                    opens `.claude.json`, `.credentials.json`, `auth.json` or any
+ *                    other credential-bearing file (contract §9.7, C6),
+ *   - `readKeychain` cursor's keychain read, refused: the keychain is never read
+ *                    and `/usr/bin/security` is never spawned (C6),
+ *   - `fetchFn`      codex/cursor's usage endpoint, disabled: it needs a token
+ *                    Gilde never reads, so no request is ever sent.
  *
  * With that, every vendor launch the sidecar can reach goes through a registered
- * seam; `scripts/check-seam.mjs` holds the bundle to it.
+ * seam; `scripts/check-seam.mjs` holds the bundle to it. The host's allowlist then
+ * refuses any argv[0] that is not a configured vendor binary (§4.5, §9.3).
  *
  * Two more deliberate choices:
- *   - cursor gets `trust: true`. Choosing to run a coding agent in a worktree IS
- *     the trust decision; without it every task stalls ~21s on an interactive gate.
- *   - claude gets NO `gateway`. M1 does not enable `steer()`, and an absent
- *     gateway makes `steer()` return an honest error instead of a silent no-op.
+ *   - cursor gets `trust: true`. Choosing to run a coding agent in a folder IS the
+ *     trust decision; without it every turn stalls ~21s on an interactive gate.
+ *   - claude gets NO `gateway`, and no adapter gets a default account: every call
+ *     names its account, so a missing one can never silently fall back to another
+ *     login.
  *
- * A SECOND set of adapter instances backs introspection (`mesh.quota`,
- * `mesh.availableModels`, `mesh.authStatus`, `fleet.route`). Their seams are
- * pre-wrapped in `runCtx` with `runId:'introspect'`, so those probes are
- * registered and visible in the Process Monitor while never being attributed to
- * a user's dispatch run.
+ * Attribution: the seams read the turn id, vendor and registry kind from
+ * `runCtx` (exec-registered.ts), which the caller sets around each adapter call —
+ * `turn` for `turn.start`, `probe` for `probe.*`.
  */
 
-import { Fleet } from '@toragonite/agent-mesh';
-import type { Account, Adapter, Vendor } from '@toragonite/agent-mesh';
+import type { Adapter } from '@toragonite/agent-mesh';
 import { ClaudeAdapter } from '@toragonite/agent-mesh-claude';
 import type { ClaudeAdapterOptions, ExecFn, LineStreamFn } from '@toragonite/agent-mesh-claude';
 import { CodexAdapter } from '@toragonite/agent-mesh-codex';
 import type { SpawnFn } from '@toragonite/agent-mesh-codex';
 import { CursorAdapter } from '@toragonite/agent-mesh-cursor';
-import type { CursorAdapterOptions } from '@toragonite/agent-mesh-cursor';
 import { GeminiAdapter } from '@toragonite/agent-mesh-gemini';
 
-import {
-  makeRegisteredExec,
-  makeRegisteredLineStream,
-  makeRegisteredSpawn,
-  runCtx,
-  INTROSPECT_RUN_ID,
-} from './exec-registered';
+import type { AccountEnv } from './gen/AccountEnv';
+import type { Vendor } from './gen/Vendor';
+import { guardedReadTextFile, noNetworkFetch, refusedKeychain } from './methods/never-open';
+import { makeRegisteredExec, makeRegisteredLineStream, makeRegisteredSpawn } from './exec-registered';
 import type { Rpc } from './rpc';
 
-/** The four vendors this build registers, in the order `mesh.hello` reports them. */
-export const VENDORS = ['claude', 'codex', 'cursor', 'gemini'] as const;
-export type KnownVendor = (typeof VENDORS)[number];
+/** The four vendors of this build, in roster order (contract vendor names). */
+export const VENDORS: readonly Vendor[] = ['claude', 'codex', 'cursor', 'agy'];
 
-/** Host-resolved absolute paths (or bare command names) for the vendor CLIs. */
-export interface BinaryMap {
-  claude?: string;
-  codex?: string;
-  cursorAgent?: string;
-  agy?: string;
-}
+/** Host-resolved absolute paths for the vendor CLIs (`mesh.configure.binaries`). */
+export type BinaryMap = Partial<Record<Vendor, string>>;
 
-/** Defaults the host imposes on every task (DESIGN §5-4). */
-export interface FleetDefaults {
-  timeoutMs?: number;
-  permissionMode?: string;
-}
+/**
+ * Command names used while the host has not configured a binary. A spawn of one
+ * of these is refused by the host's allowlist (only configured absolute paths
+ * pass), which is exactly "not installed".
+ */
+export const UNCONFIGURED_BINARIES: Readonly<Record<Vendor, string>> = {
+  claude: 'claude',
+  codex: 'codex',
+  cursor: 'cursor-agent',
+  agy: 'agy',
+};
 
 export interface BuildConfig {
   rpc: Rpc;
   appInstanceId: string;
-  binaries?: BinaryMap;
-  /** Account slots; the first one per vendor becomes that adapter's default account. */
-  accounts?: Account[];
-  defaults?: FleetDefaults;
+  binaries: BinaryMap;
   /**
    * The registered claude quota probe (`usage.ts`). Injected rather than
    * constructed here so this module never spawns: it is a `ClaudeAdapterOptions`
@@ -92,13 +82,12 @@ export interface BuildConfig {
 }
 
 export interface BuiltFleet {
-  fleet: Fleet;
-  /** Run/stream instances — one per vendor, so Cursor's memoized catalog survives. */
+  /** One instance per vendor (Cursor memoizes its model catalog on the instance). */
   adapters: Map<Vendor, Adapter>;
-  /** Introspection instances, pinned to `runId:'introspect'`. */
-  introspect: Map<Vendor, Adapter>;
-  /** The binaries these adapters were built with; `mesh.hello`/`mesh.adapters` report them. */
-  binaries: Required<BinaryMap>;
+  /** The binaries these adapters were built with. */
+  binaries: Record<Vendor, string>;
+  /** Which vendors the host configured a binary for (the others are not installed). */
+  configured: ReadonlySet<Vendor>;
 }
 
 /**
@@ -108,78 +97,11 @@ export interface BuiltFleet {
  */
 export interface SidecarState {
   appInstanceId: string;
-  bootId: string;
-  hostVersion: string;
-  defaults: FleetDefaults;
-  accounts: Account[];
   built: BuiltFleet;
-  /** Set once `mesh.hello` has been answered successfully. */
-  ready: boolean;
-}
-
-/** Default command names when the host resolved nothing. */
-const DEFAULT_BINARIES: Required<BinaryMap> = {
-  claude: 'claude',
-  codex: 'codex',
-  cursorAgent: 'cursor-agent',
-  agy: 'agy',
-};
-
-function accountFor(accounts: Account[] | undefined, vendor: Vendor): Account | undefined {
-  return accounts?.find((a) => a.vendor === vendor);
-}
-
-/** Wrap a seam so every spawn it makes is attributed to the introspection run. */
-function pinExec(exec: ExecFn, vendor: Vendor): ExecFn {
-  return (req) => runCtx.run({ runId: INTROSPECT_RUN_ID, vendor: String(vendor) }, () => exec(req));
-}
-
-function pinLineStream(lineStream: LineStreamFn, vendor: Vendor): LineStreamFn {
-  return (req, onEnd) =>
-    runCtx.run({ runId: INTROSPECT_RUN_ID, vendor: String(vendor) }, () => lineStream(req, onEnd));
-}
-
-/** The plan row is requested synchronously inside the call, so the pinned context reaches it. */
-function pinSpawn(spawnFn: SpawnFn, vendor: Vendor): SpawnFn {
-  return (command, args, options) =>
-    runCtx.run({ runId: INTROSPECT_RUN_ID, vendor: String(vendor) }, () => spawnFn(command, args, options));
-}
-
-type ReadKeychain = NonNullable<CursorAdapterOptions['readKeychain']>;
-
-/** What cursor-agent's default credential store keeps in the login keychain. */
-const CURSOR_KEYCHAIN_ARGS = ['find-generic-password', '-a', 'cursor-user', '-s', 'cursor-access-token', '-w'];
-/** The only variables `security` gets — the same four the vendor default passes. */
-const KEYCHAIN_ENV_KEYS = ['PATH', 'HOME', 'USER', 'LANG'] as const;
-
-/**
- * Cursor's keychain read, through the REGISTERED exec seam rather than the vendor's
- * own `spawn('/usr/bin/security')`, so the probe has a registry row like every other
- * child. Semantics mirror the vendor default exactly: exit 0 with output → the token;
- * exit 36/51 or an interaction-refusal message → `refused` (the adapter then backs
- * off for hours instead of re-prompting); anything else, a timeout or a launch
- * failure → not found. The token stays in this process: the host is told the
- * command and its arguments, never stdout.
- */
-function registeredKeychain(exec: ExecFn): ReadKeychain {
-  return async () => {
-    const env: Record<string, string> = {};
-    for (const key of KEYCHAIN_ENV_KEYS) {
-      const value = process.env[key];
-      if (typeof value === 'string') env[key] = value;
-    }
-    try {
-      const r = await exec({ cmd: '/usr/bin/security', args: [...CURSOR_KEYCHAIN_ARGS], env, timeoutMs: 10_000 });
-      if (r.timedOut) return { found: false, refused: false };
-      const refused =
-        r.exitCode === 51 || r.exitCode === 36 || /interaction is not allowed|user canceled|user cancelled/i.test(r.stderr);
-      if (refused) return { found: false, refused: true };
-      const token = r.stdout.trim();
-      return r.exitCode === 0 && token.length > 0 ? { found: true, token } : { found: false, refused: false };
-    } catch {
-      return { found: false, refused: false };
-    }
-  };
+  /** `mesh.configure.accounts`, by account id. Empty until the first configure. */
+  accounts: Map<string, AccountEnv>;
+  /** Set once the host has sent `mesh.configure`. */
+  configured: boolean;
 }
 
 interface Seams {
@@ -190,43 +112,34 @@ interface Seams {
 
 function makeAdapters(
   seams: Seams,
-  binaries: Required<BinaryMap>,
-  accounts: Account[] | undefined,
+  binaries: Record<Vendor, string>,
   getUsage: ClaudeAdapterOptions['getUsage'],
-  pin: boolean,
 ): Map<Vendor, Adapter> {
-  const exec = (vendor: Vendor): ExecFn => (pin ? pinExec(seams.exec, vendor) : seams.exec);
-  const lineStream = (vendor: Vendor): LineStreamFn =>
-    pin ? pinLineStream(seams.lineStream, vendor) : seams.lineStream;
-  const spawnSeam = (vendor: Vendor): SpawnFn => (pin ? pinSpawn(seams.spawn, vendor) : seams.spawn);
+  // One shared seam per kind; the per-call attribution comes from `runCtx`.
+  const exec = (_vendor: string): ExecFn => seams.exec;
+  const lineStream = (_vendor: string): LineStreamFn => seams.lineStream;
+  const spawnSeam = (_vendor: string): SpawnFn => seams.spawn;
 
   const claudeOpts: ClaudeAdapterOptions = {
     exec: exec('claude'),
     lineStream: lineStream('claude'),
     binary: binaries.claude,
-    // No `gateway`: M1 does not enable steer() (DESIGN §5-7).
+    readTextFile: guardedReadTextFile,
+    // No `gateway`: steer() stays an honest error (DESIGN §5-7).
   };
-  const claudeAccount = accountFor(accounts, 'claude');
-  if (claudeAccount !== undefined) claudeOpts.defaultAccount = claudeAccount;
   if (getUsage !== undefined) claudeOpts.getUsage = getUsage;
-
-  const codexAccount = accountFor(accounts, 'codex');
-  const cursorAccount = accountFor(accounts, 'cursor');
-  const geminiAccount = accountFor(accounts, 'gemini');
 
   const map = new Map<Vendor, Adapter>();
   map.set('claude', new ClaudeAdapter(claudeOpts));
   map.set(
     'codex',
-    // agent-mesh 0.1.3 gave CodexAdapter a lineStream seam (and stream: true), 0.1.4 a
-    // spawn seam for the app-server model listing; leaving either out would fall back to
-    // the vendor's own unregistered spawner.
     new CodexAdapter({
       exec: exec('codex'),
       lineStream: lineStream('codex'),
       spawn: spawnSeam('codex'),
       binary: binaries.codex,
-      ...(codexAccount !== undefined ? { defaultAccount: codexAccount } : {}),
+      readTextFile: guardedReadTextFile,
+      fetchFn: noNetworkFetch,
     }),
   );
   map.set(
@@ -234,36 +147,42 @@ function makeAdapters(
     new CursorAdapter({
       exec: exec('cursor'),
       lineStream: lineStream('cursor'),
-      readKeychain: registeredKeychain(exec('cursor')),
-      binary: binaries.cursorAgent,
+      readKeychain: refusedKeychain,
+      readTextFile: guardedReadTextFile,
+      fetchFn: noNetworkFetch,
+      binary: binaries.cursor,
       trust: true,
-      ...(cursorAccount !== undefined ? { defaultAccount: cursorAccount } : {}),
     }),
   );
   map.set(
-    'gemini',
+    'agy',
     new GeminiAdapter({
       exec: exec('gemini'),
       lineStream: lineStream('gemini'),
       binary: binaries.agy,
-      ...(geminiAccount !== undefined ? { defaultAccount: geminiAccount } : {}),
+      readTextFile: guardedReadTextFile,
     }),
   );
   return map;
 }
 
 /**
- * Build the run fleet plus its introspection twin. Called once at `mesh.hello`
- * and again on every `mesh.configure` — reconfiguration is a rebuild, never a
- * mutation, so no adapter is ever half-reconfigured.
+ * Build the fleet. Called once at `mesh.hello` and again on every
+ * `mesh.configure` — reconfiguration is a rebuild, never a mutation, so no adapter
+ * is ever half-reconfigured.
  */
 export function buildFleet(cfg: BuildConfig): BuiltFleet {
-  const binaries: Required<BinaryMap> = {
-    claude: cfg.binaries?.claude ?? DEFAULT_BINARIES.claude,
-    codex: cfg.binaries?.codex ?? DEFAULT_BINARIES.codex,
-    cursorAgent: cfg.binaries?.cursorAgent ?? DEFAULT_BINARIES.cursorAgent,
-    agy: cfg.binaries?.agy ?? DEFAULT_BINARIES.agy,
-  };
+  const binaries = {} as Record<Vendor, string>;
+  const configured = new Set<Vendor>();
+  for (const vendor of VENDORS) {
+    const configuredPath = cfg.binaries[vendor];
+    if (typeof configuredPath === 'string' && configuredPath.length > 0) {
+      binaries[vendor] = configuredPath;
+      configured.add(vendor);
+    } else {
+      binaries[vendor] = UNCONFIGURED_BINARIES[vendor];
+    }
+  }
 
   const seams: Seams = {
     exec: makeRegisteredExec(cfg.rpc, cfg.appInstanceId),
@@ -271,14 +190,5 @@ export function buildFleet(cfg: BuildConfig): BuiltFleet {
     spawn: makeRegisteredSpawn(cfg.rpc, cfg.appInstanceId),
   };
 
-  const adapters = makeAdapters(seams, binaries, cfg.accounts, cfg.getUsage, false);
-  const introspect = makeAdapters(seams, binaries, cfg.accounts, cfg.getUsage, true);
-
-  const fleet = new Fleet();
-  for (const vendor of VENDORS) {
-    const adapter = adapters.get(vendor);
-    if (adapter !== undefined) fleet.register(adapter);
-  }
-
-  return { fleet, adapters, introspect, binaries };
+  return { adapters: makeAdapters(seams, binaries, cfg.getUsage), binaries, configured };
 }

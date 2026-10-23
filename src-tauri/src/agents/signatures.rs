@@ -117,6 +117,121 @@ impl MonitorPatternsSpec {
     }
 }
 
+/// `readySignature.<vendor>` — the vendor's input line (and footer) that makes
+/// a settled grid `Idle` at 0.9 (contract §6.2.6, F-48, N-03/A5). A vendor (or
+/// a version) without one gets the settled-grid fallback at 0.5.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ReadySignatureSpec {
+    /// Matched against the shapes of a real TUI on this machine. An
+    /// unverified signature still yields `Idle` 0.9 when it matches, but
+    /// readiness then also accepts the 0.5 fallback (§6.2.2), so a wrong guess
+    /// can never keep a session in Starting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verified: Option<bool>,
+    /// The input row (`❯ …`, `› …`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<String>,
+    /// A footer row that must also be visible (mode bar, shortcut hint).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub footer: Option<String>,
+    /// How many bottom rows are searched (default 8).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rows: Option<usize>,
+}
+
+impl ReadySignatureSpec {
+    fn merged_with(&self, other: &ReadySignatureSpec) -> ReadySignatureSpec {
+        ReadySignatureSpec {
+            verified: other.verified.or(self.verified),
+            input: other.input.clone().or_else(|| self.input.clone()),
+            footer: other.footer.clone().or_else(|| self.footer.clone()),
+            rows: other.rows.or(self.rows),
+        }
+    }
+}
+
+/// `promptCard.<vendor>` — the screen-prompt grammar (contract §6.2.4). Every
+/// pattern is one Rust `regex` matched against one grid row.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PromptCardSpec {
+    /// An option line: group 1 = the digit, group 2 = the label.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub option: Option<String>,
+    /// The selection marker before the digit (`❯`, `>`, `›`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub marker: Option<String>,
+    /// An indented line without a digit: a wrapped label.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<String>,
+    /// An option's own description line (indented ≥ 5).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// A plain or titled rule between options.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub divider: Option<String>,
+    /// The `☐ <header>` line above the question: group 1 = the header.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    /// The footer below the run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub footer: Option<String>,
+    /// The footer phrase that offers *Allow with a note*.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amend: Option<String>,
+    /// A cursor line of an unnumbered setup menu: group 1 = the indent,
+    /// group 2 = the label.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub setup_marker: Option<String>,
+    /// Option 1's label while *Allow with a note* is being typed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amend_label: Option<String>,
+}
+
+impl PromptCardSpec {
+    fn merged_with(&self, other: &PromptCardSpec) -> PromptCardSpec {
+        let pick = |a: &Option<String>, b: &Option<String>| a.clone().or_else(|| b.clone());
+        PromptCardSpec {
+            option: pick(&other.option, &self.option),
+            marker: pick(&other.marker, &self.marker),
+            continuation: pick(&other.continuation, &self.continuation),
+            description: pick(&other.description, &self.description),
+            divider: pick(&other.divider, &self.divider),
+            header: pick(&other.header, &self.header),
+            footer: pick(&other.footer, &self.footer),
+            amend: pick(&other.amend, &self.amend),
+            setup_marker: pick(&other.setup_marker, &self.setup_marker),
+            amend_label: pick(&other.amend_label, &self.amend_label),
+        }
+    }
+}
+
+/// `trustDialog.<vendor>` — how the folder-trust dialog is recognised (A6).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TrustDialogSpec {
+    /// The "Yes, I trust this folder" family.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust: Option<Vec<String>>,
+    /// The "No, exit" family.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit: Option<Vec<String>>,
+    /// `Enter to confirm · Esc to cancel`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub footer: Option<String>,
+}
+
+impl TrustDialogSpec {
+    fn merged_with(&self, other: &TrustDialogSpec) -> TrustDialogSpec {
+        TrustDialogSpec {
+            trust: other.trust.clone().or_else(|| self.trust.clone()),
+            exit: other.exit.clone().or_else(|| self.exit.clone()),
+            footer: other.footer.clone().or_else(|| self.footer.clone()),
+        }
+    }
+}
+
 /// The whole file.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -124,6 +239,33 @@ pub struct SignatureFile {
     pub version: u32,
     pub agents: BTreeMap<String, AgentSignatureSpec>,
     pub monitor_patterns: MonitorPatternsSpec,
+    /// Per vendor key (§6.2.6).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub ready_signature: BTreeMap<String, ReadySignatureSpec>,
+    /// Per vendor key (§6.2.4).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub prompt_card: BTreeMap<String, PromptCardSpec>,
+    /// Per vendor key (A6).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub trust_dialog: BTreeMap<String, TrustDialogSpec>,
+}
+
+/// Merge `user` over `base` per key, field-wise inside each key.
+fn merge_keyed<T: Clone>(
+    base: &BTreeMap<String, T>,
+    user: &BTreeMap<String, T>,
+    merge: impl Fn(&T, &T) -> T,
+) -> BTreeMap<String, T> {
+    let mut out = base.clone();
+    for (raw_key, spec) in user {
+        let key = canonical_agent_key(raw_key);
+        let merged = match out.get(&key) {
+            Some(existing) => merge(existing, spec),
+            None => spec.clone(),
+        };
+        out.insert(key, merged);
+    }
+    out
 }
 
 impl SignatureFile {
@@ -150,6 +292,17 @@ impl SignatureFile {
             version: if user.version == 0 { self.version } else { user.version },
             agents,
             monitor_patterns: self.monitor_patterns.merged_with(&user.monitor_patterns),
+            ready_signature: merge_keyed(
+                &self.ready_signature,
+                &user.ready_signature,
+                ReadySignatureSpec::merged_with,
+            ),
+            prompt_card: merge_keyed(&self.prompt_card, &user.prompt_card, PromptCardSpec::merged_with),
+            trust_dialog: merge_keyed(
+                &self.trust_dialog,
+                &user.trust_dialog,
+                TrustDialogSpec::merged_with,
+            ),
         }
     }
 }
@@ -228,15 +381,174 @@ impl AgentSignatures {
     }
 }
 
+/// Bottom non-empty rows a ready signature is searched in, by default.
+pub const DEFAULT_READY_ROWS: usize = 6;
+
+/// A compiled `readySignature` (§6.2.6).
+#[derive(Debug, Clone)]
+pub struct ReadySignature {
+    pub verified: bool,
+    pub input: Regex,
+    pub footer: Option<Regex>,
+    pub rows: usize,
+}
+
+impl ReadySignature {
+    /// True when the input row — and the footer, when the signature has one —
+    /// is among the bottom `rows` non-empty rows of `screen` (topmost first).
+    pub fn matches<S: AsRef<str>>(&self, screen: &[S]) -> bool {
+        let bottom: Vec<&str> = screen
+            .iter()
+            .rev()
+            .map(|l| l.as_ref())
+            .filter(|l| !l.trim().is_empty())
+            .take(self.rows.max(1))
+            .collect();
+        let input = bottom.iter().any(|l| self.input.is_match(l));
+        let footer = match &self.footer {
+            Some(f) => bottom.iter().any(|l| f.is_match(l)),
+            None => true,
+        };
+        input && footer
+    }
+}
+
+/// The compiled `promptCard` grammar of one vendor (§6.2.4).
+#[derive(Debug, Clone)]
+pub struct PromptCardPatterns {
+    pub option: Regex,
+    pub marker: Regex,
+    pub continuation: Regex,
+    pub description: Regex,
+    pub divider: Regex,
+    pub header: Regex,
+    pub footer: Regex,
+    pub amend: Regex,
+    pub setup_marker: Regex,
+    pub amend_label: Regex,
+}
+
+/// The compiled `trustDialog` patterns of one vendor (A6).
+#[derive(Debug, Clone)]
+pub struct TrustDialogPatterns {
+    pub trust: Vec<Regex>,
+    pub exit: Vec<Regex>,
+    pub footer: Option<Regex>,
+}
+
+impl TrustDialogPatterns {
+    pub fn is_trust(&self, label: &str) -> bool {
+        self.trust.iter().any(|r| r.is_match(label))
+    }
+
+    pub fn is_exit(&self, label: &str) -> bool {
+        self.exit.iter().any(|r| r.is_match(label))
+    }
+}
+
+/// The grammar the contract spells out (§6.2.4); a `promptCard` entry that
+/// leaves a field out gets this one.
+pub mod default_grammar {
+    pub const OPTION: &str = r"^\s*(?:[❯>›]\s*)?(\d)\.\s+(\S.*)$";
+    pub const MARKER: &str = r"^\s*[❯>›]";
+    pub const CONTINUATION: &str = r"^\s+\S";
+    pub const DESCRIPTION: &str = r"^\s{5,}\S";
+    pub const DIVIDER: &str = r"^\s*─{3,}\s*$|^\s*─{2,}.+─{2,}\s*$";
+    pub const HEADER: &str = r"^\s*☐\s+(\S.*)$";
+    pub const FOOTER: &str =
+        r"(?i)esc to (cancel|close)|enter to (select|confirm|continue)|tab to amend|press enter";
+    pub const AMEND: &str = r"(?i)tab to amend";
+    pub const SETUP_MARKER: &str = r"^(\s*)[❯›>]\s+(\S.*)$";
+    pub const AMEND_LABEL: &str = r"(?i)^yes, and tell \S+ what to do next";
+}
+
 /// Everything the status engine and the monitor need, compiled once.
 #[derive(Debug, Clone, Default)]
 pub struct Signatures {
     agents: BTreeMap<String, AgentSignatures>,
     monitor: procscan::Signatures,
+    ready: BTreeMap<String, ReadySignature>,
+    cards: BTreeMap<String, PromptCardPatterns>,
+    trust: BTreeMap<String, TrustDialogPatterns>,
     warnings: Vec<String>,
     /// Absolute path of the user file this was loaded from, for the "edit
     /// signatures" affordance.
     source_path: Option<PathBuf>,
+}
+
+fn compile_one(what: &str, source: &str, warnings: &mut Vec<String>) -> Option<Regex> {
+    match Regex::new(source) {
+        Ok(regex) => Some(regex),
+        Err(e) => {
+            warnings.push(format!("{what} {source:?} did not compile: {e}"));
+            None
+        }
+    }
+}
+
+fn compile_ready(key: &str, spec: &ReadySignatureSpec, warnings: &mut Vec<String>) -> Option<ReadySignature> {
+    let Some(input) = spec.input.as_deref() else {
+        warnings.push(format!("readySignature.{key} has no input pattern; using the settled-grid fallback"));
+        return None;
+    };
+    let input = compile_one(&format!("readySignature.{key}.input"), input, warnings)?;
+    let footer = match spec.footer.as_deref() {
+        Some(f) => Some(compile_one(&format!("readySignature.{key}.footer"), f, warnings)?),
+        None => None,
+    };
+    Some(ReadySignature {
+        verified: spec.verified.unwrap_or(false),
+        input,
+        footer,
+        rows: spec.rows.unwrap_or(DEFAULT_READY_ROWS).clamp(1, 40),
+    })
+}
+
+fn compile_card(key: &str, spec: &PromptCardSpec, warnings: &mut Vec<String>) -> Option<PromptCardPatterns> {
+    use default_grammar as g;
+    let mut field = |name: &str, value: &Option<String>, default: &str| {
+        compile_one(
+            &format!("promptCard.{key}.{name}"),
+            value.as_deref().unwrap_or(default),
+            warnings,
+        )
+    };
+    // A grammar with a hole cannot parse safely: one broken field drops the
+    // vendor's cards (the screen then never yields a card for it).
+    Some(PromptCardPatterns {
+        option: field("option", &spec.option, g::OPTION)?,
+        marker: field("marker", &spec.marker, g::MARKER)?,
+        continuation: field("continuation", &spec.continuation, g::CONTINUATION)?,
+        description: field("description", &spec.description, g::DESCRIPTION)?,
+        divider: field("divider", &spec.divider, g::DIVIDER)?,
+        header: field("header", &spec.header, g::HEADER)?,
+        footer: field("footer", &spec.footer, g::FOOTER)?,
+        amend: field("amend", &spec.amend, g::AMEND)?,
+        setup_marker: field("setupMarker", &spec.setup_marker, g::SETUP_MARKER)?,
+        amend_label: field("amendLabel", &spec.amend_label, g::AMEND_LABEL)?,
+    })
+}
+
+fn compile_trust(key: &str, spec: &TrustDialogSpec, warnings: &mut Vec<String>) -> Option<TrustDialogPatterns> {
+    let mut list = |name: &str, sources: &Option<Vec<String>>| -> Vec<Regex> {
+        sources
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|s| compile_one(&format!("trustDialog.{key}.{name}"), s, warnings))
+            .collect()
+    };
+    let trust = list("trust", &spec.trust);
+    let exit = list("exit", &spec.exit);
+    if trust.is_empty() || exit.is_empty() {
+        warnings.push(format!("trustDialog.{key} needs both trust and exit patterns; the dialog is not recognised"));
+        return None;
+    }
+    let footer = match spec.footer.as_deref() {
+        Some(f) => Some(compile_one(&format!("trustDialog.{key}.footer"), f, warnings)?),
+        None => None,
+    };
+    Some(TrustDialogPatterns { trust, exit, footer })
 }
 
 impl Signatures {
@@ -297,12 +609,50 @@ impl Signatures {
             procscan::Signatures::compile(&agent_pats, &mcp_pats, &residue_pats);
         warnings.extend(monitor_warnings);
 
+        let mut ready = BTreeMap::new();
+        for (key, spec) in &file.ready_signature {
+            if let Some(sig) = compile_ready(key, spec, &mut warnings) {
+                ready.insert(canonical_agent_key(key), sig);
+            }
+        }
+        let mut cards = BTreeMap::new();
+        for (key, spec) in &file.prompt_card {
+            if let Some(card) = compile_card(key, spec, &mut warnings) {
+                cards.insert(canonical_agent_key(key), card);
+            }
+        }
+        let mut trust = BTreeMap::new();
+        for (key, spec) in &file.trust_dialog {
+            if let Some(dialog) = compile_trust(key, spec, &mut warnings) {
+                trust.insert(canonical_agent_key(key), dialog);
+            }
+        }
+
         Signatures {
             agents,
             monitor,
+            ready,
+            cards,
+            trust,
             warnings,
             source_path: None,
         }
+    }
+
+    /// The vendor's ready signature, if it has one (§6.2.6).
+    pub fn ready_signature(&self, key: &str) -> Option<&ReadySignature> {
+        self.ready.get(&canonical_agent_key(key))
+    }
+
+    /// The vendor's screen-prompt grammar; `None` = this vendor never yields a
+    /// screen-prompt card (§6.2.4).
+    pub fn prompt_card(&self, key: &str) -> Option<&PromptCardPatterns> {
+        self.cards.get(&canonical_agent_key(key))
+    }
+
+    /// The vendor's folder-trust dialog patterns (A6).
+    pub fn trust_dialog(&self, key: &str) -> Option<&TrustDialogPatterns> {
+        self.trust.get(&canonical_agent_key(key))
     }
 
     /// Patterns for one agent. Accepts either spelling of the Cursor key.
@@ -443,6 +793,9 @@ const SUPERSEDED_DEFAULT_DIGESTS: &[&str] = &[
     // v3, which teaches claude the `Esc to close` footer its full-screen views
     // print (BACKLOG M1.5 15b).
     "e0fe529428fbef944b6b989e4c66982a7c81f8ebba2e390cc05b7ee23160f80f",
+    // v3 — shipped up to Gilde 2. Superseded by v4 (readySignature,
+    // promptCard and trustDialog, contract §6.2.4/§6.2.6, A5/A6).
+    "8bda70d4ed5a1d1aef99417e518ceb2cb6f38423e25bf57c9bd6435f6faf9956",
 ];
 
 /// Rewrite `path` with the bundled defaults when it is an untouched seed of an
@@ -590,7 +943,7 @@ mod tests {
     #[test]
     fn the_bundled_defaults_parse_and_every_pattern_compiles() {
         let file = SignatureFile::defaults();
-        assert_eq!(file.version, 3);
+        assert_eq!(file.version, 4);
 
         let sigs = Signatures::compile(&file);
         assert!(
@@ -989,5 +1342,54 @@ mod tests {
 
         let (reloaded, _) = load_signatures(&paths);
         assert_eq!(reloaded.idle_after_ms("claude"), 7);
+    }
+    #[test]
+    fn every_vendor_ships_a_ready_signature_and_a_prompt_grammar() {
+        let sigs = Signatures::compile(&SignatureFile::defaults());
+        for key in ["claude", "codex", "cursor", "agy", "cursorAgent", "antigravity"] {
+            assert!(sigs.ready_signature(key).is_some(), "{key}");
+            assert!(sigs.prompt_card(key).is_some(), "{key}");
+        }
+        assert!(sigs.ready_signature("claude").unwrap().verified);
+        assert!(sigs.ready_signature("codex").unwrap().verified);
+        assert!(!sigs.ready_signature("cursor").unwrap().verified);
+        assert!(!sigs.ready_signature("agy").unwrap().verified);
+        assert!(sigs.trust_dialog("claude").is_some());
+        assert!(sigs.prompt_card("shell").is_none(), "a vendor without a grammar never gets a card");
+    }
+
+    #[test]
+    fn a_ready_input_never_matches_a_highlighted_numbered_option() {
+        let sigs = Signatures::compile(&SignatureFile::defaults());
+        let claude = sigs.ready_signature("claude").unwrap();
+        assert!(claude.input.is_match("❯ Try \"fix lint errors\""));
+        assert!(claude.input.is_match("❯"));
+        assert!(!claude.input.is_match(" ❯ 1. Yes"));
+        let codex = sigs.ready_signature("codex").unwrap();
+        assert!(codex.input.is_match("› Find and fix a bug in @filename"));
+        assert!(!codex.input.is_match("› 1. Update now"));
+        // Input and footer must both be among the bottom rows.
+        let screen = ["❯ ", "", "  ⏸ manual mode on · ? for shortcuts"];
+        assert!(claude.matches(&screen));
+        assert!(!claude.matches(&["❯ "]), "no footer, no signature");
+    }
+
+    #[test]
+    fn the_new_sections_merge_per_vendor_and_a_broken_field_drops_only_that_vendor() {
+        let user: SignatureFile = serde_json::from_str(
+            r#"{"readySignature":{"claude":{"footer":"CUSTOM FOOTER"}},
+                "promptCard":{"codex":{"option":"(unclosed"}},
+                "trustDialog":{"claude":{"exit":[]}}}"#,
+        )
+        .expect("json");
+        let merged = SignatureFile::defaults().merge_over_defaults(&user);
+        let sigs = Signatures::compile(&merged);
+        let claude = sigs.ready_signature("claude").unwrap();
+        assert!(claude.footer.as_ref().unwrap().is_match("CUSTOM FOOTER"));
+        assert!(claude.input.is_match("❯ "), "the input pattern is inherited");
+        assert!(sigs.prompt_card("codex").is_none(), "a broken grammar drops that vendor's cards");
+        assert!(sigs.prompt_card("claude").is_some(), "and only that vendor's");
+        assert!(sigs.trust_dialog("claude").is_none(), "an empty exit family disables recognition");
+        assert!(sigs.warnings().iter().any(|w| w.contains("promptCard.codex.option")));
     }
 }

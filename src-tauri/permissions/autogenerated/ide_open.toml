@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-ide-open"
+description = "Enables the ide_open command without any pre-configured scope."
+commands.allow = ["ide_open"]
+
+[[permission]]
+identifier = "deny-ide-open"
+description = "Denies the ide_open command without any pre-configured scope."
+commands.deny = ["ide_open"]

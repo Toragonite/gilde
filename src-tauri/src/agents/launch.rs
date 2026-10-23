@@ -262,6 +262,396 @@ fn apply_override(template: &mut LaunchTemplate, over: &LaunchOverride) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Gilde 2 argv builders (contract §6.1.1, §6.2.1)
+// ---------------------------------------------------------------------------
+//
+// The tables of §6.1.1 and §6.2.1, exactly. `argv[0]` is always the resolved,
+// checked absolute path of the vendor binary (or `/bin/sh` for a hosted pane);
+// the supervisor's allowlist refuses anything else (§9.3). Every value that
+// lands on argv is checked here first: an id that could be read as a flag, a
+// model outside the model rule, or a control character never reaches a
+// command line.
+
+use crate::contract::common::{AbsPath, PermissionMode};
+use crate::contract::process::ProcKind;
+use crate::contract::IpcError;
+
+/// How a Conversation-mode claude starts (§6.1.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConvoLaunch {
+    /// `--session-id <uuid v4 minted by Gilde>`.
+    New { session_id: String },
+    /// `--resume <sessionId>`.
+    Continue { session_id: String },
+    /// `--resume <sessionId> --fork-session`.
+    Copy { session_id: String },
+    /// `--resume <absolute transcript path> --fork-session` (a copy until
+    /// LP-25 can run, §6.5).
+    OtherAccount { transcript: AbsPath },
+}
+
+/// Everything §6.1.1's argv depends on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConvoArgs {
+    pub launch: ConvoLaunch,
+    /// Always passed (default `default`) [R6 §1.5].
+    pub permission_mode: PermissionMode,
+    pub model: Option<String>,
+}
+
+/// The argv tail (after `<claude>`) of a Conversation-mode session (§6.1.1):
+/// `-p --input-format stream-json --output-format stream-json --verbose
+/// --include-partial-messages --replay-user-messages --permission-prompt-tool
+/// stdio --permission-prompts host` + the launch flags + `--permission-mode
+/// <m>` [+ `--model <m>`] [+ `--allow-dangerously-skip-permissions` with
+/// `bypassPermissions` chosen at start].
+pub fn conversation_args(args: &ConvoArgs) -> Result<Vec<String>, IpcError> {
+    let mut out: Vec<String> = [
+        "-p",
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--include-partial-messages",
+        "--replay-user-messages",
+        "--permission-prompt-tool",
+        "stdio",
+        "--permission-prompts",
+        "host",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect();
+    match &args.launch {
+        ConvoLaunch::New { session_id } => {
+            check_uuid("sessionId", session_id)?;
+            out.extend(["--session-id".to_string(), session_id.clone()]);
+        }
+        ConvoLaunch::Continue { session_id } => {
+            check_id("sessionId", session_id)?;
+            out.extend(["--resume".to_string(), session_id.clone()]);
+        }
+        ConvoLaunch::Copy { session_id } => {
+            check_id("sessionId", session_id)?;
+            out.extend([
+                "--resume".to_string(),
+                session_id.clone(),
+                "--fork-session".to_string(),
+            ]);
+        }
+        ConvoLaunch::OtherAccount { transcript } => {
+            out.extend([
+                "--resume".to_string(),
+                transcript.as_str().to_string(),
+                "--fork-session".to_string(),
+            ]);
+        }
+    }
+    push_mode_and_model(&mut out, args.permission_mode, args.model.as_deref())?;
+    if args.permission_mode == PermissionMode::BypassPermissions {
+        out.push("--allow-dangerously-skip-permissions".to_string());
+    }
+    Ok(out)
+}
+
+/// How a first prompt reaches a Terminal-mode CLI (§6.2.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FirstPrompt {
+    /// No prompt.
+    None,
+    /// On argv (already in the args).
+    Argv,
+    /// `pty_paste(text, submit = true)` once the session is ready (§6.2.2).
+    TypedAfterReady(String),
+}
+
+/// One Terminal-mode launch: what to hand `PtyApi::open`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalArgv {
+    /// `Pty`, `Attach` or `Pane`.
+    pub kind: ProcKind,
+    pub argv0: AbsPath,
+    pub args: Vec<String>,
+    pub prompt: FirstPrompt,
+}
+
+/// The rows of §6.2.1.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalLaunch {
+    /// `<claude> --session-id <uuid> --permission-mode <m> [--model m] [-- <prompt>]`.
+    ClaudeNew {
+        session_id: String,
+        permission_mode: PermissionMode,
+        model: Option<String>,
+        prompt: Option<String>,
+    },
+    /// `<claude> --resume <id> [--fork-session] --permission-mode <m> [--model m]`;
+    /// the prompt is typed after ready.
+    ClaudeResume {
+        session_id: String,
+        fork: bool,
+        permission_mode: PermissionMode,
+        model: Option<String>,
+        prompt: Option<String>,
+    },
+    /// `<claude> --teammate-mode tmux --session-id <uuid> --permission-mode <m>
+    /// --settings '{"permissions":{"defaultMode":"<m>"}}' [--model m] [-- <prompt>]`
+    /// (+ the team env of §7.4.1, composed by the caller).
+    ClaudeHostedLead {
+        session_id: String,
+        permission_mode: PermissionMode,
+        model: Option<String>,
+        prompt: Option<String>,
+    },
+    /// `<claude> attach <sessionId>` [R6 §6 LP-22].
+    ClaudeAttach { session_id: String },
+    /// The claude sign-in TUI: `<claude> --permission-mode default`, then
+    /// `/login` typed after ready (§4.2.7) [F-44].
+    ClaudeSignIn,
+    /// `<codex> [resume <id>] [--model <m>] [<prompt>]` (argv when new, typed
+    /// after ready when resuming).
+    Codex {
+        resume: Option<String>,
+        model: Option<String>,
+        prompt: Option<String>,
+    },
+    /// `codex login`.
+    CodexSignIn,
+    /// `<cursor-agent> [--resume <chatId>] [--model <m>]`; prompt typed after
+    /// ready [R1 §3 Bug].
+    Cursor {
+        resume: Option<String>,
+        model: Option<String>,
+        prompt: Option<String>,
+    },
+    /// `cursor-agent login`.
+    CursorSignIn,
+    /// `<agy> [--conversation <id>]`; prompt typed after ready.
+    Agy {
+        conversation: Option<String>,
+        prompt: Option<String>,
+    },
+    /// The agy TUI (it signs in from there).
+    AgySignIn,
+    /// A hosted pane: `/bin/sh -c <command string from respawn-pane>` (§7.4.5),
+    /// used as given.
+    Pane { command: String },
+}
+
+/// The one shell a hosted pane runs in (§7.4.5, §9.3).
+pub const PANE_SHELL: &str = "/bin/sh";
+
+/// Build one Terminal-mode launch (§6.2.1). `binary` is the resolved,
+/// checked absolute path of the vendor binary (ignored for a pane, which
+/// always runs `/bin/sh`).
+pub fn terminal_argv(binary: &AbsPath, launch: &TerminalLaunch) -> Result<TerminalArgv, IpcError> {
+    let mut args: Vec<String> = Vec::new();
+    let mut prompt = FirstPrompt::None;
+    let mut kind = ProcKind::Pty;
+    let mut argv0 = binary.clone();
+    let typed = |text: &Option<String>| match text.as_deref().filter(|t| !t.trim().is_empty()) {
+        Some(t) => FirstPrompt::TypedAfterReady(t.to_string()),
+        None => FirstPrompt::None,
+    };
+    match launch {
+        TerminalLaunch::ClaudeNew {
+            session_id,
+            permission_mode,
+            model,
+            prompt: text,
+        } => {
+            check_uuid("sessionId", session_id)?;
+            args.extend(["--session-id".to_string(), session_id.clone()]);
+            push_mode_and_model(&mut args, *permission_mode, model.as_deref())?;
+            prompt = push_prompt_after_dashes(&mut args, text)?;
+        }
+        TerminalLaunch::ClaudeResume {
+            session_id,
+            fork,
+            permission_mode,
+            model,
+            prompt: text,
+        } => {
+            check_id("sessionId", session_id)?;
+            args.extend(["--resume".to_string(), session_id.clone()]);
+            if *fork {
+                args.push("--fork-session".to_string());
+            }
+            push_mode_and_model(&mut args, *permission_mode, model.as_deref())?;
+            prompt = typed(text);
+        }
+        TerminalLaunch::ClaudeHostedLead {
+            session_id,
+            permission_mode,
+            model,
+            prompt: text,
+        } => {
+            check_uuid("sessionId", session_id)?;
+            args.extend([
+                "--teammate-mode".to_string(),
+                "tmux".to_string(),
+                "--session-id".to_string(),
+                session_id.clone(),
+                "--permission-mode".to_string(),
+                permission_mode.as_cli().to_string(),
+                "--settings".to_string(),
+                lead_settings_json(*permission_mode),
+            ]);
+            if let Some(model) = model {
+                check_model(model)?;
+                args.extend(["--model".to_string(), model.clone()]);
+            }
+            prompt = push_prompt_after_dashes(&mut args, text)?;
+        }
+        TerminalLaunch::ClaudeAttach { session_id } => {
+            check_id("sessionId", session_id)?;
+            kind = ProcKind::Attach;
+            args.extend(["attach".to_string(), session_id.clone()]);
+        }
+        TerminalLaunch::ClaudeSignIn => {
+            push_mode_and_model(&mut args, PermissionMode::Default, None)?;
+            prompt = FirstPrompt::TypedAfterReady("/login".to_string());
+        }
+        TerminalLaunch::Codex {
+            resume,
+            model,
+            prompt: text,
+        } => {
+            if let Some(id) = resume {
+                check_id("resume", id)?;
+                args.extend(["resume".to_string(), id.clone()]);
+            }
+            if let Some(model) = model {
+                check_model(model)?;
+                args.extend(["--model".to_string(), model.clone()]);
+            }
+            match text.as_deref().filter(|t| !t.trim().is_empty()) {
+                None => {}
+                // A resumed session gets its prompt typed after ready.
+                Some(t) if resume.is_some() => prompt = FirstPrompt::TypedAfterReady(t.to_string()),
+                // A prompt that starts with `-` would be read as a flag:
+                // typed after ready instead, never on argv.
+                Some(t) if t.starts_with('-') => prompt = FirstPrompt::TypedAfterReady(t.to_string()),
+                Some(t) => {
+                    check_argv_text("prompt", t)?;
+                    args.push(t.to_string());
+                    prompt = FirstPrompt::Argv;
+                }
+            }
+        }
+        TerminalLaunch::CodexSignIn => args.push("login".to_string()),
+        TerminalLaunch::Cursor {
+            resume,
+            model,
+            prompt: text,
+        } => {
+            if let Some(id) = resume {
+                check_id("resume", id)?;
+                args.extend(["--resume".to_string(), id.clone()]);
+            }
+            if let Some(model) = model {
+                check_model(model)?;
+                args.extend(["--model".to_string(), model.clone()]);
+            }
+            prompt = typed(text);
+        }
+        TerminalLaunch::CursorSignIn => args.push("login".to_string()),
+        TerminalLaunch::Agy {
+            conversation,
+            prompt: text,
+        } => {
+            if let Some(id) = conversation {
+                check_id("conversation", id)?;
+                args.extend(["--conversation".to_string(), id.clone()]);
+            }
+            prompt = typed(text);
+        }
+        TerminalLaunch::AgySignIn => {}
+        TerminalLaunch::Pane { command } => {
+            if command.is_empty() || command.contains('\0') {
+                return Err(IpcError::invalid_argument("command", "required"));
+            }
+            kind = ProcKind::Pane;
+            argv0 = AbsPath::parse(PANE_SHELL).map_err(|_| IpcError::internal("pane-shell"))?;
+            args.extend(["-c".to_string(), command.clone()]);
+        }
+    }
+    Ok(TerminalArgv {
+        kind,
+        argv0,
+        args,
+        prompt,
+    })
+}
+
+/// The hosted lead's inline settings: the only `--settings` Gilde ever
+/// passes; it writes no file (§6.2.1, frozen LP-10/LP-11).
+pub fn lead_settings_json(mode: PermissionMode) -> String {
+    serde_json::json!({ "permissions": { "defaultMode": mode.as_cli() } }).to_string()
+}
+
+fn push_mode_and_model(out: &mut Vec<String>, mode: PermissionMode, model: Option<&str>) -> Result<(), IpcError> {
+    out.extend(["--permission-mode".to_string(), mode.as_cli().to_string()]);
+    if let Some(model) = model {
+        check_model(model)?;
+        out.extend(["--model".to_string(), model.to_string()]);
+    }
+    Ok(())
+}
+
+/// `-- <prompt>`: after the `--` fence nothing can be read as a flag.
+fn push_prompt_after_dashes(out: &mut Vec<String>, text: &Option<String>) -> Result<FirstPrompt, IpcError> {
+    match text.as_deref().filter(|t| !t.trim().is_empty()) {
+        None => Ok(FirstPrompt::None),
+        Some(t) => {
+            check_argv_text("prompt", t)?;
+            out.extend(["--".to_string(), t.to_string()]);
+            Ok(FirstPrompt::Argv)
+        }
+    }
+}
+
+fn check_uuid(field: &str, s: &str) -> Result<(), IpcError> {
+    if crate::contract::ids::is_uuid(s, None) {
+        Ok(())
+    } else {
+        Err(IpcError::invalid_argument(field, "pattern"))
+    }
+}
+
+/// A vendor session/chat id on argv: non-empty, ≤ 256 bytes, never starting
+/// with `-` (it would be read as a flag), no whitespace or control characters.
+fn check_id(field: &str, s: &str) -> Result<(), IpcError> {
+    let ok = !s.is_empty()
+        && s.len() <= 256
+        && !s.starts_with('-')
+        && !s.chars().any(|c| c.is_control() || c.is_whitespace());
+    if ok {
+        Ok(())
+    } else {
+        Err(IpcError::invalid_argument(field, "pattern"))
+    }
+}
+
+fn check_model(model: &str) -> Result<(), IpcError> {
+    if crate::contract::ipc::is_model_id(model) {
+        Ok(())
+    } else {
+        Err(IpcError::invalid_argument("model", "pattern"))
+    }
+}
+
+/// Text on argv cannot hold NUL.
+fn check_argv_text(field: &str, s: &str) -> Result<(), IpcError> {
+    if s.contains('\0') {
+        Err(IpcError::invalid_argument(field, "nul"))
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

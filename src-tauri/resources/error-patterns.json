@@ -1,0 +1,27 @@
+{
+  "schema": 1,
+  "provenance": "Contract §6.1.7 / §1.3 P12 (owner T05). signIn: R6 §3 LP-09b observed 2.1.306 ('Not logged in · Please run /login', assistant.error 'authentication_failed'). usageLimit: PROVISIONAL (LP-09c not observed) — the patterns below are the fallback guesses; freezing them is a T05 data follow-up. usageErrorMarkers: the CLI's usage-error wording for an unknown flag (§6.1.2 step 6, §6.1.9).",
+  "signInErrorCodes": ["authentication_failed"],
+  "signIn": [
+    { "regex": "(?i)not logged in" },
+    { "regex": "(?i)please run /login" },
+    { "regex": "(?i)invalid api key" },
+    { "regex": "(?i)oauth token has expired" }
+  ],
+  "usageLimitErrorCodes": ["rate_limit", "usage_limit"],
+  "usageLimitStatus": [429],
+  "usageLimit": [
+    { "regex": "(?i)usage limit reached\\|(?P<epoch_s>[0-9]{9,11})" },
+    { "regex": "(?i)usage limit reached" },
+    { "regex": "(?i)you've (hit|reached) your (usage )?limit" },
+    { "regex": "(?i)rate limit (reached|exceeded)" },
+    { "regex": "(?i)out of extra usage" }
+  ],
+  "usageErrorMarkers": [
+    "unknown option",
+    "unknown argument",
+    "unrecognized option",
+    "invalid option",
+    "error: option"
+  ]
+}

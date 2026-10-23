@@ -1,15 +1,18 @@
 #!/usr/bin/env node
 /**
  * check-showcase-tree-shaking.mjs — proves the showcase (src/showcase/, behind
- * `VITE_GILDE_SHOWCASE=1`, see src/features.ts) is NOT in a normal build and IS
- * in a showcase build.
+ * `VITE_GILDE_SHOWCASE=1`: the `SHOWCASE` switch of src/lib/mode.ts and the
+ * guarded dynamic import in src/main.tsx) is NOT in a normal build and IS in a
+ * showcase build (contract §2.2.4: "tree-shaking proof stays a gate").
  *
  *   node scripts/check-showcase-tree-shaking.mjs            build both ways into temp dirs, scan
  *   node scripts/check-showcase-tree-shaking.mjs --dist     also scan ./dist (after `npm run build`)
  *
  * The marker is `SHOWCASE_MARKER` of src/showcase/backend.ts, read from the
  * source so the two can never drift. Too slow for the unit runner (two
- * production builds), so it is a script of its own.
+ * production builds), so it is a script of its own. Between T13's merge and
+ * the wave-2 exit the WebView build does not compile (A8.2), so the check runs
+ * again from the wave-2 exit on.
  *
  * Exit codes: 0 both checks hold; 1 a check failed; 2 the builds could not run.
  */

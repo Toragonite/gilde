@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-screen-prompt-key"
+description = "Enables the screen_prompt_key command without any pre-configured scope."
+commands.allow = ["screen_prompt_key"]
+
+[[permission]]
+identifier = "deny-screen-prompt-key"
+description = "Denies the screen_prompt_key command without any pre-configured scope."
+commands.deny = ["screen_prompt_key"]

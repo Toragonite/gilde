@@ -1,0 +1,109 @@
+/*
+ * The Split screen (ux-ia §3.7). Tokens only; the grid is set inline from
+ * `layout.ts` (columns, rows, each tile's cell).
+ */
+
+.g-split {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
+}
+
+.g-split-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 40px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--border);
+  min-width: 0;
+}
+
+.g-split-title {
+  margin: 0;
+  font-size: var(--fs-body);
+  font-weight: 600;
+  color: var(--n12);
+  white-space: nowrap;
+}
+
+.g-split-count {
+  font-size: var(--fs-sub);
+  color: var(--n8);
+  white-space: nowrap;
+}
+
+.g-split-hint {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-sub);
+  color: var(--n8);
+}
+
+.g-split-fill {
+  flex: 1 1 0;
+}
+
+.g-split-empty {
+  padding: 24px 12px;
+}
+
+.g-tiles {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: grid;
+  gap: 4px;
+  padding: 4px;
+}
+
+.g-split-replace {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--n2);
+}
+
+.g-split-replace-text {
+  margin: 0;
+  flex: 1 1 100%;
+  font-size: var(--fs-sub);
+  color: var(--n11);
+}
+
+.g-split-replace-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.g-split-replace-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 260px;
+  font-size: var(--fs-sub);
+  color: var(--n10);
+}
+
+.g-split-replace-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.g-split-replace-actions {
+  display: inline-flex;
+  gap: 6px;
+}

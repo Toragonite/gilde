@@ -1,0 +1,302 @@
+/*
+ * Approval, question, plan and screen-prompt cards (ux-ia §3.5).
+ * Tokens only (UI-GUIDELINES §2-1); flat surfaces, 1px borders, 4/6 px radii.
+ * The card's warn-tinted border is the one accent it carries.
+ */
+
+.g-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.g-card {
+  border: 1px solid var(--warn);
+  border-radius: var(--r-md);
+  background: var(--n1);
+  padding: 8px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  font-size: var(--fs-body);
+  color: var(--n11);
+}
+
+.g-card[data-variant='row'] {
+  padding: 6px 8px;
+  gap: 4px;
+}
+
+.g-card[data-kind='watchedApproval'],
+.g-card[data-kind='watchedQuestion'],
+.g-card[data-kind='setupPrompt'] {
+  border-color: var(--border);
+}
+
+.g-card:focus {
+  outline: none;
+}
+
+.g-card:focus-visible,
+.g-card:focus-within {
+  outline: 1px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.g-card-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: var(--fs-sub);
+  color: var(--n9);
+}
+
+.g-card-head .g-glyph {
+  color: var(--warn);
+  flex: none;
+}
+
+.g-card-state {
+  font-weight: 600;
+  color: var(--warn);
+}
+
+.g-card[data-kind='setupPrompt'] .g-card-state,
+.g-card[data-kind='setupPrompt'] .g-card-head .g-glyph {
+  color: var(--n10);
+}
+
+.g-card-note,
+.g-card-pos {
+  color: var(--n8);
+}
+
+.g-card-age {
+  margin-left: auto;
+  font-size: var(--fs-label);
+  color: var(--n8);
+  font-variant-numeric: tabular-nums;
+}
+
+.g-card-title {
+  margin: 0;
+  color: var(--n12);
+  overflow-wrap: anywhere;
+}
+
+.g-card-details {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.g-card-cmd,
+.g-card-screen {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: var(--fs-sub);
+  line-height: 1.5;
+  color: var(--n12);
+  background: var(--n0);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  padding: 6px 8px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 240px;
+  overflow: auto;
+}
+
+.g-card[data-variant='row'] .g-card-cmd {
+  max-height: 48px;
+}
+
+.g-card-sub {
+  margin: 0;
+  font-size: var(--fs-sub);
+  color: var(--n9);
+  overflow-wrap: anywhere;
+}
+
+.g-card-muted {
+  color: var(--n8);
+}
+
+.g-card-full {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.g-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.g-card-expand {
+  margin-left: auto;
+}
+
+.g-card-hint,
+.g-card-line {
+  margin: 0;
+  font-size: var(--fs-label);
+  color: var(--n8);
+}
+
+.g-card-line {
+  color: var(--n10);
+}
+
+.g-card-detail {
+  display: block;
+  margin-top: 2px;
+  color: var(--n8);
+  overflow-wrap: anywhere;
+}
+
+.g-card-gone {
+  margin: 0;
+  padding: 4px 12px;
+  font-size: var(--fs-sub);
+  color: var(--n8);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+}
+
+/* Buttons of a card: 28 px in the Session screen, 24 px in rows. */
+.g-cbtn {
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--n2);
+  color: var(--n11);
+  font: inherit;
+  font-size: var(--fs-sub);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  max-width: 100%;
+  cursor: default;
+  transition: background var(--motion-fast) var(--easing);
+}
+
+.g-cbtn > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.g-card[data-variant='row'] .g-cbtn {
+  height: 24px;
+}
+
+.g-cbtn:hover:not(:disabled) {
+  background: var(--n3);
+}
+
+.g-cbtn:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.g-cbtn:disabled {
+  opacity: 0.45;
+}
+
+.g-cbtn[aria-disabled='true'] {
+  opacity: 0.6;
+}
+
+.g-cbtn-primary {
+  background: var(--primary);
+  color: var(--on-primary);
+  border-color: transparent;
+  font-weight: 600;
+}
+
+.g-cbtn-primary:hover:not(:disabled) {
+  background: var(--primary);
+  opacity: 0.88;
+}
+
+.g-cbtn-ghost {
+  background: transparent;
+  border-color: transparent;
+  color: var(--n9);
+}
+
+.g-cbtn-ghost:hover:not(:disabled) {
+  color: var(--n11);
+}
+
+.g-cbtn[aria-pressed='true'],
+.g-card-check[data-selected='true'] {
+  background: var(--n4);
+  color: var(--n12);
+}
+
+.g-key {
+  font-family: var(--mono);
+  font-size: var(--fs-label);
+  line-height: 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  padding: 0 4px;
+  color: var(--n9);
+  background: var(--n2);
+  font-weight: 400;
+  flex: none;
+}
+
+.g-cbtn-primary .g-key {
+  color: inherit;
+  background: transparent;
+}
+
+.g-card-questions {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.g-card-question {
+  border: 0;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.g-card-question:disabled {
+  color: var(--n8);
+}
+
+.g-card-qtext {
+  padding: 0;
+  color: var(--n11);
+}
+
+.g-card-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.g-card-check input {
+  margin: 0;
+  accent-color: var(--n12);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .g-cbtn {
+    transition: none;
+  }
+}

@@ -454,7 +454,14 @@ fn a_process_scanned_before_its_exec_into_a_bundle_main_is_protected_on_the_fres
     let main = macos.join("Fixture Probe");
     std::fs::copy(fixtures::fake_agent_path(), &main).expect("copy the fixture into the bundle");
 
-    let script = format!("sleep 2; exec \"{}\" hang", main.display());
+    // The shell execs only once the test has taken its first look (an event,
+    // not a 2 s head start a loaded machine can eat — A10.7).
+    let go = dir.path().join("go");
+    let script = format!(
+        "while [ ! -e \"{}\" ]; do sleep 0.05; done; exec \"{}\" hang",
+        go.display(),
+        main.display()
+    );
     let child = std::process::Command::new("/bin/sh")
         .args(["-c", &script])
         .stdin(std::process::Stdio::null())
@@ -489,7 +496,8 @@ fn a_process_scanned_before_its_exec_into_a_bundle_main_is_protected_on_the_fres
         "a shell that only names a bundle path in its script is not a bundle main: {row:?}"
     );
 
-    // Wait for the exec.
+    // Let it exec, and wait for that.
+    std::fs::write(&go, b"").expect("release the shell");
     let deadline = Instant::now() + Duration::from_secs(20);
     while !procscan::exe_path_of(pid).is_some_and(|e| procscan::is_app_bundle_path(&e)) {
         assert!(Instant::now() < deadline, "pid {pid} never exec'd into the bundle main");

@@ -13,6 +13,11 @@
 //!   logs/gilde.log.YYYY-MM-DD                   tracing, daily rotation, 7 kept
 //!   logs/sidecar.log.YYYY-MM-DD                 sidecar stderr
 //!   runs/<run_id>.txt                           spill for run text over 4 MiB
+//!   run/                                        sockets (PaneHost `ph.sock`, §4.6)      [Gilde 2]
+//!   shim/<buildId>/tmux                         per-build gilde-tmux copy (§4.7)        [Gilde 2]
+//!   tmp/vendorcopy/                             SQLite clones of vendor DBs (§5.7)      [Gilde 2]
+//!   tmp/diff/<uuid>/                            IDE diff base files, 0400 (§9.4)        [Gilde 2]
+//!   cache/canary/                               static canary results (§3.10)           [Gilde 2]
 //!
 //! ~/.gilde/                                     user-facing output, typed into a shell
 //!   worktrees/<repo-slug>/<task-slug>/
@@ -65,6 +70,11 @@ pub struct AppPaths {
     worktrees_root: PathBuf,
     archive_root: PathBuf,
     dispatch_root: PathBuf,
+    run_dir: PathBuf,
+    shim_root: PathBuf,
+    tmp_vendorcopy_dir: PathBuf,
+    tmp_diff_dir: PathBuf,
+    canary_cache_dir: PathBuf,
 }
 
 impl AppPaths {
@@ -122,6 +132,11 @@ impl AppPaths {
     pub fn new(app_data_dir: PathBuf, home_dir: PathBuf) -> Self {
         let user_root = home_dir.join(USER_ROOT_DIR_NAME);
         Self {
+            run_dir: app_data_dir.join("run"),
+            shim_root: app_data_dir.join("shim"),
+            tmp_vendorcopy_dir: app_data_dir.join("tmp").join("vendorcopy"),
+            tmp_diff_dir: app_data_dir.join("tmp").join("diff"),
+            canary_cache_dir: app_data_dir.join("cache").join("canary"),
             cache_dir: app_data_dir.join("cache"),
             logs_dir: app_data_dir.join("logs"),
             scrollback_dir: app_data_dir.join("sessions"),
@@ -182,9 +197,40 @@ impl AppPaths {
         &self.archive_root
     }
 
-    /// `~/.gilde/dispatch`
+    /// `~/.gilde/dispatch` — legacy (contract §3.9): never read or written by
+    /// Gilde 2, no longer created at boot.
     pub fn dispatch_root(&self) -> &Path {
         &self.dispatch_root
+    }
+
+    /// `<app-data>/run` — sockets (the PaneHost socket, §4.6).
+    pub fn run_dir(&self) -> &Path {
+        &self.run_dir
+    }
+
+    /// `<app-data>/shim` — the per-build `gilde-tmux` copies live below it.
+    pub fn shim_root(&self) -> &Path {
+        &self.shim_root
+    }
+
+    /// `<app-data>/shim/<build_id>` (§4.7: a copy per build, not a symlink).
+    pub fn shim_dir(&self, build_id: &str) -> PathBuf {
+        self.shim_root.join(build_id)
+    }
+
+    /// `<app-data>/tmp/vendorcopy` — SQLite clones of vendor databases (§5.7).
+    pub fn tmp_vendorcopy_dir(&self) -> &Path {
+        &self.tmp_vendorcopy_dir
+    }
+
+    /// `<app-data>/tmp/diff` — IDE diff base files (§9.4).
+    pub fn tmp_diff_dir(&self) -> &Path {
+        &self.tmp_diff_dir
+    }
+
+    /// `<app-data>/cache/canary` — static canary results (§3.10).
+    pub fn canary_cache_dir(&self) -> &Path {
+        &self.canary_cache_dir
     }
 
     // -- files ----------------------------------------------------------------
@@ -273,7 +319,11 @@ impl AppPaths {
             self.user_root.as_path(),
             self.worktrees_root.as_path(),
             self.archive_root.as_path(),
-            self.dispatch_root.as_path(),
+            self.run_dir.as_path(),
+            self.shim_root.as_path(),
+            self.tmp_vendorcopy_dir.as_path(),
+            self.tmp_diff_dir.as_path(),
+            self.canary_cache_dir.as_path(),
         ]
     }
 }

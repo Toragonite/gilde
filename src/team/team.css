@@ -1,440 +1,667 @@
 /*
- * Team preview styles (T8, team contract v2 §8.2).
- *
- * Every colour is a var(--token) from styles/tokens.css — nothing literal
- * (scripts/lint-ui.sh). Flat surfaces, 1px --border separators, no shadows,
- * 4/8/12px spacing; numbers, ids and times in the mono stack. It lives next to
- * the module, like monitor.css, because styles/global.css is not this lane's.
+ * The Team screen (ux-ia §3.8–§3.10). Tokens only; flat surfaces with 1 px
+ * borders; sub-view tabs 32 px, active tab --n12 on --n0 (UI-GUIDELINES
+ * §2-1b); every single-line text that can be cut ends in an ellipsis.
  */
 
-/*
- * Live check G-a. The header and the preview line are in-flow rows ABOVE the
- * one scroll container (`.team-body`), never on top of it: nothing here is
- * positioned or layered, so the banner cannot cover a heading. `.team` clips,
- * so the only element that can ever scroll is the body.
- */
-.team {
+.g-team {
   display: flex;
   flex-direction: column;
-  flex: 1 1 auto;
-  min-width: 0;
+  height: 100%;
   min-height: 0;
-  overflow: hidden;
-  background: var(--n1);
-}
-
-.team > :not(.team-body) {
-  flex: none;
-}
-
-.team-hdr {
-  flex: none;
-}
-
-.team-chips {
-  flex-wrap: nowrap;
-  overflow: hidden;
   min-width: 0;
 }
 
-.team-refresh {
-  padding: 0 var(--sp-6);
+.g-team-gone {
+  margin: 0;
+  padding: 24px 12px;
+  color: var(--n8);
 }
 
-.team-preview {
+.g-team-head {
   flex: none;
-  padding: var(--sp-4) var(--sp-12);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 40px;
+  padding: 0 12px;
   border-bottom: 1px solid var(--border);
+  min-width: 0;
 }
 
-.team-body {
+.g-team-title {
+  flex: 0 1 auto;
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-body);
+  font-weight: 600;
+  color: var(--n12);
+}
+
+.g-team-meta {
+  flex: 0 3 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-sub);
+  color: var(--n8);
+}
+
+.g-team-fill,
+.g-board-fill {
   flex: 1 1 0;
-  min-height: 0;
-  /* Content that grows above the viewport (the roster and the board fill in
-     after the first paint) must not drag the view down to the messages. */
-  overflow-anchor: none;
-}
-
-.team-loading,
-.team-note {
-  padding: var(--sp-4) var(--sp-12);
-}
-
-.team-head {
-  padding: var(--sp-8) var(--sp-12);
-  border-bottom: 1px solid var(--border);
-}
-
-.team-title {
   min-width: 0;
 }
 
-.team-figures {
-  flex-wrap: wrap;
+.g-team-modes {
+  flex: none;
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  overflow: hidden;
 }
 
-.team-goal {
-  color: var(--n11);
-}
-
-.team-hint,
-.team-warn {
-  color: var(--warn);
-}
-
-.team-list-reason {
-  overflow-wrap: anywhere;
-}
-
-.team-pre {
-  margin: 0;
-  white-space: pre-wrap;
-}
-
-.team-warnings {
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.team-section {
-  border-bottom: 1px solid var(--border);
-  padding-bottom: var(--sp-8);
-}
-
-.team-section > .sec {
-  padding: 0 var(--sp-12);
-}
-
-/* -- roster ---------------------------------------------------------------- */
-
-.team-roster {
-  display: flex;
-  flex-direction: column;
-}
-
-.team-member {
-  display: flex;
-  flex-direction: column;
-  align-items: stretch;
-  gap: var(--sp-2);
-  width: 100%;
-  padding: var(--sp-6) var(--sp-12);
+.g-team-mode {
+  height: 26px;
+  padding: 0 12px;
   border: 0;
-  border-bottom: 1px solid var(--border);
-  background: transparent;
-  color: var(--n11);
+  background: var(--n1);
+  color: var(--n9);
   font: inherit;
-  text-align: left;
-  cursor: default;
+  font-size: var(--fs-sub);
+  white-space: nowrap;
 }
 
-.team-member:hover {
-  background: var(--n3);
+.g-team-mode + .g-team-mode {
+  border-left: 1px solid var(--border);
 }
 
-.team-member[data-selected='true'] {
-  background: var(--n4);
+.g-team-mode[aria-selected='true'] {
+  background: var(--n0);
+  color: var(--n12);
+  font-weight: 600;
 }
 
-.team-member:focus-visible {
+.g-team-mode:focus-visible {
   outline: 1px solid var(--accent);
   outline-offset: -1px;
 }
 
-.team-member-line,
-.team-member-meta {
-  min-width: 0;
-}
-
-.team-member-meta {
-  flex-wrap: nowrap;
-}
-
-.team-tone[data-tone='warn'] {
-  color: var(--warn);
-}
-
-.team-tone[data-tone='error'] {
-  color: var(--error);
-}
-
-.team-tone[data-tone='ok'] {
-  color: var(--ok);
-}
-
-.team-member-panel {
-  padding: var(--sp-4) 0;
-}
-
-.team-member-panel > .team-last-turn {
-  padding: 0 var(--sp-12);
-  color: var(--n11);
-}
-
-.team-activity {
-  margin: 0;
-  padding: 0 var(--sp-12);
-  list-style: none;
-  color: var(--n11);
-}
-
-.team-activity li {
-  height: 20px;
-  min-width: 0;
-}
-
-.team-activity-kind {
-  width: 40px;
+.g-team-lines {
   flex: none;
-}
-
-/* -- board ----------------------------------------------------------------- */
-
-.team-board {
-  display: grid;
-  grid-template-columns: repeat(5, minmax(120px, 1fr));
-  gap: var(--sp-8);
-  padding: 0 var(--sp-12);
-}
-
-.team-column {
-  min-width: 0;
-  gap: var(--sp-4);
-}
-
-.team-column-head {
-  height: 24px;
-  display: flex;
-  align-items: center;
   border-bottom: 1px solid var(--border);
+  padding: 4px 12px;
 }
 
-.team-task {
-  padding: var(--sp-6) var(--sp-8);
-  border: 1px solid var(--border);
-  border-radius: var(--r-sm);
-  background: var(--n2);
-  min-width: 0;
-}
-
-/* -- messages -------------------------------------------------------------- */
-
-.team-timeline {
+.g-team-line {
   margin: 0;
-  padding: 0;
-  list-style: none;
+  padding: 2px 0;
+  font-size: var(--fs-sub);
+  color: var(--n10);
 }
 
-.team-message {
-  padding: var(--sp-6) var(--sp-12);
+.g-team-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.g-team-floor {
+  flex: 1 1 auto;
+  min-height: 0;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.g-team-floor > * {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.g-team-menu {
+  display: flex;
+  flex-direction: column;
+  min-width: 240px;
+  max-width: 360px;
+  padding: 4px;
+}
+
+.g-team-menu-actions {
+  display: flex;
+  flex-direction: column;
+  padding-bottom: 4px;
+  margin-bottom: 4px;
   border-bottom: 1px solid var(--border);
 }
 
-.team-message-body {
-  color: var(--n11);
+.g-team-menu-fact {
+  margin: 0;
+  padding: 4px 8px;
+  font-size: var(--fs-sub);
+  color: var(--n8);
   overflow-wrap: anywhere;
 }
 
-/* -- the Team view's sidebar (F4) and empty state (F2, F3) ---------------- */
+/* -- Panes ------------------------------------------------------------------ */
 
-.team-sb-teams {
-  flex: 0 1 auto;
-  overflow-y: auto;
+.g-panes {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 
-.tree-row.team-sb-team,
-.tree-row.team-sb-member {
-  width: 100%;
-  border: 0;
-  background: none;
-  font: inherit;
-  text-align: left;
-  cursor: pointer;
+.g-panes-grid {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: grid;
+  gap: 4px;
+  padding: 4px;
 }
 
-/*
- * A member row in the sidebar: the identity (dot, name, worktree icon) first,
- * the details (branch, leftover, memory, state) after. The details are one
- * group that wraps onto a second line when the row is too narrow for both, so
- * they never squeeze the name; the name is the only thing on its line that
- * may shrink, and only once it alone is wider than the row.
- */
-.tree-row.team-sb-member {
-  height: auto;
-  min-height: var(--row-h);
-  flex-wrap: wrap;
-  column-gap: var(--sp-8);
-  row-gap: 0;
-  padding-left: var(--sp-24);
+.g-panes-divider {
+  cursor: col-resize;
+  border-radius: var(--r-sm);
+  background: transparent;
+  outline: none;
+  touch-action: none;
 }
 
-/* The identity takes its full width before the details get any: when both do
-   not fit, the details wrap, so the name is cut only when it alone is wider
-   than the row (about 20 characters at the default sidebar width). No width is
-   reserved, so a short row stays on one line. */
-.team-sb-member-id {
+.g-panes-divider:hover,
+.g-panes-divider:focus-visible {
+  background: var(--n4);
+}
+
+.g-panes-divider:focus-visible {
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+.g-panes-foot {
+  flex: none;
   display: flex;
   align-items: center;
-  gap: var(--sp-6);
-  flex: 0 1 auto;
-  min-width: 0;
-  max-width: 100%;
-  height: var(--row-h);
+  gap: 8px;
+  min-height: 28px;
+  padding: 0 12px;
+  border-top: 1px solid var(--border);
+  font-size: var(--fs-sub);
+  color: var(--n8);
 }
 
-.team-sb-member-name {
-  flex: 0 1 auto;
+.g-panes-foot > span {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.team-sb-member-meta {
+/* -- Board ------------------------------------------------------------------ */
+
+.g-board {
+  flex: 1 1 auto;
+  min-height: 0;
   display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: var(--sp-6);
-  flex: 0 1 auto;
-  min-width: 0;
-  max-width: 100%;
-  min-height: 20px;
-  margin-left: auto;
+  flex-direction: column;
 }
 
-.team-sb-member-meta > :not(.team-sb-branch) {
+.g-board-tabs {
   flex: none;
-}
-
-.tree-row.team-sb-team[aria-pressed='true'],
-.tree-row.team-sb-member[aria-pressed='true'] {
-  background: var(--n4);
-}
-
-.team-sb-folders-hdr {
-  border-top: 1px solid var(--border);
-}
-
-.team-empty-title {
-  color: var(--n11);
-}
-
-.team-empty .team-note {
-  padding: 0;
-}
-
-/* -- scope switch, group-by menu, repository groups ------------------------ */
-
-.team-sb-groupby {
-  height: 22px;
-  max-width: 132px;
-  padding: 0 var(--sp-4);
-}
-
-.team-sb-scope {
-  padding: var(--sp-4) var(--sp-12) var(--sp-6);
+  display: flex;
+  gap: 2px;
+  height: 32px;
+  align-items: center;
+  padding: 0 8px;
   border-bottom: 1px solid var(--border);
 }
 
-.team-sb-scope .seg {
-  align-self: flex-start;
-}
-
-.team-sb-scope .seg button:disabled {
-  color: var(--n7);
-}
-
-.team-scope-hint {
-  min-width: 0;
-}
-
-.team-sb-group-hdr {
-  height: 22px;
-  align-items: center;
-  padding: 0 var(--sp-12);
-  margin-top: var(--sp-4);
-  min-width: 0;
-}
-
-.team-sb-branch {
-  flex: 0 1 auto;
-  min-width: 0;
-  max-width: 96px;
-}
-
-.team-wt {
-  display: inline-flex;
-  align-items: center;
-  flex: none;
-}
-
-.tree-row.team-sb-folder {
-  gap: var(--sp-4);
-}
-
-.tree-row.team-sb-folder[data-nested='true'] {
-  padding-left: var(--sp-24);
-}
-
-.team-sb-folder-pick {
-  min-width: 0;
-  height: 100%;
+.g-board-tab {
+  height: 26px;
+  padding: 0 12px;
   border: 0;
-  background: none;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--n9);
   font: inherit;
-  color: inherit;
-  text-align: left;
-  cursor: pointer;
-  padding: 0;
+  font-size: var(--fs-sub);
 }
 
-.team-sb-folder-pick[aria-pressed='true'] {
+.g-board-tab[aria-selected='true'] {
+  background: var(--n0);
   color: var(--n12);
+}
+
+.g-board-tab:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.g-board-cols {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr) minmax(0, 1fr);
+}
+
+.g-board[data-tabs='true'] .g-board-cols {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.g-board-col {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.g-board-col + .g-board-col {
+  border-left: 1px solid var(--border);
+}
+
+.g-board-section {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.g-board-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--border);
+  min-width: 0;
+}
+
+.g-board-title {
+  margin: 0;
+  font-size: var(--fs-sub);
   font-weight: 600;
+  color: var(--n10);
+  white-space: nowrap;
 }
 
-/* -- the Team pane header and the member inspector's worktree block -------- */
+.g-board-count {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--fs-sub);
+  color: var(--n8);
+  white-space: nowrap;
+}
 
-.team-scope-label {
-  flex: 0 1 auto;
+.g-board-hint {
   min-width: 0;
-  max-width: 220px;
-}
-
-.team-lead-worktree {
-  min-width: 0;
-}
-
-.team-insp-worktree {
-  min-width: 0;
-  align-items: flex-start;
-}
-
-.team-insp-path {
-  overflow-wrap: anywhere;
-}
-
-.team-insp-reveal {
-  border: 0;
-  background: none;
-  padding: 0;
-  font: inherit;
-  color: var(--accent);
-  cursor: pointer;
-}
-
-.team-insp-reveal:hover {
-  text-decoration: underline;
-}
-
-/* -- a project folder that is gone (live check G-b) ------------------------- */
-
-.tree-row.team-sb-folder[data-missing='true'] .team-sb-folder-pick {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-label);
   color: var(--n8);
 }
 
-.team-folder-missing {
+.g-board-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.g-board-list-virtual {
+  display: flex;
+  flex-direction: column;
+}
+
+.g-board-vlist {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.g-board-empty,
+.g-board-note {
+  margin: 0;
+  padding: 8px 12px;
+  font-size: var(--fs-sub);
+  color: var(--n8);
+}
+
+.g-board-note {
+  border-bottom: 1px solid var(--border);
+}
+
+.g-board-foot,
+.g-board-more {
   flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+}
+
+.g-board-foot {
+  border-top: 1px solid var(--border);
+}
+
+/* Member rows */
+.g-brow {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border);
+  outline: none;
+}
+
+.g-brow:hover {
+  background: var(--n2);
+}
+
+.g-brow:focus-visible {
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.g-brow[data-present='false'] {
+  opacity: 0.7;
+}
+
+.g-brow-1 {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: var(--fs-body);
+}
+
+.g-brow-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+  color: var(--n12);
+}
+
+.g-brow-muted {
+  color: var(--n8);
+  white-space: nowrap;
+}
+
+.g-brow-state {
+  flex: none;
+  font-size: var(--fs-sub);
+  color: var(--n10);
+  white-space: nowrap;
+}
+
+.g-brow-2 {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--fs-label);
+  color: var(--n8);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.g-brow-3 {
+  font-size: var(--fs-sub);
+  color: var(--n9);
+  overflow-wrap: anywhere;
+}
+
+.g-brow-4 {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-top: 2px;
+}
+
+.g-brow-4:empty {
+  display: none;
+}
+
+/* Tasks */
+.g-btask-group {
+  padding: 6px 12px 2px;
+  font-size: var(--fs-label);
+  font-weight: 600;
+  color: var(--n8);
+}
+
+.g-btask {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 4px 12px;
+  font-size: var(--fs-sub);
+}
+
+.g-btask:hover {
+  background: var(--n2);
+}
+
+.g-btask[data-inferred='true'] .g-btask-title {
+  text-decoration: underline dotted var(--n7);
+  text-underline-offset: 3px;
+}
+
+.g-btask-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 8px;
+}
+
+.g-btask-title {
+  color: var(--n11);
+  overflow-wrap: anywhere;
+}
+
+.g-btask-flag,
+.g-btask-station {
+  font-size: var(--fs-label);
+  color: var(--n8);
+  white-space: nowrap;
+}
+
+.g-btask-extra {
+  flex-basis: 100%;
+  font-size: var(--fs-label);
   color: var(--warn);
+}
+
+.g-btask-owner {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 45%;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--n9);
+}
+
+.g-btask-ownername {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Messages */
+.g-bmsg {
+  padding: 4px 12px;
+  border-bottom: 1px solid var(--border);
+  font-size: var(--fs-sub);
+}
+
+.g-bmsg-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 2px 6px;
+  min-width: 0;
+}
+
+.g-bmsg-time {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--fs-label);
+  color: var(--n8);
+}
+
+.g-bmsg-derived {
+  color: var(--n8);
+}
+
+.g-bmsg-event {
+  color: var(--n9);
+  overflow-wrap: anywhere;
+}
+
+.g-bmsg-route {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.g-bmsg-party {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.g-bmsg-partyname {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--n11);
+}
+
+.g-bmsg-note {
+  font-size: var(--fs-label);
+  color: var(--warn);
+  white-space: nowrap;
+}
+
+.g-bmsg-body {
+  padding: 4px 0 2px;
+}
+
+.g-bmsg-text {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--n11);
+}
+
+.g-bmsg-line {
+  margin: 0;
+  color: var(--n8);
+  overflow-wrap: anywhere;
+}
+
+/* To: composer and the ownership bar */
+.g-to {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--border);
+}
+
+.g-to-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.g-to-label {
+  flex: none;
+  font-size: var(--fs-sub);
+  color: var(--n8);
+}
+
+.g-to-select {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 24px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--n0);
+  color: var(--n11);
+  font: inherit;
+  font-size: var(--fs-sub);
+}
+
+.g-to-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 28px;
+  max-height: 120px;
+  resize: vertical;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--n0);
+  color: var(--n11);
+  font: inherit;
+  font-size: var(--fs-body);
+}
+
+.g-to-select:focus-visible,
+.g-to-input:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 0;
+}
+
+.g-to-note {
+  margin: 0;
+  font-size: var(--fs-label);
+  color: var(--n8);
+}
+
+.g-team-own {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+  margin: 8px 12px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--n0);
+}
+
+.g-team-own-text {
+  margin: 0;
+  flex: 1 1 100%;
+  font-size: var(--fs-sub);
+  color: var(--n11);
+}
+
+.g-team-own-actions {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/* Close pane sheet */
+.g-close-line {
+  margin: 0 0 8px;
+  font-size: var(--fs-body);
+  color: var(--n11);
 }

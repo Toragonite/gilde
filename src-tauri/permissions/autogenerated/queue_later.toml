@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-queue-later"
+description = "Enables the queue_later command without any pre-configured scope."
+commands.allow = ["queue_later"]
+
+[[permission]]
+identifier = "deny-queue-later"
+description = "Denies the queue_later command without any pre-configured scope."
+commands.deny = ["queue_later"]

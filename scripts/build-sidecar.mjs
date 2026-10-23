@@ -24,13 +24,25 @@
  * It does not touch the vendored Node runtime — that is `scripts/fetch-node.sh`.
  * `tauri.conf.json > build.beforeBuildCommand` runs both, in that order.
  *
+ * 3. **Build id** (contract §4.7, A8.1). `esbuild.mjs` bakes the build id into the
+ *    bundle: `GILDE_BUILD_ID` when set and non-empty, else the version; a value
+ *    outside `^[0-9A-Za-z][0-9A-Za-z._+-]{0,63}$` fails the build. The bundle a
+ *    developer or a test runs must be built with `GILDE_BUILD_ID` UNSET (its id is
+ *    then the version, which is what the core and the WebView fall back to as well).
+ *
  * Usage:
  *   node scripts/build-sidecar.mjs            bundle + verify + seam check
  *   node scripts/build-sidecar.mjs --watch    esbuild watch loop (no gates)
+ *   node scripts/build-sidecar.mjs --check    drift check (the codegen-drift gate):
+ *                                             rebuild with GILDE_BUILD_ID unset into a
+ *                                             temp dir and fail unless the on-disk
+ *                                             sidecar.cjs is byte-identical — i.e. it is
+ *                                             current AND carries the version build id
  */
 
 import { spawn } from 'node:child_process';
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -44,15 +56,16 @@ const bundle = join(sidecarDir, 'sidecar.cjs');
 const bundleMap = join(sidecarDir, 'sidecar.cjs.map');
 
 const watch = process.argv.includes('--watch');
+const checkOnly = process.argv.includes('--check');
 const rel = (p) => relative(repoRoot, p);
 
 /** Run `node <script> [args]` in the sidecar dir; resolve on exit 0, reject otherwise. */
-function run(script, args = []) {
+function run(script, args = [], env = process.env) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [script, ...args], {
       cwd: sidecarDir,
       stdio: 'inherit',
-      env: process.env,
+      env,
     });
     child.on('error', reject);
     child.on('exit', (code, signal) => {
@@ -142,10 +155,44 @@ function verifyBundleConfig() {
   }
 }
 
+/**
+ * The drift check: a fresh build with `GILDE_BUILD_ID` unset must reproduce the
+ * on-disk `sidecar.cjs` byte for byte. A stale bundle, or one built with a
+ * release build id, fails here — the same way `gen:ipc:check` fails on stale
+ * generated types.
+ */
+async function checkDrift() {
+  requireFile(bundle, 'Run `npm run sidecar:build` first.');
+  const dir = mkdtempSync(join(tmpdir(), 'gilde-sidecar-drift-'));
+  try {
+    const fresh = join(dir, 'sidecar.cjs');
+    const env = { ...process.env };
+    delete env.GILDE_BUILD_ID;
+    await run(esbuildScript, ['--outfile', fresh], env);
+    const want = readFileSync(fresh);
+    const have = readFileSync(bundle);
+    if (!want.equals(have)) {
+      throw new Error(
+        `[build-sidecar] ${rel(bundle)} is out of date or was built with GILDE_BUILD_ID set ` +
+          '(the bundle tests and dev builds run must carry the version build id). ' +
+          'Run `npm run sidecar:build` with GILDE_BUILD_ID unset.',
+      );
+    }
+    console.log(`[build-sidecar] ${rel(bundle)} is current (built with GILDE_BUILD_ID unset).`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 async function main() {
   requireFile(entryPoint, 'The sidecar source tree is incomplete.');
   requireFile(esbuildScript, 'The sidecar build script is missing.');
   requireFile(nodeModules, 'Run: (cd src-tauri/sidecar && npm ci)');
+
+  if (checkOnly) {
+    await checkDrift();
+    return;
+  }
 
   await run(esbuildScript, watch ? ['--watch'] : []);
 

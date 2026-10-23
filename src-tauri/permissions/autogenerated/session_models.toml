@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-session-models"
+description = "Enables the session_models command without any pre-configured scope."
+commands.allow = ["session_models"]
+
+[[permission]]
+identifier = "deny-session-models"
+description = "Denies the session_models command without any pre-configured scope."
+commands.deny = ["session_models"]

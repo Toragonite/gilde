@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-team-message-body"
+description = "Enables the team_message_body command without any pre-configured scope."
+commands.allow = ["team_message_body"]
+
+[[permission]]
+identifier = "deny-team-message-body"
+description = "Denies the team_message_body command without any pre-configured scope."
+commands.deny = ["team_message_body"]

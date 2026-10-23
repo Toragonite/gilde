@@ -1,730 +1,713 @@
 /**
- * UI slice — shell layout, locale, theme, tabs and panes (DESIGN §9-1, §9-3).
+ * UI slice — what the window shows, independent of the World mirror.
  *
- * A pane is content agnostic: it holds a tab id, and the tab carries a
- * descriptor naming which view to render. That is what lets a terminal, a
- * dispatch board, the graph and the process monitor all be "just a tile".
+ * Contract §2.2.4 (uiSlice REWORK) and ux-ia §2.4: one main view at a time
+ * with browser-like history (`⌘[` / `⌘]`), N-tile Split (2–6), per-team
+ * layouts, the Focus Home mode, per-session composer drafts, the `⌘J` chain
+ * through the queue, sheets, zoom, and the window's visibility.
  *
- * Layout is persisted through `app_settings_set({ layout })`, which the Rust
- * side stores in `settings_kv` (DESIGN §10-4). Writes are debounced so dragging
- * the sidebar does not hammer the backend.
+ * Persisted keys (`ui_state_set`, contract §4.2.1 `UiKey`) are written by
+ * `persist.ts`; this slice only holds the values and hydrates them from
+ * `app_bootstrap.uiState`, which is untrusted JSON and is validated here.
+ *
+ * Every uid the UI holds is remapped when World reports a tombstone
+ * (`remapSessionRefs`, contract §3.3.3, T-ui-mergedInto).
  */
 
 import type { StateCreator } from 'zustand';
 
-import { experimentalLanes, isPaneViewEnabled, isViewEnabled } from '../features';
-import { cmd, isUnavailable } from '../lib/commands';
-import type {
-  AgentBinary,
-  AppConfig,
-  Locale,
-  LocalePreference,
-  NodeStatus,
-  SessionId,
-  SidecarStateEvent,
-  TaskId,
-  ThemePreference,
-} from '../lib/ipc';
-import { resolveLocale, translate } from '../i18n';
-import type { MessageKey } from '../i18n';
+import { defaultLocale } from '../i18n';
+import type { AppBootstrapRes } from '../lib/gen/AppBootstrapRes';
+import type { AppFeatures } from '../lib/gen/AppFeatures';
+import type { AttentionItem } from '../lib/gen/AttentionItem';
+import type { LaunchInfo } from '../lib/gen/LaunchInfo';
+import type { Locale } from '../lib/gen/Locale';
+import type { MemberKey } from '../lib/gen/MemberKey';
+import type { ProjectId } from '../lib/gen/ProjectId';
+import type { Platform } from '../lib/gen/Platform';
+import type { JsonValue } from '../lib/gen/serde_json/JsonValue';
+import type { SessionUid } from '../lib/gen/SessionUid';
+import type { TeamKey } from '../lib/gen/TeamKey';
+import type { TeamViewMode } from '../lib/gen/TeamViewMode';
+import type { Theme } from '../lib/gen/Theme';
+import type { VisibilityEvent } from '../lib/gen/VisibilityEvent';
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
-/**
- * The views the rail switches between. `team` and `workers` are the preview;
- * the other four are the experimental lanes (`src/features.ts`). Settings is a
- * sheet, not a view.
- */
-export type ViewKey = 'team' | 'workers' | 'sessions' | 'dispatch' | 'graph' | 'monitor';
+/** Session screen sub-views: Conversation · Changes · Terminal or Log (ux-ia §2.4). */
+export type SessionSub = 'conversation' | 'changes' | 'terminal';
 
-/** The view the app opens on (and falls back to when a saved one is hidden). */
-export const DEFAULT_VIEW: ViewKey = 'team';
+export type AccountsSection = 'accounts' | 'health';
 
-/** What a pane should render. Panes themselves know nothing about content. */
-export type PaneDescriptor =
-  | { view: 'terminal'; sessionId: SessionId }
-  | { view: 'dispatch'; taskId?: TaskId }
-  | { view: 'graph' }
-  | { view: 'monitor' }
-  // T8: the read-only team preview (team contract v2 §8.2), src/team/.
-  | { view: 'team' }
-  // Plan #3c: the orchestrator's worker accounts, read-only, src/workers/.
-  | { view: 'workers' };
+/** The one main view (ux-ia §2.4 "Main: what you work on"). */
+export type MainView =
+  | { screen: 'home' }
+  | { screen: 'session'; uid: SessionUid; sub: SessionSub }
+  | { screen: 'split' }
+  | { screen: 'team'; teamKey: TeamKey; mode: TeamViewMode }
+  | { screen: 'floor' }
+  | { screen: 'history' }
+  | { screen: 'accounts'; section: AccountsSection }
+  | { screen: 'settings' };
 
-export interface Tab {
-  id: string;
+export type HomeMode = 'focus' | 'classic';
+
+/** Layer-2 sheets (ux-ia §2.4). One at a time; sheets trap focus. */
+export type SheetId =
+  | 'newSession'
+  | 'stopSession'
+  | 'cleanUp'
+  | 'commit'
+  | 'merge'
+  | 'discardWorktree'
+  | 'closePane'
+  | 'quit'
+  | 'help';
+
+/** What a sheet was opened for (A26.2): "+ on a project", "New session in {project}". */
+export interface SheetContext {
+  projectId?: ProjectId;
+}
+
+/** A History read's title (memory only; it is content). */
+export interface ReadTitle {
+  uid: SessionUid;
   title: string;
-  sublabel?: string;
-  descriptor: PaneDescriptor;
-  /** Drives the tab's status dot; kept in sync from the graph projection. */
-  status?: NodeStatus;
-  badge?: string;
-  closable: boolean;
 }
 
-export interface PaneSlot {
-  id: string;
-  tabId: string | null;
+export interface SplitState {
+  /** 0–6 sessions side by side, in tile order. */
+  uids: SessionUid[];
+  focused: SessionUid | null;
+  zoomed: SessionUid | null;
 }
 
-export type SplitCount = 1 | 2 | 3 | 4;
-
-export interface PaneLayout {
-  split: SplitCount;
-  slots: PaneSlot[];
+export interface TeamLayout {
+  mode: TeamViewMode;
+  focused: MemberKey | null;
+  zoomed: MemberKey | null;
+  /** The lead column's share of Team › Panes, 0.2–0.8 (A30.3); null = the default. */
+  leadRatio: number | null;
+  /** The teammates' tile order in Team › Panes, ≤ 64 member keys (A30.3); null = join order. */
+  tileOrder: MemberKey[] | null;
 }
 
-/** The bottom drawer holds the process monitor only (experimental lanes). */
-export type DrawerTab = 'monitor';
+export const LEAD_RATIO_RANGE = { min: 0.2, max: 0.8 } as const;
+export const MAX_TILE_ORDER = 64;
 
-/**
- * The Team view's scope: every workspace's teams, or only those whose repository
- * is the selected project folder's (worktree-aware, `team/grouping.ts`).
- */
-export type TeamScope = 'all' | 'workspace';
-/** How the Team view's sidebar groups the teams. */
-export type TeamGroupBy = 'repository' | 'folder' | 'status';
+/** A layout with every field at its default. */
+export function defaultTeamLayout(): TeamLayout {
+  return { mode: 'panes', focused: null, zoomed: null, leadRatio: null, tileOrder: null };
+}
 
-export const TEAM_SCOPES: readonly TeamScope[] = ['all', 'workspace'];
-export const TEAM_GROUP_BYS: readonly TeamGroupBy[] = ['repository', 'folder', 'status'];
+/** The `⌘J` chain: where it started, and the queue item it is on. */
+export interface QueueChain {
+  origin: MainView;
+  currentKey: string | null;
+  /** Rank index of the current item when it was reached (the handled item's slot). */
+  currentIndex: number;
+}
 
-/** Which part of the settings sheet to bring into view when it opens. */
-export type SettingsFocus = 'diagnostics' | null;
+/** A request to focus a session's top card when its screen arrives (⌘J, notification click). */
+export interface FocusCardRequest {
+  uid: SessionUid;
+  token: number;
+}
+
+export interface WindowVisibility {
+  frontmost: boolean;
+  occluded: boolean;
+  asleep: boolean;
+  documentVisible: boolean;
+}
 
 export interface UiState {
-  /** The language shown — `localePref` resolved against the OS language. */
   locale: Locale;
-  /** What the user chose: a language, or `system` (the default, F1). */
-  localePref: LocalePreference;
-  theme: ThemePreference;
+  theme: Theme;
+  view: MainView;
+  back: MainView[];
+  forward: MainView[];
   sidebarVisible: boolean;
-  sidebarWidth: number;
-  inspectorOpen: boolean;
-  inspectorWidth: number;
-  drawerOpen: boolean;
-  drawerHeight: number;
-  drawerTab: DrawerTab;
-  activeView: ViewKey;
-  panes: PaneLayout;
-  activePaneId: string;
-  tabs: Tab[];
+  split: SplitState;
+  teamLayouts: Readonly<Record<string, TeamLayout>>;
+  homeMode: HomeMode;
+  /** Composer drafts per session (memory only). */
+  drafts: Readonly<Record<string, string>>;
+  chain: QueueChain | null;
+  focusCard: FocusCardRequest | null;
   paletteOpen: boolean;
-  switcherOpen: boolean;
-  helpOpen: boolean;
-  settingsOpen: boolean;
-  settingsFocus: SettingsFocus;
-  /** Graph node id shown in the inspector. */
-  selectedNodeId: string | null;
-  /** Team view: all workspaces (default) or this workspace. Persisted. */
-  teamScope: TeamScope;
-  /** Team view: how the sidebar groups teams (default: repository). Persisted. */
-  teamGroupBy: TeamGroupBy;
+  sheet: SheetId | null;
+  /** The context the open sheet was opened with; cleared by `closeSheet()` (A26.2). */
+  sheetContext: SheetContext | null;
   /**
-   * Team view: the project folder "This workspace" means. `null` (or a folder
-   * that was removed) = the first project folder. Persisted.
+   * The session on Home's focus card (A26.1): set by Home, cleared when Home
+   * unmounts or the card shows no session. `viewStateOf` reports it as
+   * visible while the view is Home (notification rule 2, F-04).
    */
-  teamFolderId: string | null;
+  homeFocusUid: SessionUid | null;
   /**
-   * `config.notifications.system`: health alerts that need the user are also
-   * posted as macOS notifications while the window is in the background.
-   * Default on. Persisted.
+   * The title of a History read (A29.2, T31): set by the read-only view of a
+   * session World does not hold, cleared when it unmounts. The top bar and the
+   * `main` landmark use it only while the uid is absent from the store.
    */
-  systemNotifications: boolean;
+  readTitle: ReadTitle | null;
+  /**
+   * The sessions a multi-session screen actually shows (A30.2, F-04): Split's
+   * rendered tiles, Team › Panes' rendered tiles, the Board rows whose cards
+   * are shown. Set by that screen, `null` when it unmounts; `viewStateOf`
+   * reports it instead of its own derivation while it is non-null.
+   */
+  visibleUids: SessionUid[] | null;
+  /** UI zoom, 0.8–2.0 (ux-ia §10 Text scaling). */
+  zoom: number;
+  visibility: WindowVisibility;
+  /** `gilde://quit-requested` arrived; the shell shows the quit sheet. */
+  quitRequested: boolean;
+  /** The core runs another build than this WebView even after one reload (§4.7): "Restart Gilde to finish updating." */
+  buildMismatch: boolean;
+  launch: LaunchInfo | null;
+  buildId: string | null;
+  version: string | null;
+  platform: Platform | null;
+  features: AppFeatures;
+  /** Opaque persisted values owned by their screens (validated as JSON only). */
+  sidebarOrder: JsonValue | null;
+  sidebarFolds: JsonValue | null;
+  floorPrefs: JsonValue | null;
   hydrated: boolean;
 }
 
-export interface UiSlice {
-  ui: UiState;
-  agents: AgentBinary[];
-  sidecar: SidecarStateEvent | null;
-  recoveryPending: number;
+export const MAX_SPLIT = 6;
+export const MAX_VIEW_HISTORY = 50;
+export const ZOOM_MIN = 0.8;
+export const ZOOM_MAX = 2.0;
+export const ZOOM_STEP = 0.1;
 
-  /** A language, or `system` to follow the OS. Persisted as given. */
-  setLocale: (locale: LocalePreference) => void;
-  setTheme: (theme: ThemePreference) => void;
-  /** Turn system notifications on or off. Persisted. */
-  setSystemNotifications: (on: boolean) => void;
-  toggleSidebar: () => void;
-  setSidebarWidth: (width: number) => void;
-  toggleInspector: () => void;
-  setInspectorWidth: (width: number) => void;
-  toggleDrawer: () => void;
-  setDrawerTab: (tab: DrawerTab) => void;
-  setDrawerHeight: (height: number) => void;
-  setActiveView: (view: ViewKey) => void;
-  /**
-   * M1.5-3: put the view's own surface in front, opening its tab the first
-   * time. `setActiveView` calls it, so the rail, ⌘⇧G/⌘⇧M and the palette all
-   * move the main area rather than only a highlight.
-   */
-  revealView: (view: ViewKey) => void;
-  /** Focus a tab where it already is, or place it by the pane rule below. */
-  revealTab: (tabId: string) => void;
-  setSplit: (split: SplitCount) => void;
-  setActivePane: (paneId: string) => void;
-  openTab: (tab: Omit<Tab, 'id'> & { id?: string }) => string;
-  updateTab: (tabId: string, patch: Partial<Omit<Tab, 'id'>>) => void;
-  /** Patch every tab whose descriptor points at `sessionId`. */
-  updateSessionTabs: (sessionId: SessionId, patch: Partial<Omit<Tab, 'id'>>) => void;
-  closeTab: (tabId: string) => void;
-  closeActivePane: () => void;
-  focusTab: (tabId: string) => void;
-  focusTabIndex: (index: number) => void;
-  cycleTab: (delta: number) => void;
-  assignTab: (paneId: string, tabId: string | null) => void;
-  setPaletteOpen: (open: boolean) => void;
-  setSwitcherOpen: (open: boolean) => void;
-  setHelpOpen: (open: boolean) => void;
-  setSettingsOpen: (open: boolean, focus?: SettingsFocus) => void;
-  closeOverlays: () => void;
-  selectNode: (nodeId: string | null) => void;
-  setTeamScope: (scope: TeamScope) => void;
-  setTeamGroupBy: (groupBy: TeamGroupBy) => void;
-  setTeamFolder: (projectId: string | null) => void;
-  setAgents: (agents: AgentBinary[]) => void;
-  setSidecar: (state: SidecarStateEvent) => void;
-  setRecoveryPending: (count: number) => void;
-  hydrateFromConfig: (config: AppConfig) => void;
-}
-
-// ---------------------------------------------------------------------------
-// Constants and helpers
-// ---------------------------------------------------------------------------
-
-export const SIDEBAR_MIN = 260;
-export const SIDEBAR_MAX = 420;
-export const INSPECTOR_MIN = 300;
-export const INSPECTOR_MAX = 480;
-export const DRAWER_MIN = 120;
-export const DRAWER_MAX = 520;
-
-export function clamp(value: number, min: number, max: number): number {
-  if (!Number.isFinite(value)) return min;
-  return Math.min(max, Math.max(min, Math.round(value)));
-}
-
-function makePanes(split: SplitCount, previous?: PaneLayout): PaneLayout {
-  const slots: PaneSlot[] = [];
-  for (let i = 0; i < split; i++) {
-    slots.push(previous?.slots[i] ?? { id: `pane-${i + 1}`, tabId: null });
-  }
-  return { split, slots };
-}
-
-let tabCounter = 0;
-function nextTabId(): string {
-  tabCounter += 1;
-  return `tab-${tabCounter}`;
-}
-
-/**
- * Restored ids must never be handed out again (M1.5-6).
- *
- * A layout that comes back from `settings_kv` carries ids like `tab-4`; without
- * this the next `openTab` would mint `tab-1` … `tab-4` and silently overwrite a
- * restored tab.
- */
-function reserveTabIds(tabs: readonly Tab[]): void {
-  for (const tab of tabs) {
-    const match = /^tab-(\d+)$/.exec(tab.id);
-    if (match) tabCounter = Math.max(tabCounter, Number(match[1]));
-  }
-}
-
-/**
- * Which pane a tab should land in — BACKLOG 9.
- *
- * An empty pane is an invitation: in a 2/3/4 split a new session belongs in the
- * one that is still blank, not on top of whatever the user is reading in the
- * focused pane. In order: the pane already showing this tab, the active pane if
- * it is empty, the first empty pane, and only then the active pane.
- */
-export function placementPaneId(ui: UiState, tabId: string): string {
-  const slots = ui.panes.slots;
-  const showing = slots.find((slot) => slot.tabId === tabId);
-  if (showing) return showing.id;
-  const active = slots.find((slot) => slot.id === ui.activePaneId);
-  if (active && active.tabId === null) return active.id;
-  const empty = slots.find((slot) => slot.tabId === null);
-  if (empty) return empty.id;
-  return active?.id ?? slots[0].id;
-}
-
-/** The pane view each rail view puts in front, and the tab's title key. */
-export const VIEW_PANE: Partial<Record<ViewKey, { descriptor: PaneDescriptor; title: MessageKey }>> = {
-  dispatch: { descriptor: { view: 'dispatch' }, title: 'dispatch.title' },
-  graph: { descriptor: { view: 'graph' }, title: 'graph.title' },
-  monitor: { descriptor: { view: 'monitor' }, title: 'view.monitor' },
-  team: { descriptor: { view: 'team' }, title: 'view.team' },
-  workers: { descriptor: { view: 'workers' }, title: 'view.workers' },
-};
-
-/** The title key of a view's own tab, so a tab title follows the locale. */
-export function viewTabTitleKey(descriptor: PaneDescriptor): MessageKey | null {
-  for (const entry of Object.values(VIEW_PANE)) {
-    if (entry && entry.descriptor.view === descriptor.view) return entry.title;
-  }
-  return null;
-}
+const HOME: MainView = { screen: 'home' };
 
 export function initialUiState(): UiState {
   return {
-    locale: resolveLocale('system'),
-    localePref: 'system',
+    locale: defaultLocale(),
     theme: 'system',
+    view: HOME,
+    back: [],
+    forward: [],
     sidebarVisible: true,
-    sidebarWidth: 300,
-    // F5: closed by default. The Team view opens it for a selected member.
-    inspectorOpen: false,
-    inspectorWidth: 360,
-    drawerOpen: false,
-    drawerHeight: 220,
-    drawerTab: 'monitor',
-    activeView: DEFAULT_VIEW,
-    panes: makePanes(1),
-    activePaneId: 'pane-1',
-    tabs: [],
+    split: { uids: [], focused: null, zoomed: null },
+    teamLayouts: {},
+    homeMode: 'focus',
+    drafts: {},
+    chain: null,
+    focusCard: null,
     paletteOpen: false,
-    switcherOpen: false,
-    helpOpen: false,
-    settingsOpen: false,
-    settingsFocus: null,
-    selectedNodeId: null,
-    teamScope: 'all',
-    teamGroupBy: 'repository',
-    teamFolderId: null,
-    systemNotifications: true,
+    sheet: null,
+    sheetContext: null,
+    homeFocusUid: null,
+    readTitle: null,
+    visibleUids: null,
+    zoom: 1,
+    visibility: { frontmost: true, occluded: false, asleep: false, documentVisible: true },
+    quitRequested: false,
+    buildMismatch: false,
+    launch: null,
+    buildId: null,
+    version: null,
+    platform: null,
+    features: { orchestrator: false },
+    sidebarOrder: null,
+    sidebarFolds: null,
+    floorPrefs: null,
     hydrated: false,
   };
 }
 
-/**
- * The subset of `UiState` that round-trips through `config.layout`
- * (`LayoutConfig` in `lib/ipc.ts`).
- *
- * Only `sidebarWidth`, `inspectorOpen` and `inspectorWidth` are declared fields
- * of `LayoutConfig`; everything else the shell wants to remember goes inside
- * `layout.panes`, which the contract declares as free-form
- * (`Record<string, unknown>`). That way nothing depends on the Rust struct
- * growing a field, and an older build simply ignores keys it does not know.
- */
-export interface PersistedPanes {
-  sidebarVisible: boolean;
-  drawerOpen: boolean;
-  drawerHeight: number;
-  drawerTab: DrawerTab;
-  activeView: ViewKey;
-  split: SplitCount;
-  /**
-   * M1.5-6: the tabs and which pane each one sat in.
-   *
-   * Without these a SIGKILLed host came back with an empty main area even
-   * though every session row was still in the registry. What is restored is the
-   * *arrangement*, never a claim about liveness: a terminal tab comes back with
-   * no status, and `loadSessions` is what marks it exited when the session
-   * behind it did not survive.
-   */
-  tabs?: PersistedTab[];
-  slots?: (string | null)[];
-  activePaneId?: string;
-  /** Team view preferences (older layouts lack them: the defaults apply). */
-  teamScope?: TeamScope;
-  teamGroupBy?: TeamGroupBy;
-  teamFolderId?: string | null;
+// ---------------------------------------------------------------------------
+// Pure helpers
+// ---------------------------------------------------------------------------
+
+export function sameView(a: MainView, b: MainView): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
 }
 
-/** A tab as it round-trips through `settings_kv`. Status is deliberately not. */
-export interface PersistedTab {
-  id: string;
-  title: string;
-  sublabel?: string;
-  descriptor: PaneDescriptor;
-  closable: boolean;
+export function clampZoom(z: number): number {
+  if (!Number.isFinite(z)) return 1;
+  return Math.round(Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, z)) * 100) / 100;
 }
 
-export interface PersistedLayout {
-  sidebarWidth: number;
-  inspectorOpen: boolean;
-  inspectorWidth: number;
-  panes: PersistedPanes;
+const SUBS: readonly SessionSub[] = ['conversation', 'changes', 'terminal'];
+const TEAM_MODES: readonly TeamViewMode[] = ['panes', 'board', 'floor'];
+const UID = /^s_[0-9a-f-]{36}$/;
+
+function isObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
-export function pickPersistedLayout(ui: UiState): PersistedLayout {
+function asUid(v: unknown): SessionUid | null {
+  return typeof v === 'string' && UID.test(v) ? (v as SessionUid) : null;
+}
+
+function asKey(v: unknown): string | null {
+  return typeof v === 'string' && v.length > 0 && v.length <= 256 ? v : null;
+}
+
+/** A persisted `lastView`, validated; anything malformed is Home. */
+export function parseView(v: unknown): MainView {
+  if (!isObject(v)) return HOME;
+  switch (v.screen) {
+    case 'home':
+    case 'split':
+    case 'floor':
+    case 'history':
+    case 'settings':
+      return { screen: v.screen };
+    case 'session': {
+      const uid = asUid(v.uid);
+      const sub = SUBS.includes(v.sub as SessionSub) ? (v.sub as SessionSub) : 'conversation';
+      return uid ? { screen: 'session', uid, sub } : HOME;
+    }
+    case 'team': {
+      const teamKey = asKey(v.teamKey);
+      const mode = TEAM_MODES.includes(v.mode as TeamViewMode) ? (v.mode as TeamViewMode) : 'panes';
+      return teamKey ? { screen: 'team', teamKey: teamKey as TeamKey, mode } : HOME;
+    }
+    case 'accounts':
+      return { screen: 'accounts', section: v.section === 'health' ? 'health' : 'accounts' };
+    default:
+      return HOME;
+  }
+}
+
+/** A persisted `splitSet`, validated: ≤ 6 distinct well-formed uids. */
+export function parseSplit(v: unknown): SplitState {
+  const out: SplitState = { uids: [], focused: null, zoomed: null };
+  const list = isObject(v) ? v.uids : v;
+  if (!Array.isArray(list)) return out;
+  for (const item of list) {
+    const uid = asUid(item);
+    if (uid && !out.uids.includes(uid)) out.uids.push(uid);
+    if (out.uids.length === MAX_SPLIT) break;
+  }
+  if (isObject(v)) {
+    const f = asUid(v.focused);
+    if (f && out.uids.includes(f)) out.focused = f;
+  }
+  return out;
+}
+
+const MEMBER_KEY = /^m_[0-9a-f]{16}$/;
+
+/** A lead-column share within 0.2–0.8, else null (A30.3). */
+export function parseLeadRatio(v: unknown): number | null {
+  if (typeof v !== 'number' || !Number.isFinite(v)) return null;
+  return v >= LEAD_RATIO_RANGE.min && v <= LEAD_RATIO_RANGE.max ? v : null;
+}
+
+/** ≤ 64 distinct well-formed member keys, else null: a malformed order is dropped whole (A30.3). */
+export function parseTileOrder(v: unknown): MemberKey[] | null {
+  if (!Array.isArray(v) || v.length > MAX_TILE_ORDER) return null;
+  const out: MemberKey[] = [];
+  for (const item of v) {
+    if (typeof item !== 'string' || !MEMBER_KEY.test(item) || out.includes(item as MemberKey)) return null;
+    out.push(item as MemberKey);
+  }
+  return out;
+}
+
+/** A persisted `teamLayout:<TeamKey>`, validated. */
+export function parseTeamLayout(v: unknown): TeamLayout {
+  const out = defaultTeamLayout();
+  if (!isObject(v)) return out;
+  if (TEAM_MODES.includes(v.mode as TeamViewMode)) out.mode = v.mode as TeamViewMode;
+  const f = asKey(v.focused);
+  if (f) out.focused = f as MemberKey;
+  const z = asKey(v.zoomed);
+  if (z) out.zoomed = z as MemberKey;
+  out.leadRatio = parseLeadRatio(v.leadRatio);
+  out.tileOrder = parseTileOrder(v.tileOrder);
+  return out;
+}
+
+/** Push `next` as the main view, keeping a bounded back stack and clearing forward. */
+export function pushView(ui: UiState, next: MainView): Pick<UiState, 'view' | 'back' | 'forward'> {
+  if (sameView(ui.view, next)) return { view: ui.view, back: ui.back, forward: ui.forward };
+  const back = [...ui.back, ui.view].slice(-MAX_VIEW_HISTORY);
+  return { view: next, back, forward: [] };
+}
+
+function remapView(view: MainView, map: ReadonlyMap<SessionUid, SessionUid>): MainView {
+  if (view.screen === 'session') {
+    const to = map.get(view.uid);
+    if (to) return { ...view, uid: to };
+  }
+  return view;
+}
+
+/** Collapse consecutive duplicates (a remap can make two neighbours equal). */
+function dedupeStack(stack: MainView[]): MainView[] {
+  const out: MainView[] = [];
+  for (const v of stack) if (out.length === 0 || !sameView(out[out.length - 1] as MainView, v)) out.push(v);
+  return out;
+}
+
+/** Move every reference from a tombstone uid to its survivor (contract §3.3.3). */
+export function remapUi(ui: UiState, map: ReadonlyMap<SessionUid, SessionUid>): UiState {
+  if (map.size === 0) return ui;
+  const r = (uid: SessionUid | null): SessionUid | null => (uid ? (map.get(uid) ?? uid) : null);
+
+  const uids: SessionUid[] = [];
+  for (const u of ui.split.uids) {
+    const to = map.get(u) ?? u;
+    if (!uids.includes(to)) uids.push(to);
+  }
+
+  const drafts: Record<string, string> = { ...ui.drafts };
+  for (const [from, to] of map) {
+    const old = drafts[from];
+    if (old === undefined) continue;
+    delete drafts[from];
+    const kept = drafts[to];
+    drafts[to] = kept && kept.trim() !== '' ? (old.trim() !== '' ? `${kept}\n${old}` : kept) : old;
+  }
+
+  let chain = ui.chain;
+  if (chain) {
+    let currentKey = chain.currentKey;
+    if (currentKey && currentKey.startsWith('q_')) {
+      const to = map.get(currentKey.slice(2) as SessionUid);
+      if (to) currentKey = `q_${to}`;
+    }
+    chain = { ...chain, origin: remapView(chain.origin, map), currentKey };
+  }
+
+  const focusCard = ui.focusCard ? { ...ui.focusCard, uid: r(ui.focusCard.uid) as SessionUid } : null;
+  const homeFocusUid = r(ui.homeFocusUid);
+  let visibleUids: SessionUid[] | null = null;
+  if (ui.visibleUids) {
+    visibleUids = [];
+    for (const u of ui.visibleUids) {
+      const to = map.get(u) ?? u;
+      if (!visibleUids.includes(to)) visibleUids.push(to);
+    }
+  }
+
   return {
-    sidebarWidth: ui.sidebarWidth,
-    inspectorOpen: ui.inspectorOpen,
-    inspectorWidth: ui.inspectorWidth,
-    panes: {
-      sidebarVisible: ui.sidebarVisible,
-      drawerOpen: ui.drawerOpen,
-      drawerHeight: ui.drawerHeight,
-      drawerTab: ui.drawerTab,
-      activeView: ui.activeView,
-      split: ui.panes.split,
-      tabs: ui.tabs.map((tab) => ({
-        id: tab.id,
-        title: tab.title,
-        ...(tab.sublabel === undefined ? {} : { sublabel: tab.sublabel }),
-        descriptor: tab.descriptor,
-        closable: tab.closable,
-      })),
-      slots: ui.panes.slots.map((slot) => slot.tabId),
-      activePaneId: ui.activePaneId,
-      teamScope: ui.teamScope,
-      teamGroupBy: ui.teamGroupBy,
-      teamFolderId: ui.teamFolderId,
-    },
+    ...ui,
+    view: remapView(ui.view, map),
+    back: dedupeStack(ui.back.map((v) => remapView(v, map))),
+    forward: dedupeStack(ui.forward.map((v) => remapView(v, map))),
+    split: { uids, focused: r(ui.split.focused), zoomed: r(ui.split.zoomed) },
+    drafts,
+    chain,
+    focusCard,
+    homeFocusUid,
+    visibleUids,
   };
 }
 
-// Debounced write-through to `settings_kv` via `app_settings_set`.
-let persistTimer: ReturnType<typeof setTimeout> | null = null;
-let persistPending: PersistedLayout | null = null;
-
-/** Drop a pending debounced write (teardown, and the unit tests). */
-export function cancelPersistLayout(): void {
-  if (persistTimer) clearTimeout(persistTimer);
-  persistTimer = null;
-  persistPending = null;
+/** The view a queue item opens. */
+export function viewForItem(item: AttentionItem): MainView {
+  if (item.subject.kind === 'leftovers') return { screen: 'accounts', section: 'health' };
+  const uid = item.subject.answerIn ?? item.subject.uid;
+  return { screen: 'session', uid, sub: 'conversation' };
 }
 
-export function persistLayout(layout: PersistedLayout, delayMs = 500): void {
-  // The unit-test bundle renders the shell on Node, where there is no Tauri
-  // host to invoke. Scheduling a write there would fire after the suite has
-  // finished and log a failure for something that was never going to work.
-  if (typeof window === 'undefined') return;
-  persistPending = layout;
-  if (persistTimer) clearTimeout(persistTimer);
-  persistTimer = setTimeout(() => {
-    persistTimer = null;
-    const payload = persistPending;
-    persistPending = null;
-    if (!payload) return;
-    void cmd.appSettingsSet({ layout: payload }).catch((e) => {
-      // The settings command lands with T03; until then the layout simply is
-      // not durable. Anything else is worth surfacing in the log drawer.
-      if (!isUnavailable(e)) console.warn('[gilde] layout persist failed', e);
-    });
-  }, delayMs);
+/**
+ * The next item of the `⌘J` chain. `dir` 1 = next, -1 = previous. Returns
+ * `null` when the chain runs off either end (the caller returns to the
+ * chain's origin). When the current item was handled meanwhile, "next" is the
+ * item that now holds its rank slot.
+ */
+export function chainStep(
+  items: readonly AttentionItem[],
+  chain: QueueChain | null,
+  dir: 1 | -1,
+): { item: AttentionItem; index: number } | null {
+  if (items.length === 0) return null;
+  if (!chain || chain.currentKey === null) {
+    const index = dir === 1 ? 0 : items.length - 1;
+    return { item: items[index] as AttentionItem, index };
+  }
+  const at = items.findIndex((i) => i.key === chain.currentKey);
+  let index: number;
+  if (at >= 0) index = at + dir;
+  else index = dir === 1 ? Math.min(chain.currentIndex, items.length) : chain.currentIndex - 1;
+  if (index < 0 || index >= items.length) return null;
+  return { item: items[index] as AttentionItem, index };
 }
 
 // ---------------------------------------------------------------------------
 // Slice
 // ---------------------------------------------------------------------------
 
-export const createUiSlice: StateCreator<
-  UiSlice,
-  [['zustand/subscribeWithSelector', never]],
-  [],
-  UiSlice
-> = (set, get) => {
-  const patchUi = (patch: Partial<UiState>, persist = false) => {
-    const ui = { ...get().ui, ...patch };
-    set({ ui });
-    if (persist) persistLayout(pickPersistedLayout(ui));
-  };
+export interface UiSlice {
+  ui: UiState;
+  setLocale: (locale: Locale) => void;
+  setTheme: (theme: Theme) => void;
+  /** Show a main view (pushes history; leaving the chain's path ends the chain). */
+  navigate: (view: MainView) => void;
+  goBack: () => void;
+  goForward: () => void;
+  /** Open a session's screen, optionally asking its top card to take focus. */
+  openSession: (uid: SessionUid, options?: { sub?: SessionSub; focusCard?: boolean }) => void;
+  setSessionSub: (sub: SessionSub) => void;
+  toggleSidebar: () => void;
+  setSidebarVisible: (visible: boolean) => void;
+  /** Add to Split (`⌘D`); false when the Split already holds 6 (ux-ia §9.2 split.max). */
+  addToSplit: (uid: SessionUid) => boolean;
+  removeFromSplit: (uid: SessionUid) => void;
+  setSplitFocus: (uid: SessionUid | null) => void;
+  toggleSplitZoom: (uid: SessionUid) => void;
+  setTeamLayout: (teamKey: TeamKey, patch: Partial<TeamLayout>) => void;
+  /** Panes / Board / Floor without a view-history entry; the mode is kept in the team's layout (A30.4). */
+  setTeamMode: (teamKey: TeamKey, mode: TeamViewMode) => void;
+  /** The sessions a multi-session screen shows; null when it unmounts (A30.2). */
+  setVisibleUids: (uids: readonly SessionUid[] | null) => void;
+  setHomeMode: (mode: HomeMode) => void;
+  setDraft: (uid: SessionUid, text: string) => void;
+  clearDraft: (uid: SessionUid) => void;
+  /** `⌘J` / `⇧⌘J` over the visible queue items; returns the item reached or null (back at the origin). */
+  chainStep: (items: readonly AttentionItem[], dir: 1 | -1) => AttentionItem | null;
+  endChain: () => void;
+  setPaletteOpen: (open: boolean) => void;
+  /** Open a sheet, optionally with what it was opened for (A26.2). */
+  openSheet: (sheet: SheetId, context?: SheetContext) => void;
+  closeSheet: () => void;
+  /** Home's focus card shows this session (A26.1); null when it shows none. */
+  setHomeFocusUid: (uid: SessionUid | null) => void;
+  /** Set a History read's title, or clear it (`null`); clearing for another uid is a no-op. */
+  setReadTitle: (entry: ReadTitle | null, clearFor?: SessionUid) => void;
+  setZoom: (zoom: number) => void;
+  zoomBy: (steps: number) => void;
+  setVisibility: (event: VisibilityEvent) => void;
+  setDocumentVisible: (visible: boolean) => void;
+  setQuitRequested: (requested: boolean) => void;
+  setBuildMismatch: (mismatch: boolean) => void;
+  setSidebarOrder: (value: JsonValue) => void;
+  setSidebarFolds: (value: JsonValue) => void;
+  setFloorPrefs: (value: JsonValue) => void;
+  /** Apply `app_bootstrap` (locale, theme, launch, persisted UI state). */
+  hydrateFromBootstrap: (res: AppBootstrapRes) => void;
+  /** Called by the World slice for every new tombstone. */
+  remapSessionRefs: (merged: ReadonlyMap<SessionUid, SessionUid>) => void;
+}
+
+let focusToken = 0;
+
+export const createUiSlice: StateCreator<UiSlice, [['zustand/subscribeWithSelector', never]], [], UiSlice> = (
+  set,
+  get,
+) => {
+  const patch = (p: Partial<UiState>) => set((s) => ({ ui: { ...s.ui, ...p } }));
 
   return {
     ui: initialUiState(),
-    agents: [],
-    sidecar: null,
-    recoveryPending: 0,
 
-    setLocale: (pref) => {
-      patchUi({ localePref: pref, locale: resolveLocale(pref) });
-      void cmd.appSettingsSet({ locale: pref }).catch(() => undefined);
+    setLocale: (locale) => patch({ locale }),
+    setTheme: (theme) => patch({ theme }),
+
+    navigate: (view) => {
+      const ui = get().ui;
+      patch({ ...pushView(ui, view), chain: null });
     },
 
-    setTheme: (theme) => {
-      patchUi({ theme });
-      void cmd.appSettingsSet({ theme }).catch(() => undefined);
+    goBack: () => {
+      const ui = get().ui;
+      const prev = ui.back[ui.back.length - 1];
+      if (!prev) return;
+      patch({ view: prev, back: ui.back.slice(0, -1), forward: [ui.view, ...ui.forward], chain: null });
     },
 
-    setSystemNotifications: (on) => {
-      patchUi({ systemNotifications: on });
-      void cmd.appSettingsSet({ notifications: { system: on } }).catch(() => undefined);
+    goForward: () => {
+      const ui = get().ui;
+      const next = ui.forward[0];
+      if (!next) return;
+      patch({ view: next, back: [...ui.back, ui.view].slice(-MAX_VIEW_HISTORY), forward: ui.forward.slice(1), chain: null });
     },
 
-    toggleSidebar: () => patchUi({ sidebarVisible: !get().ui.sidebarVisible }, true),
-
-    setSidebarWidth: (width) =>
-      patchUi({ sidebarWidth: clamp(width, SIDEBAR_MIN, SIDEBAR_MAX) }, true),
-
-    toggleInspector: () => patchUi({ inspectorOpen: !get().ui.inspectorOpen }, true),
-
-    setInspectorWidth: (width) =>
-      patchUi({ inspectorWidth: clamp(width, INSPECTOR_MIN, INSPECTOR_MAX) }, true),
-
-    // The drawer belongs to the experimental lanes; in the preview it never opens.
-    toggleDrawer: () => {
-      if (!experimentalLanes()) return;
-      patchUi({ drawerOpen: !get().ui.drawerOpen }, true);
+    openSession: (uid, options = {}) => {
+      const ui = get().ui;
+      const sub = options.sub ?? 'conversation';
+      const focusCard = options.focusCard ? { uid, token: ++focusToken } : ui.focusCard;
+      patch({ ...pushView(ui, { screen: 'session', uid, sub }), focusCard, chain: null });
     },
 
-    setDrawerTab: (drawerTab) => {
-      if (!experimentalLanes()) return;
-      patchUi({ drawerTab, drawerOpen: true }, true);
+    setSessionSub: (sub) => {
+      const ui = get().ui;
+      if (ui.view.screen !== 'session' || ui.view.sub === sub) return;
+      patch({ view: { ...ui.view, sub } });
     },
 
-    setDrawerHeight: (height) => patchUi({ drawerHeight: clamp(height, DRAWER_MIN, DRAWER_MAX) }, true),
+    toggleSidebar: () => patch({ sidebarVisible: !get().ui.sidebarVisible }),
+    setSidebarVisible: (visible) => patch({ sidebarVisible: visible }),
 
-    // BACKLOG 3: one store field drives the rail highlight, the sidebar
-    // landmark and what the main area shows. Switching the view is therefore
-    // never only a highlight — it reveals the surface that view is about.
-    setActiveView: (activeView) => {
-      // A hidden lane is never entered — not from a stale caller, not from a
-      // restored layout (`hydrateFromConfig` applies the same rule).
-      if (!isViewEnabled(activeView)) return;
-      patchUi({ activeView }, true);
-      get().revealView(activeView);
+    addToSplit: (uid) => {
+      const split = get().ui.split;
+      if (split.uids.includes(uid)) return true;
+      if (split.uids.length >= MAX_SPLIT) return false;
+      patch({ split: { ...split, uids: [...split.uids, uid] } });
+      return true;
     },
 
-    revealView: (view) => {
-      const target = VIEW_PANE[view];
-      if (!target) {
-        // `sessions` owns no tile of its own. It focuses a
-        // terminal that is already open; it never opens a session on its own,
-        // because starting a process is a decision the user makes.
-        if (view !== 'sessions') return;
-        const terminal = get().ui.tabs.find((tab) => tab.descriptor.view === 'terminal');
-        if (terminal) get().revealTab(terminal.id);
+    removeFromSplit: (uid) => {
+      const split = get().ui.split;
+      const at = split.uids.indexOf(uid);
+      if (at < 0) return;
+      const uids = split.uids.filter((u) => u !== uid);
+      // Closing a tile moves focus to the previous tile in reading order (ux-ia §10).
+      const focused = split.focused === uid ? (uids[Math.max(0, at - 1)] ?? null) : split.focused;
+      patch({ split: { uids, focused, zoomed: split.zoomed === uid ? null : split.zoomed } });
+    },
+
+    setSplitFocus: (uid) => {
+      const split = get().ui.split;
+      if (uid !== null && !split.uids.includes(uid)) return;
+      patch({ split: { ...split, focused: uid } });
+    },
+
+    toggleSplitZoom: (uid) => {
+      const split = get().ui.split;
+      if (!split.uids.includes(uid)) return;
+      patch({ split: { ...split, zoomed: split.zoomed === uid ? null : uid } });
+    },
+
+    setTeamLayout: (teamKey, p) => {
+      const layouts = get().ui.teamLayouts;
+      const current = layouts[teamKey] ?? defaultTeamLayout();
+      patch({ teamLayouts: { ...layouts, [teamKey]: { ...current, ...p } } });
+    },
+
+    setTeamMode: (teamKey, mode) => {
+      const ui = get().ui;
+      const current = ui.teamLayouts[teamKey] ?? defaultTeamLayout();
+      const teamLayouts = current.mode === mode ? ui.teamLayouts : { ...ui.teamLayouts, [teamKey]: { ...current, mode } };
+      const view = ui.view;
+      const onTeam = view.screen === 'team' && view.teamKey === teamKey && view.mode !== mode;
+      if (teamLayouts === ui.teamLayouts && !onTeam) return;
+      // Like a Session sub-view: the view is replaced, never pushed (ux-ia K7, K8).
+      patch(onTeam ? { teamLayouts, view: { screen: 'team', teamKey, mode } } : { teamLayouts });
+    },
+
+    setVisibleUids: (uids) => {
+      const current = get().ui.visibleUids;
+      if (uids === null) {
+        if (current !== null) patch({ visibleUids: null });
         return;
       }
+      const next: SessionUid[] = [];
+      for (const u of uids) if (!next.includes(u)) next.push(u);
+      if (current && current.length === next.length && current.every((u, i) => u === next[i])) return;
+      patch({ visibleUids: next });
+    },
+
+    setHomeMode: (mode) => patch({ homeMode: mode }),
+
+    setDraft: (uid, text) => {
+      const drafts = get().ui.drafts;
+      if (drafts[uid] === text) return;
+      patch({ drafts: { ...drafts, [uid]: text } });
+    },
+
+    clearDraft: (uid) => {
+      const drafts = { ...get().ui.drafts };
+      if (!(uid in drafts)) return;
+      delete drafts[uid];
+      patch({ drafts });
+    },
+
+    chainStep: (items, dir) => {
       const ui = get().ui;
-      const existing = ui.tabs.find((tab) => tab.descriptor.view === target.descriptor.view);
-      if (existing) {
-        get().revealTab(existing.id);
+      const step = chainStep(items, ui.chain, dir);
+      const origin = ui.chain?.origin ?? ui.view;
+      if (!step) {
+        patch({ ...pushView(ui, origin), chain: null });
+        return null;
+      }
+      const view = viewForItem(step.item);
+      const uid = view.screen === 'session' ? view.uid : null;
+      patch({
+        ...pushView(ui, view),
+        chain: { origin, currentKey: step.item.key, currentIndex: step.index },
+        focusCard: uid ? { uid, token: ++focusToken } : ui.focusCard,
+      });
+      return step.item;
+    },
+
+    endChain: () => patch({ chain: null }),
+
+    setPaletteOpen: (open) => patch({ paletteOpen: open }),
+    openSheet: (sheet, context) => patch({ sheet, sheetContext: context ?? null, paletteOpen: false }),
+    closeSheet: () => patch({ sheet: null, sheetContext: null }),
+    setHomeFocusUid: (uid) => {
+      if (get().ui.homeFocusUid !== uid) patch({ homeFocusUid: uid });
+    },
+    setReadTitle: (entry, clearFor) => {
+      const cur = get().ui.readTitle;
+      if (entry === null) {
+        if (cur !== null && (clearFor === undefined || cur.uid === clearFor)) patch({ readTitle: null });
         return;
       }
-      get().openTab({
-        title: translate(ui.locale, target.title),
-        descriptor: target.descriptor,
-        closable: true,
-      });
+      if (cur?.uid !== entry.uid || cur.title !== entry.title) patch({ readTitle: entry });
     },
 
-    revealTab: (tabId) => {
-      const ui = get().ui;
-      if (!ui.tabs.some((tab) => tab.id === tabId)) return;
-      const showing = ui.panes.slots.find((slot) => slot.tabId === tabId);
-      if (showing) {
-        get().setActivePane(showing.id);
-        return;
+    setZoom: (zoom) => patch({ zoom: clampZoom(zoom) }),
+    zoomBy: (steps) => patch({ zoom: clampZoom(get().ui.zoom + steps * ZOOM_STEP) }),
+
+    setVisibility: (event) => {
+      const v = get().ui.visibility;
+      patch({ visibility: { ...v, frontmost: event.frontmost, occluded: event.occluded, asleep: event.asleep } });
+    },
+
+    setDocumentVisible: (visible) => {
+      const v = get().ui.visibility;
+      if (v.documentVisible === visible) return;
+      patch({ visibility: { ...v, documentVisible: visible } });
+    },
+
+    setQuitRequested: (requested) => patch({ quitRequested: requested }),
+    setBuildMismatch: (mismatch) => patch({ buildMismatch: mismatch }),
+
+    setSidebarOrder: (value) => patch({ sidebarOrder: value }),
+    setSidebarFolds: (value) => patch({ sidebarFolds: value }),
+    setFloorPrefs: (value) => patch({ floorPrefs: value }),
+
+    hydrateFromBootstrap: (res) => {
+      const state = res.uiState ?? {};
+      const teamLayouts: Record<string, TeamLayout> = {};
+      for (const [key, value] of Object.entries(state)) {
+        if (key.startsWith('teamLayout:')) {
+          const teamKey = key.slice('teamLayout:'.length);
+          if (asKey(teamKey)) teamLayouts[teamKey] = parseTeamLayout(value);
+        }
       }
-      get().assignTab(placementPaneId(ui, tabId), tabId);
-    },
-
-    setSplit: (split) => {
-      const ui = get().ui;
-      const panes = makePanes(split, ui.panes);
-      const activePaneId = panes.slots.some((s) => s.id === ui.activePaneId)
-        ? ui.activePaneId
-        : panes.slots[0].id;
-      patchUi({ panes, activePaneId }, true);
-    },
-
-    setActivePane: (activePaneId) => patchUi({ activePaneId }),
-
-    openTab: (input) => {
-      const ui = get().ui;
-      const id = input.id ?? nextTabId();
-      const existing = ui.tabs.find((t) => t.id === id);
-      const tab: Tab = { ...input, id };
-      const tabs = existing ? ui.tabs.map((t) => (t.id === id ? tab : t)) : [...ui.tabs, tab];
-      // BACKLOG 9: a blank pane takes the new tab before the focused one does.
-      const paneId = placementPaneId(ui, id);
-      const slots = ui.panes.slots.map((slot) =>
-        slot.id === paneId ? { ...slot, tabId: id } : slot,
-      );
-      patchUi({ tabs, panes: { ...ui.panes, slots }, activePaneId: paneId }, true);
-      return id;
-    },
-
-    updateTab: (tabId, patch) => {
-      const ui = get().ui;
-      if (!ui.tabs.some((t) => t.id === tabId)) return;
-      patchUi({ tabs: ui.tabs.map((t) => (t.id === tabId ? { ...t, ...patch } : t)) });
-    },
-
-    updateSessionTabs: (sessionId, patch) => {
-      const ui = get().ui;
-      let touched = false;
-      const tabs = ui.tabs.map((t) => {
-        if (t.descriptor.view !== 'terminal' || t.descriptor.sessionId !== sessionId) return t;
-        touched = true;
-        return { ...t, ...patch };
+      // Restore the last view only on a restore launch; the other launch
+      // kinds open Home (ux-ia §2.7).
+      const restore = res.launch.kind === 'restore';
+      const view = restore ? parseView(state.lastView) : HOME;
+      patch({
+        locale: res.locale,
+        theme: res.theme,
+        launch: res.launch,
+        buildId: res.buildId,
+        version: res.version,
+        platform: res.platform,
+        features: res.features,
+        view,
+        back: [],
+        forward: [],
+        split: parseSplit(state.splitSet),
+        teamLayouts,
+        homeMode: state.homeMode === 'classic' ? 'classic' : 'focus',
+        sidebarOrder: state.sidebarOrder ?? null,
+        sidebarFolds: state.sidebarFolds ?? null,
+        floorPrefs: state.floorPrefs ?? null,
+        hydrated: true,
       });
-      if (touched) patchUi({ tabs });
     },
 
-    closeTab: (tabId) => {
-      const ui = get().ui;
-      const tabs = ui.tabs.filter((t) => t.id !== tabId);
-      const slots = ui.panes.slots.map((slot) =>
-        slot.tabId === tabId ? { ...slot, tabId: tabs[tabs.length - 1]?.id ?? null } : slot,
-      );
-      patchUi({ tabs, panes: { ...ui.panes, slots } }, true);
-    },
-
-    closeActivePane: () => {
-      const ui = get().ui;
-      const slot = ui.panes.slots.find((s) => s.id === ui.activePaneId);
-      if (!slot?.tabId) return;
-      get().closeTab(slot.tabId);
-    },
-
-    focusTab: (tabId) => {
-      const ui = get().ui;
-      if (!ui.tabs.some((t) => t.id === tabId)) return;
-      const slots = ui.panes.slots.map((slot) =>
-        slot.id === ui.activePaneId ? { ...slot, tabId } : slot,
-      );
-      patchUi({ panes: { ...ui.panes, slots } }, true);
-    },
-
-    focusTabIndex: (index) => {
-      const tab = get().ui.tabs[index];
-      if (tab) get().focusTab(tab.id);
-    },
-
-    cycleTab: (delta) => {
-      const ui = get().ui;
-      if (ui.tabs.length === 0) return;
-      const slot = ui.panes.slots.find((s) => s.id === ui.activePaneId);
-      const current = ui.tabs.findIndex((t) => t.id === slot?.tabId);
-      const base = current < 0 ? 0 : current;
-      const next = (base + delta + ui.tabs.length) % ui.tabs.length;
-      get().focusTab(ui.tabs[next].id);
-    },
-
-    assignTab: (paneId, tabId) => {
-      const ui = get().ui;
-      const slots = ui.panes.slots.map((slot) => (slot.id === paneId ? { ...slot, tabId } : slot));
-      patchUi({ panes: { ...ui.panes, slots }, activePaneId: paneId }, true);
-    },
-
-    setPaletteOpen: (paletteOpen) => patchUi({ paletteOpen }),
-    setSwitcherOpen: (switcherOpen) => patchUi({ switcherOpen }),
-    setHelpOpen: (helpOpen) => patchUi({ helpOpen }),
-    setSettingsOpen: (settingsOpen, focus = null) =>
-      patchUi({ settingsOpen, settingsFocus: settingsOpen ? focus : null }),
-
-    closeOverlays: () =>
-      patchUi({
-        paletteOpen: false,
-        switcherOpen: false,
-        helpOpen: false,
-        settingsOpen: false,
-        settingsFocus: null,
-      }),
-
-    selectNode: (selectedNodeId) => patchUi({ selectedNodeId }),
-
-    setTeamScope: (teamScope) => {
-      if (!TEAM_SCOPES.includes(teamScope)) return;
-      patchUi({ teamScope }, true);
-    },
-
-    setTeamGroupBy: (teamGroupBy) => {
-      if (!TEAM_GROUP_BYS.includes(teamGroupBy)) return;
-      patchUi({ teamGroupBy }, true);
-    },
-
-    setTeamFolder: (teamFolderId) => patchUi({ teamFolderId }, true),
-
-    setAgents: (agents) => set({ agents }),
-
-    setSidecar: (sidecar) => set({ sidecar }),
-
-    setRecoveryPending: (recoveryPending) => set({ recoveryPending }),
-
-    hydrateFromConfig: (config) => {
-      const layout = (config.layout ?? {}) as unknown as Partial<PersistedLayout>;
-      const panes = (layout.panes ?? {}) as Partial<PersistedPanes>;
-      const ui = get().ui;
-      const split = ([1, 2, 3, 4] as const).includes(panes.split as SplitCount)
-        ? (panes.split as SplitCount)
-        : ui.panes.split;
-
-      // M1.5-6: the tabs and the arrangement come back before anything is known
-      // about the sessions behind them. Only tabs that name a view a pane can
-      // render in THIS build survive the trip (a layout saved with the
-      // experimental lanes on does not bring a hidden lane back into the
-      // preview), and a slot pointing at a tab that did not is simply empty.
-      const tabs: Tab[] = (Array.isArray(panes.tabs) ? panes.tabs : [])
-        .filter(
-          (tab) =>
-            tab &&
-            typeof tab.id === 'string' &&
-            typeof tab.descriptor?.view === 'string' &&
-            isPaneViewEnabled(tab.descriptor.view),
-        )
-        .map((tab) => ({
-          id: tab.id,
-          title: tab.title,
-          ...(tab.sublabel === undefined ? {} : { sublabel: tab.sublabel }),
-          descriptor: tab.descriptor,
-          closable: tab.closable !== false,
-        }));
-      reserveTabIds(tabs);
-      const known = new Set(tabs.map((tab) => tab.id));
-      const restored = makePanes(split, ui.panes);
-      const slotTabs = Array.isArray(panes.slots) ? panes.slots : [];
-      restored.slots = restored.slots.map((slot, i) => {
-        const tabId = slotTabs[i];
-        return typeof tabId === 'string' && known.has(tabId) ? { ...slot, tabId } : slot;
-      });
-      const activePaneId = restored.slots.some((slot) => slot.id === panes.activePaneId)
-        ? (panes.activePaneId as string)
-        : restored.slots[0].id;
-
-      const lanes = experimentalLanes();
-      const localePref: LocalePreference =
-        config.locale === 'ko' || config.locale === 'en' ? config.locale : 'system';
-      const savedView = panes.activeView;
-      const activeView: ViewKey =
-        typeof savedView === 'string' && isViewEnabled(savedView) ? savedView : ui.activeView;
-
-      set({
-        ui: {
-          ...ui,
-          // F1: `system` (the default) follows the OS; only an explicit choice wins.
-          localePref,
-          locale: resolveLocale(localePref),
-          theme: config.theme ?? ui.theme,
-          sidebarVisible: panes.sidebarVisible ?? ui.sidebarVisible,
-          sidebarWidth: clamp(layout.sidebarWidth ?? ui.sidebarWidth, SIDEBAR_MIN, SIDEBAR_MAX),
-          inspectorOpen: layout.inspectorOpen ?? ui.inspectorOpen,
-          inspectorWidth: clamp(
-            layout.inspectorWidth ?? ui.inspectorWidth,
-            INSPECTOR_MIN,
-            INSPECTOR_MAX,
-          ),
-          drawerOpen: lanes ? (panes.drawerOpen ?? ui.drawerOpen) : false,
-          drawerHeight: clamp(panes.drawerHeight ?? ui.drawerHeight, DRAWER_MIN, DRAWER_MAX),
-          // Logs and Events were removed from the drawer; an old saved tab lands on the monitor.
-          drawerTab: 'monitor',
-          activeView,
-          panes: restored,
-          activePaneId,
-          tabs,
-          teamScope: TEAM_SCOPES.includes(panes.teamScope as TeamScope)
-            ? (panes.teamScope as TeamScope)
-            : ui.teamScope,
-          teamGroupBy: TEAM_GROUP_BYS.includes(panes.teamGroupBy as TeamGroupBy)
-            ? (panes.teamGroupBy as TeamGroupBy)
-            : ui.teamGroupBy,
-          teamFolderId:
-            typeof panes.teamFolderId === 'string' && panes.teamFolderId !== ''
-              ? panes.teamFolderId
-              : ui.teamFolderId,
-          // Only an explicit `false` turns it off; an old config without the key reads as on.
-          systemNotifications: config.notifications?.system !== false,
-          hydrated: true,
-        },
-      });
+    remapSessionRefs: (merged) => {
+      set((s) => ({ ui: remapUi(s.ui, merged) }));
     },
   };
 };

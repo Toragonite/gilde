@@ -1,0 +1,617 @@
+/*
+ * The Floor (pixel-office v3). Colours come only from tokens: each drawing
+ * colour `--fl-*` is the Floor's pixel token `--px-*` / identity token
+ * `--id-*` (styles/tokens.css, the UI-GUIDELINES exception for the Floor),
+ * falling back to the neutral and semantic tokens per theme until those exist.
+ */
+
+.fl-root {
+  --fl-bg: var(--px-bg, var(--n0));
+  --fl-floor-a: var(--px-floor-a, var(--n2));
+  --fl-floor-b: var(--px-floor-b, var(--n3));
+  --fl-wall: var(--px-wall, var(--n4));
+  --fl-wall-top: var(--px-wall-top, var(--n5));
+  --fl-trim: var(--px-trim, var(--n6));
+  --fl-door: var(--px-door, var(--n5));
+  --fl-door-dark: var(--px-door-dark, var(--n9));
+  --fl-knob: var(--px-knob, var(--n10));
+  --fl-desk: var(--px-desk, var(--n5));
+  --fl-desk-top: var(--px-desk-top, var(--n4));
+  --fl-desk-edge: var(--px-desk-edge, var(--n7));
+  --fl-chair: var(--px-chair, var(--n7));
+  --fl-chair-dark: var(--px-chair-dark, var(--n8));
+  --fl-monitor: var(--px-monitor, var(--n10));
+  --fl-screen-on: var(--px-screen-on, var(--n3));
+  --fl-screen-line: var(--px-screen-line, var(--n8));
+  --fl-screen-off: var(--px-screen-off, var(--n11));
+  --fl-glass: var(--px-glass, var(--info));
+  --fl-glint: var(--px-glint, var(--n0));
+  --fl-board: var(--px-board, var(--n1));
+  --fl-board-edge: var(--px-board-edge, var(--n8));
+  --fl-board-line: var(--px-board-line, var(--n6));
+  --fl-paper: var(--px-paper, var(--n0));
+  --fl-paper-edge: var(--px-paper-edge, var(--n7));
+  --fl-ink: var(--px-ink, var(--n10));
+  --fl-outline: var(--px-outline, var(--n11));
+  --fl-pants: var(--px-pants, var(--n9));
+  --fl-shoes: var(--px-shoes, var(--n11));
+  --fl-acc: var(--px-acc, var(--n9));
+  --fl-acc-light: var(--px-acc-light, var(--n7));
+  --fl-smoke: var(--px-smoke, var(--n7));
+  --fl-text: var(--px-text, var(--n9));
+  --fl-text-strong: var(--px-text-strong, var(--n12));
+  --fl-bubble: var(--px-bubble, var(--n0));
+  --fl-glyph: var(--px-glyph, var(--n12));
+  --fl-eye: var(--px-eye, var(--n12));
+  --fl-shirt-1: var(--px-shirt-1, var(--n7));
+  --fl-shirt-2: var(--px-shirt-2, var(--n8));
+  --fl-shirt-3: var(--px-shirt-3, var(--n6));
+  --fl-shirt-4: var(--px-shirt-4, var(--n9));
+  --fl-skin-1: var(--px-skin-1, var(--n4));
+  --fl-skin-2: var(--px-skin-2, var(--n5));
+  --fl-skin-3: var(--px-skin-3, var(--n6));
+  --fl-skin-4: var(--px-skin-4, var(--n7));
+  --fl-skin-5: var(--px-skin-5, var(--n8));
+  --fl-hair-1: var(--px-hair-1, var(--n11));
+  --fl-hair-2: var(--px-hair-2, var(--n10));
+  --fl-hair-3: var(--px-hair-3, var(--n9));
+  --fl-hair-4: var(--px-hair-4, var(--n6));
+  --fl-hair-5: var(--px-hair-5, var(--n12));
+  --fl-hair-6: var(--px-hair-6, var(--n8));
+  --fl-id-red: var(--id-red, var(--info));
+  --fl-id-blue: var(--id-blue, var(--info));
+  --fl-id-green: var(--id-green, var(--info));
+  --fl-id-yellow: var(--id-yellow, var(--info));
+  --fl-id-purple: var(--id-purple, var(--info));
+  --fl-id-orange: var(--id-orange, var(--info));
+  --fl-id-pink: var(--id-pink, var(--info));
+  --fl-id-cyan: var(--id-cyan, var(--info));
+  --fl-ok: var(--ok);
+  --fl-warn: var(--warn);
+  --fl-error: var(--error);
+  --fl-info: var(--info);
+  --fl-accent: var(--accent);
+}
+
+/* dark: the paper and the board stay light, the ink and the eyes dark (as the pixel palette does) */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) .fl-root {
+    --fl-door-dark: var(--px-door-dark, var(--n0));
+    --fl-knob: var(--px-knob, var(--n8));
+    --fl-desk: var(--px-desk, var(--n6));
+    --fl-desk-top: var(--px-desk-top, var(--n7));
+    --fl-desk-edge: var(--px-desk-edge, var(--n4));
+    --fl-chair: var(--px-chair, var(--n5));
+    --fl-chair-dark: var(--px-chair-dark, var(--n4));
+    --fl-monitor: var(--px-monitor, var(--n5));
+    --fl-screen-on: var(--px-screen-on, var(--n9));
+    --fl-screen-line: var(--px-screen-line, var(--n12));
+    --fl-screen-off: var(--px-screen-off, var(--n1));
+    --fl-glint: var(--px-glint, var(--n12));
+    --fl-board: var(--px-board, var(--n10));
+    --fl-board-edge: var(--px-board-edge, var(--n7));
+    --fl-board-line: var(--px-board-line, var(--n8));
+    --fl-paper: var(--px-paper, var(--n11));
+    --fl-ink: var(--px-ink, var(--n4));
+    --fl-outline: var(--px-outline, var(--n0));
+    --fl-pants: var(--px-pants, var(--n6));
+    --fl-shoes: var(--px-shoes, var(--n2));
+    --fl-acc: var(--px-acc, var(--n8));
+    --fl-acc-light: var(--px-acc-light, var(--n10));
+    --fl-bubble: var(--px-bubble, var(--n2));
+    --fl-eye: var(--px-eye, var(--n1));
+    --fl-skin-1: var(--px-skin-1, var(--n11));
+    --fl-skin-2: var(--px-skin-2, var(--n10));
+    --fl-skin-3: var(--px-skin-3, var(--n9));
+    --fl-skin-4: var(--px-skin-4, var(--n8));
+    --fl-skin-5: var(--px-skin-5, var(--n7));
+    --fl-hair-1: var(--px-hair-1, var(--n1));
+    --fl-hair-2: var(--px-hair-2, var(--n3));
+    --fl-hair-3: var(--px-hair-3, var(--n5));
+    --fl-hair-4: var(--px-hair-4, var(--n9));
+    --fl-hair-5: var(--px-hair-5, var(--n6));
+    --fl-hair-6: var(--px-hair-6, var(--n4));
+  }
+}
+
+:root[data-theme='dark'] .fl-root {
+  --fl-door-dark: var(--px-door-dark, var(--n0));
+  --fl-knob: var(--px-knob, var(--n8));
+  --fl-desk: var(--px-desk, var(--n6));
+  --fl-desk-top: var(--px-desk-top, var(--n7));
+  --fl-desk-edge: var(--px-desk-edge, var(--n4));
+  --fl-chair: var(--px-chair, var(--n5));
+  --fl-chair-dark: var(--px-chair-dark, var(--n4));
+  --fl-monitor: var(--px-monitor, var(--n5));
+  --fl-screen-on: var(--px-screen-on, var(--n9));
+  --fl-screen-line: var(--px-screen-line, var(--n12));
+  --fl-screen-off: var(--px-screen-off, var(--n1));
+  --fl-glint: var(--px-glint, var(--n12));
+  --fl-board: var(--px-board, var(--n10));
+  --fl-board-edge: var(--px-board-edge, var(--n7));
+  --fl-board-line: var(--px-board-line, var(--n8));
+  --fl-paper: var(--px-paper, var(--n11));
+  --fl-ink: var(--px-ink, var(--n4));
+  --fl-outline: var(--px-outline, var(--n0));
+  --fl-pants: var(--px-pants, var(--n6));
+  --fl-shoes: var(--px-shoes, var(--n2));
+  --fl-acc: var(--px-acc, var(--n8));
+  --fl-acc-light: var(--px-acc-light, var(--n10));
+  --fl-bubble: var(--px-bubble, var(--n2));
+  --fl-eye: var(--px-eye, var(--n1));
+  --fl-skin-1: var(--px-skin-1, var(--n11));
+  --fl-skin-2: var(--px-skin-2, var(--n10));
+  --fl-skin-3: var(--px-skin-3, var(--n9));
+  --fl-skin-4: var(--px-skin-4, var(--n8));
+  --fl-skin-5: var(--px-skin-5, var(--n7));
+  --fl-hair-1: var(--px-hair-1, var(--n1));
+  --fl-hair-2: var(--px-hair-2, var(--n3));
+  --fl-hair-3: var(--px-hair-3, var(--n5));
+  --fl-hair-4: var(--px-hair-4, var(--n9));
+  --fl-hair-5: var(--px-hair-5, var(--n6));
+  --fl-hair-6: var(--px-hair-6, var(--n4));
+}
+
+/* -- layout ---------------------------------------------------------------- */
+
+.fl-root {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
+  background: var(--n1);
+  color: var(--n11);
+  font-family: var(--sans);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+}
+
+.fl-head {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 12px 16px 0;
+  min-width: 0;
+}
+
+.fl-h1,
+.fl-h {
+  margin: 0;
+  font-size: var(--fs-body);
+  font-weight: 600;
+  color: var(--n12);
+}
+
+.fl-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.fl-sp {
+  flex: 1;
+}
+
+.fl-btn,
+.fl-chip {
+  display: inline-flex;
+  align-items: center;
+  height: 24px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--n2);
+  color: var(--n11);
+  font: inherit;
+  font-size: var(--fs-sub);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.fl-btn:hover,
+.fl-chip:hover:not(:disabled) {
+  background: var(--n3);
+}
+
+.fl-btn[aria-pressed='true'] {
+  background: var(--n4);
+  color: var(--n12);
+}
+
+.fl-chip:disabled {
+  cursor: default;
+}
+
+.fl-btn:focus-visible,
+.fl-chip:focus-visible,
+.fl-ticket:focus-visible,
+.fl-twin-row:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.fl-more {
+  position: relative;
+}
+
+.fl-more > summary {
+  list-style: none;
+}
+
+.fl-more > summary::-webkit-details-marker {
+  display: none;
+}
+
+.fl-menu {
+  position: absolute;
+  right: 0;
+  top: 28px;
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--n2);
+  box-shadow: var(--shadow-popover);
+}
+
+.fl-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 12px 16px;
+}
+
+.fl-wrap {
+  position: relative;
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.fl-canvas {
+  display: block;
+  image-rendering: pixelated;
+}
+
+.fl-legend,
+.fl-note {
+  margin: 8px 0;
+  font-size: var(--fs-sub);
+  color: var(--n8);
+}
+
+.fl-bar + .fl-note {
+  margin: 0;
+  padding: 4px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.fl-replay {
+  color: var(--n11);
+}
+
+.fl-empty {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 24px 0;
+  color: var(--n8);
+}
+
+.fl-muted {
+  color: var(--n8);
+}
+
+.fl-warn {
+  color: var(--warn);
+}
+
+.fl-num,
+.fl-age {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.fl-ell {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* visually hidden, still read: never put text directly in it (the clipping gate) */
+.fl-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* -- identity swatches (M12; the Floor and swatches only) ------------------ */
+
+.fl-sw,
+.fl-stripe {
+  display: inline-block;
+  flex: none;
+  width: 8px;
+  height: 8px;
+  margin-right: 6px;
+  background: var(--fl-sw-c, var(--info));
+}
+
+.fl-stripe {
+  width: 2px;
+  height: 12px;
+  margin-right: 4px;
+}
+
+.fl-root [data-c='red'] {
+  --fl-sw-c: var(--fl-id-red);
+}
+.fl-root [data-c='blue'] {
+  --fl-sw-c: var(--fl-id-blue);
+}
+.fl-root [data-c='green'] {
+  --fl-sw-c: var(--fl-id-green);
+}
+.fl-root [data-c='yellow'] {
+  --fl-sw-c: var(--fl-id-yellow);
+}
+.fl-root [data-c='purple'] {
+  --fl-sw-c: var(--fl-id-purple);
+}
+.fl-root [data-c='orange'] {
+  --fl-sw-c: var(--fl-id-orange);
+}
+.fl-root [data-c='pink'] {
+  --fl-sw-c: var(--fl-id-pink);
+}
+.fl-root [data-c='cyan'] {
+  --fl-sw-c: var(--fl-id-cyan);
+}
+
+/* -- the counter ------------------------------------------------------------ */
+
+.fl-counter {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 36px;
+  padding: 6px 16px;
+  border-top: 1px solid var(--border);
+  background: var(--n2);
+}
+
+.fl-cnt-l {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+  font-weight: 600;
+  color: var(--n12);
+}
+
+.fl-tickets {
+  display: flex;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+}
+
+.fl-ticket {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+  max-width: 320px;
+  height: 24px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--n1);
+  color: var(--n11);
+  font: inherit;
+  font-size: var(--fs-sub);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.fl-ticket.fl-hot {
+  border-color: var(--warn);
+}
+
+.fl-tk-card {
+  display: inline-flex;
+  align-items: center;
+  max-width: 140px;
+  color: var(--n8);
+}
+
+.fl-age {
+  color: var(--n8);
+}
+
+/* -- the name card ---------------------------------------------------------- */
+
+.fl-card {
+  position: absolute;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 220px;
+  max-width: 320px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--n2);
+  box-shadow: var(--shadow-popover);
+  font-size: var(--fs-sub);
+  pointer-events: none;
+  user-select: text;
+}
+
+.fl-card.fl-pinned {
+  pointer-events: auto;
+}
+
+.fl-card-r {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.fl-badge {
+  flex: none;
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  font-family: var(--mono);
+  font-size: var(--fs-label);
+  color: var(--n9);
+}
+
+/* -- the task tables ---------------------------------------------------------- */
+
+.fl-tasks {
+  margin: 16px 0 0;
+}
+
+.fl-tasks-h {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  margin-bottom: 4px;
+}
+
+.fl-table {
+  width: 100%;
+  table-layout: fixed;
+  border-collapse: collapse;
+  font-size: var(--fs-sub);
+}
+
+.fl-table th {
+  padding: 2px 6px;
+  font-weight: 500;
+  color: var(--n8);
+  text-align: left;
+}
+
+.fl-table th:first-child,
+.fl-table td:first-child {
+  width: 16px;
+}
+
+.fl-table th:nth-child(3),
+.fl-table th:nth-child(5) {
+  width: 96px;
+}
+
+.fl-table th:nth-child(4) {
+  width: 128px;
+}
+
+.fl-table td {
+  padding: 2px 6px;
+  border-top: 1px solid var(--border);
+}
+
+.fl-table tr:hover td {
+  background: var(--n3);
+}
+
+.fl-row-you td {
+  color: var(--n12);
+}
+
+.fl-tg {
+  font-family: var(--mono);
+  color: var(--n8);
+}
+
+.fl-st-doing {
+  color: var(--n12);
+}
+
+.fl-st-you,
+.fl-st-blocked {
+  color: var(--warn);
+}
+
+.fl-st-done {
+  color: var(--ok);
+}
+
+.fl-inf {
+  text-decoration: underline dotted;
+}
+
+/* -- the twin (Show as list): a flat tree, indented by level -------------------- */
+
+.fl-twin ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.fl-twin-row {
+  display: block;
+  padding: 2px 6px;
+  border-radius: var(--r-sm);
+}
+
+.fl-twin-row.fl-lv2 {
+  margin-left: 12px;
+}
+
+.fl-twin-row.fl-lv3 {
+  margin-left: 24px;
+}
+
+.fl-twin-row.fl-lv4 {
+  margin-left: 32px;
+}
+
+.fl-twin-row[data-flsel],
+.fl-twin-row[data-fl-row^='item:'],
+.fl-twin-row[data-fl-row^='team:'] {
+  cursor: pointer;
+}
+
+.fl-twin-row:hover {
+  background: var(--n3);
+}
+
+.fl-twin-row.fl-sel {
+  background: var(--n4);
+  color: var(--n12);
+}
+
+.fl-twin-row.fl-lv1,
+.fl-twin-row.fl-lv2 {
+  font-weight: 600;
+  color: var(--n12);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fl-root * {
+    transition: none;
+    animation: none;
+  }
+}

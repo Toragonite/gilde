@@ -23,8 +23,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gilde_code_lib::config::ConfigStore;
-use gilde_code_lib::events::bus::{EventBus, RecordingSink};
-use gilde_code_lib::model::graph::GraphHandle;
+use gilde_code_lib::events::{Events, RecordingEvents};
 use gilde_code_lib::store::models::{ProcKind, ProcRow, ProcState};
 use gilde_code_lib::store::{dao, Db};
 use gilde_code_lib::supervise::kill::{is_gone, KillOpts};
@@ -32,14 +31,57 @@ use gilde_code_lib::supervise::procscan::ps_snapshot;
 use gilde_code_lib::supervise::reaper::{
     self, note, RecoveryDecision, SweepOpts, UNDO_WINDOW,
 };
-use gilde_code_lib::supervise::registry::{SpawnGuard, SpawnPlan, Supervisor};
+use gilde_code_lib::supervise::registry::{SpawnGuard, Supervisor};
 use gilde_code_lib::supervise::spawn::is_alive;
 
 use rusty_fork::rusty_fork_test;
 use std::os::unix::process::CommandExt as _;
+use std::os::unix::process::ExitStatusExt as _;
+
+/// A fixture's spawn request on the one spawn path (`SupervisorApi`'s
+/// checks, A12.8/A22.3; the legacy `Supervisor::plan_spawn(SpawnPlan)` is
+/// gone): `headless` rows are the turn runs they became, and a sidecar or
+/// turn row belongs to `generation` (1 unless given).
+#[allow(dead_code)]
+fn fixture_request(
+    kind: ProcKind,
+    argv: &[String],
+    cwd: impl AsRef<std::path::Path>,
+    parent: Option<&str>,
+    generation: Option<i64>,
+) -> gilde_code_lib::contract::services::SpawnRequest {
+    use gilde_code_lib::contract::process::ProcKind as C;
+    let kind = match kind {
+        ProcKind::Pty => C::Pty,
+        ProcKind::Convo => C::Convo,
+        ProcKind::Pane => C::Pane,
+        ProcKind::Attach => C::Attach,
+        ProcKind::Turn | ProcKind::Headless => C::Turn,
+        ProcKind::Sidecar => C::Sidecar,
+        ProcKind::Probe => C::Probe,
+        ProcKind::Vendorcli => C::Vendorcli,
+        ProcKind::Git => C::Git,
+        ProcKind::Ide => C::Ide,
+        other => panic!("no fixture kind for {other:?}"),
+    };
+    let needs_generation = matches!(kind, C::Turn | C::Sidecar);
+    gilde_code_lib::contract::services::SpawnRequest {
+        kind,
+        argv0: gilde_code_lib::contract::common::AbsPath::parse(argv[0].clone()).expect("absolute argv[0]"),
+        args: argv[1..].to_vec(),
+        cwd: gilde_code_lib::contract::common::AbsPath::parse(cwd.as_ref().to_string_lossy().into_owned()).ok(),
+        env_keys: Vec::new(),
+        parent_uid: parent.map(|p| gilde_code_lib::contract::ids::SessionUid::parse(p).expect("uid")),
+        generation: generation.or(needs_generation.then_some(1)),
+        turn_id: (kind == C::Turn).then(|| "t-fixture".to_string()),
+    }
+}
+
 
 /// How long a test waits for the kernel to catch up with reality.
 const SETTLE: Duration = Duration::from_secs(5);
+/// A10.7: the ceiling of an event-driven wait, far above any budget.
+const EVENT_CEILING: Duration = Duration::from_secs(60);
 /// Long enough that `kill_tree`'s 200 ms "too young" exclusion cannot swallow a
 /// target we just spawned.
 const AGE_SETTLE: Duration = Duration::from_millis(400);
@@ -62,9 +104,8 @@ fn block_on<F: std::future::Future>(f: F) -> F::Output {
 struct Harness {
     db: Db,
     config: Arc<ConfigStore>,
-    sink: Arc<RecordingSink>,
-    bus: EventBus,
-    _graph: GraphHandle,
+    sink: Arc<RecordingEvents>,
+    bus: Events,
     _dir: tempfile::TempDir,
 }
 
@@ -73,15 +114,13 @@ async fn harness() -> Harness {
     let db = Db::open_in_memory().expect("db");
     let config =
         Arc::new(ConfigStore::open_at(&dir.path().join("config.json")).expect("config store"));
-    let graph = GraphHandle::new();
-    let sink = Arc::new(RecordingSink::default());
-    let bus = EventBus::with_sink(sink.clone(), graph.state().clone());
+    let sink = RecordingEvents::new();
+    let bus = Events::new(sink.clone());
     Harness {
         db,
         config,
         sink,
         bus,
-        _graph: graph,
         _dir: dir,
     }
 }
@@ -190,6 +229,26 @@ impl Kid {
     }
 }
 
+impl Kid {
+    /// Reap the child once it exits (its exit is the event waited on);
+    /// `None` if it still runs at `ceiling`. Async: the scheduled kill it
+    /// waits for runs on this test's current-thread runtime, which a blocking
+    /// sleep would starve.
+    async fn wait_exit(&mut self, ceiling: Duration) -> Option<std::process::ExitStatus> {
+        let deadline = Instant::now() + ceiling;
+        loop {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                self.reaped = true;
+                return Some(status);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
 impl Drop for Kid {
     fn drop(&mut self) {
         self.kill_and_reap();
@@ -240,6 +299,12 @@ fn wait_until_gone(pid: i32) {
     }
 }
 
+/// The §9.3 allowlist admits only resolved binaries: a fixture is
+/// allowlisted for the kind it is planned as before it is planned (A12.8).
+fn allow(argv: &[String], kind: ProcKind) {
+    gilde_code_lib::supervise::spawn::allow_executable(std::path::Path::new(&argv[0]), &[kind]);
+}
+
 /// Plan a row, start the process it describes, mark it running — DESIGN §8-3.
 async fn register(
     sup: &Supervisor,
@@ -247,10 +312,25 @@ async fn register(
     argv: &[String],
     cwd: &Path,
 ) -> (String, Kid) {
+    allow(argv, kind);
+    // A13.1: a sidecar row always belongs to a generation (the helper's 1).
     let guard = sup
-        .plan_spawn(SpawnPlan::new(kind, argv.to_vec(), cwd))
+        .plan_guarded(fixture_request(kind, argv, cwd, None, None))
         .await
         .expect("plan_spawn");
+    if kind == ProcKind::Headless {
+        // A row an older build left: no Gilde 2 path plans `headless` (it is
+        // planned as the `turn` it became), so the fixture writes the legacy
+        // kind onto the row the way that build did.
+        let id = guard.spawn_id().to_string();
+        sup.db()
+            .write(move |conn| {
+                conn.execute("UPDATE proc_registry SET kind = 'headless' WHERE spawn_id = ?1", [&id])?;
+                Ok(())
+            })
+            .await
+            .expect("legacy kind");
+    }
     let kid = spawn_child(argv, cwd, Some(guard.env_marker()));
     let pid = kid.pid();
     guard.mark_running(pid, pid).expect("mark_running");
@@ -265,8 +345,9 @@ async fn register(
 /// to close. The guard is deliberately leaked: dropping it would mark the row
 /// `lost`, which is exactly the state the test needs it *not* to be in.
 async fn plan_only(sup: &Supervisor, argv: &[String], cwd: &Path) -> (String, String) {
+    allow(argv, ProcKind::Pty);
     let guard: SpawnGuard = sup
-        .plan_spawn(SpawnPlan::new(ProcKind::Pty, argv.to_vec(), cwd))
+        .plan_guarded(fixture_request(ProcKind::Pty, argv, cwd, None, None))
         .await
         .expect("plan_spawn");
     let ids = (guard.spawn_id().to_string(), guard.env_marker().to_string());
@@ -631,9 +712,10 @@ rusty_fork_test! {
             let sup = h.instance().await;
             let cwd = h._dir.path().to_path_buf();
             let argv = argv_of(&[&fake_agent().to_string_lossy(), "hang"]);
+            allow(&argv, ProcKind::Headless);
 
             let doomed = sup
-                .plan_spawn(SpawnPlan::new(ProcKind::Headless, argv.clone(), &cwd).generation(7))
+                .plan_guarded(fixture_request(ProcKind::Headless, &argv, &cwd, None, Some(7)))
                 .await
                 .expect("plan_spawn");
             let doomed_kid = spawn_child(&argv, &cwd, Some(doomed.env_marker()));
@@ -642,7 +724,7 @@ rusty_fork_test! {
             drop(doomed);
 
             let kept = sup
-                .plan_spawn(SpawnPlan::new(ProcKind::Headless, argv.clone(), &cwd).generation(7))
+                .plan_guarded(fixture_request(ProcKind::Headless, &argv, &cwd, None, Some(7)))
                 .await
                 .expect("plan_spawn");
             let kept_kid = spawn_child(&argv, &cwd, Some(kept.env_marker()));
@@ -869,6 +951,442 @@ rusty_fork_test! {
                 "the sheet is told it has nothing to show"
             );
             assert_eq!(UNDO_WINDOW, Duration::from_secs(10), "DESIGN §8-5");
+        });
+    }
+}
+
+// ===========================================================================
+// Gilde 2 (contract §10.3): a crashed instance's session processes are never
+// adopted as live; they get a fenced SIGTERM after the undo window, and a
+// vendor CLI among them is never SIGKILLed.
+// ===========================================================================
+
+rusty_fork_test! {
+    #[test]
+    fn crash_leftover_sessions_are_terminated_after_the_undo_window_without_sigkill() {
+        block_on(async {
+            let h = harness().await;
+            let old = h.instance().await;
+            let cwd = h._dir.path().to_path_buf();
+            // A Conversation child (an ordinary fixture) and a "claude" copy that
+            // ignores SIGTERM, both owned by Gilde sessions.
+            let quiet = argv_of(&[&fake_agent().to_string_lossy(), "hang"]);
+            let bin = tempfile::tempdir().expect("bin");
+            let claude = bin.path().join("claude");
+            std::fs::copy(fake_agent(), &claude).expect("copy");
+            let stubborn = argv_of(&[&claude.to_string_lossy(), "ignore-term"]);
+            let mut kids = Vec::new();
+            let mut ids = Vec::new();
+            for (argv, uid) in [
+                (&quiet, "s_01890a5d-ac96-774b-bcce-b302099a8057"),
+                (&stubborn, "s_01890a5d-ac96-774b-bcce-b302099a8058"),
+            ] {
+                allow(argv, ProcKind::Convo);
+                let guard = old
+                    .plan_guarded(fixture_request(ProcKind::Convo, argv, &cwd, Some(uid), None))
+                    .await
+                    .expect("plan");
+                let kid = spawn_child(argv, &cwd, Some(guard.env_marker()));
+                guard.mark_running(kid.pid(), kid.pid()).expect("running");
+                ids.push(guard.spawn_id().to_string());
+                drop(guard);
+                kids.push(kid);
+            }
+            drop(old);
+            std::thread::sleep(AGE_SETTLE);
+
+            let new = h.instance().await;
+            let report = reaper::sweep_startup_with(&new, fast_opts()).await;
+            assert!(report.pending.is_empty(), "session rows are not offered as live: {report:?}");
+            assert_eq!(report.auto_terminated.len(), 2, "{report:?}");
+            assert!(report.auto_terminated.iter().all(|r| r.dry_run));
+            let crash = reaper::crash_leftover_spawn_ids();
+            assert!(ids.iter().all(|id| crash.contains(id)));
+            // Nothing is signalled inside the undo window.
+            assert!(is_alive(kids[0].pid()) && is_alive(kids[1].pid()));
+
+            // After the window: the quiet one is gone, the vendor CLI survived
+            // its SIGTERM and was not escalated.
+            // Waited on as events with a generous ceiling (A10.7): the quiet
+            // child's own exit, then the vendor CLI's row recording it as a
+            // survivor of its SIGTERM.
+            let quiet_pid = kids[0].pid();
+            let status = kids[0].wait_exit(EVENT_CEILING).await;
+            let row0 = h.row(&ids[0]).await;
+            let status = status.unwrap_or_else(|| {
+                panic!("pid {quiet_pid} never exited; row {:?} note {:?}", row0.state, row0.note)
+            });
+            assert_eq!(status.signal(), Some(libc::SIGTERM), "a SIGTERM, never a SIGKILL");
+            let deadline = Instant::now() + EVENT_CEILING;
+            let row1 = loop {
+                let row = h.row(&ids[1]).await;
+                if row.state == ProcState::KillIncomplete || Instant::now() >= deadline {
+                    break row;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            };
+            assert_eq!(row1.state, ProcState::KillIncomplete, "the survivor is recorded: {row1:?}");
+            assert!(is_alive(kids[1].pid()) && !is_gone(kids[1].pid()), "a vendor CLI is never SIGKILLed");
+            for kid in &mut kids {
+                kid.kill_and_reap();
+            }
+        });
+    }
+}
+
+// ===========================================================================
+// A29.3: the recovery window — every stop the boot sweep schedules (a
+// crashed instance's session children, the previous instance's quit
+// survivors) is one group under one undo token, published as
+// `BootStatus.recovery`; rows it neither stops nor adopts become leftovers.
+// ===========================================================================
+
+mod a29 {
+    use super::*;
+    use gilde_code_lib::contract::process::LeftoverReason;
+    use gilde_code_lib::contract::services::{ProcInfo, ProcSnapshot, TeammateLabels};
+    use gilde_code_lib::contract::store::{BootStatus, Entity, StoreOp};
+    use gilde_code_lib::events::StoreOpsSink;
+    use gilde_code_lib::lifecycle::boot::{run_boot_sweep_with, Lifecycle};
+    use gilde_code_lib::supervise::health::{registry_view, HealthState};
+
+    /// Every store op the feed published, in order.
+    #[derive(Default)]
+    struct Ops(parking_lot::Mutex<Vec<StoreOp>>);
+
+    impl StoreOpsSink for Ops {
+        fn ops(&self, ops: Vec<StoreOp>) {
+            self.0.lock().extend(ops);
+        }
+    }
+
+    impl Ops {
+        fn boots(&self) -> Vec<BootStatus> {
+            self.0
+                .lock()
+                .iter()
+                .filter_map(|op| match op {
+                    StoreOp::Boot { status } => Some(status.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    fn lifecycle() -> (Arc<Lifecycle>, Arc<Ops>) {
+        let lc = Lifecycle::new("0.0.0-test", "build");
+        let ops = Arc::new(Ops::default());
+        lc.feed.set_local_store(ops.clone());
+        (lc, ops)
+    }
+
+    /// A Gilde session's Conversation child of `sup`'s instance.
+    async fn session_child(sup: &Supervisor, argv: &[String], cwd: &Path, uid: &str) -> (String, Kid) {
+        allow(argv, ProcKind::Convo);
+        let guard = sup
+            .plan_guarded(fixture_request(ProcKind::Convo, argv, cwd, Some(uid), None))
+            .await
+            .expect("plan");
+        let kid = spawn_child(argv, cwd, Some(guard.env_marker()));
+        guard.mark_running(kid.pid(), kid.pid()).expect("running");
+        let id = guard.spawn_id().to_string();
+        drop(guard);
+        (id, kid)
+    }
+
+    /// A vendor process the previous instance recorded as a quit survivor
+    /// (§10.2 step 6): its row stays `running` under the ended instance.
+    async fn quit_survivor(h: &Harness, argv: &[String], cwd: &Path) -> (String, Kid) {
+        let prev = h.instance().await;
+        let (id, kid) = register(&prev, ProcKind::Pty, argv, cwd).await;
+        let (sid, inst) = (id.clone(), prev.app_instance_id().to_string());
+        h.db.write(move |conn| {
+            conn.execute(
+                "UPDATE proc_registry SET note = ?2 WHERE spawn_id = ?1",
+                rusqlite::params![sid, note::QUIT_SURVIVOR],
+            )?;
+            dao::app_instance::close(conn, &inst, gilde_code_lib::store::now_ms())?;
+            Ok(())
+        })
+        .await
+        .expect("an ended instance with a survivor");
+        (id, kid)
+    }
+
+    rusty_fork_test! {
+        #[test]
+        fn one_token_cancels_every_grouped_stop_and_clears_the_window() {
+            block_on(async {
+                let h = harness().await;
+                let cwd = h._dir.path().to_path_buf();
+                let argv = argv_of(&[&fake_agent().to_string_lossy(), "hang"]);
+                let (survivor_id, survivor) = quit_survivor(&h, &argv, &cwd).await;
+                let old = h.instance().await;
+                let (a_id, a) = session_child(&old, &argv, &cwd, "s_01890a5d-ac96-774b-bcce-b302099a8061").await;
+                let (b_id, b) = session_child(&old, &argv, &cwd, "s_01890a5d-ac96-774b-bcce-b302099a8062").await;
+                // A headless run past its lifetime keeps its own toast and token.
+                let (headless_id, headless) = register(&old, ProcKind::Headless, &argv, &cwd).await;
+                h.backdate(&headless_id, 200).await;
+                drop(old);
+                std::thread::sleep(AGE_SETTLE);
+
+                let new = h.instance().await;
+                let (lc, ops) = lifecycle();
+                let before = gilde_code_lib::store::now_ms();
+                let opts = fast_opts();
+                let report = run_boot_sweep_with(&lc, &new, opts).await;
+
+                let window = report.recovery.clone().expect("the sweep scheduled stops");
+                assert_eq!(window.stopping, 3, "two crash leftovers and one quit survivor: {report:?}");
+                assert!(window.until >= before + opts.undo_window.as_millis() as i64, "until is wall clock");
+                assert_eq!(lc.feed.boot().recovery, Some(window.clone()), "published as soon as scheduled");
+                let token = window.undo_token.as_str().to_string();
+                let mut members = reaper::undo_targets(&token);
+                members.sort();
+                let mut want = vec![a_id.clone(), b_id.clone(), survivor_id.clone()];
+                want.sort();
+                assert_eq!(members, want, "one token names every grouped stop");
+                assert_eq!(reaper::undo_target(&token), None);
+
+                let headless_token = h.undo_token().expect("the headless toast carries its own token");
+                assert_ne!(headless_token, token);
+                assert!(!members.contains(&headless_id));
+                assert!(reaper::undo_cancel(&headless_token));
+
+                // [Keep them]: one undo, every stop of the group.
+                assert!(reaper::undo_cancel(&token));
+                assert_eq!(lc.feed.boot().recovery, None, "the window closes on the undo");
+                assert!(!reaper::undo_cancel(&token), "a token is spent once");
+                assert!(reaper::undo_targets(&token).is_empty());
+
+                // Well past the window: no signal reached any of them.
+                tokio::time::sleep(opts.undo_window * 2 + Duration::from_millis(500)).await;
+                for (what, kid) in [("crash a", &a), ("crash b", &b), ("survivor", &survivor), ("headless", &headless)] {
+                    assert!(is_alive(kid.pid()), "{what}: the undo really prevented the stop");
+                }
+                // The store saw the window open, then close.
+                let recoveries: Vec<_> = ops.boots().into_iter().map(|b| b.recovery).collect();
+                assert!(recoveries.contains(&Some(window.clone())), "{recoveries:?}");
+                assert_eq!(recoveries.last(), Some(&None), "{recoveries:?}");
+                // A survivor of the undo is still a leftover for Clean up.
+                let crash = reaper::crash_leftover_spawn_ids();
+                assert!(crash.contains(&a_id) && crash.contains(&b_id));
+                assert!(reaper::quit_survivor_spawn_ids().contains(&survivor_id));
+            });
+        }
+    }
+
+    rusty_fork_test! {
+        #[test]
+        fn the_window_ends_every_grouped_stop_fires_and_the_window_clears() {
+            block_on(async {
+                let h = harness().await;
+                let cwd = h._dir.path().to_path_buf();
+                let argv = argv_of(&[&fake_agent().to_string_lossy(), "hang"]);
+                let (_survivor_id, survivor) = quit_survivor(&h, &argv, &cwd).await;
+                let old = h.instance().await;
+                let (_a_id, a) = session_child(&old, &argv, &cwd, "s_01890a5d-ac96-774b-bcce-b302099a8063").await;
+                let (_b_id, b) = session_child(&old, &argv, &cwd, "s_01890a5d-ac96-774b-bcce-b302099a8064").await;
+                drop(old);
+                std::thread::sleep(AGE_SETTLE);
+
+                let new = h.instance().await;
+                let (lc, ops) = lifecycle();
+                let report = run_boot_sweep_with(&lc, &new, fast_opts()).await;
+                let window = report.recovery.clone().expect("a window");
+                assert_eq!(window.stopping, 3);
+                // Nothing is signalled inside the window.
+                assert!(is_alive(a.pid()) && is_alive(b.pid()) && is_alive(survivor.pid()));
+
+                // The window ends (an event, A10.7): `recovery` is cleared …
+                let deadline = Instant::now() + EVENT_CEILING;
+                while lc.feed.boot().recovery.is_some() {
+                    assert!(Instant::now() < deadline, "the window never ended");
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                assert!(!reaper::undo_is_pending(window.undo_token.as_str()), "the token is spent");
+                assert!(!reaper::undo_cancel(window.undo_token.as_str()), "too late to undo");
+                // … and every stop of the group fires: fenced, never SIGKILL.
+                for (what, mut kid) in [("crash a", a), ("crash b", b), ("survivor", survivor)] {
+                    let pid = kid.pid();
+                    let status = kid.wait_exit(EVENT_CEILING).await.unwrap_or_else(|| panic!("{what} ({pid}) never stopped"));
+                    let sig = status.signal();
+                    assert!(matches!(sig, Some(libc::SIGTERM) | Some(libc::SIGHUP)), "{what}: {sig:?}, never SIGKILL");
+                }
+                let recoveries: Vec<_> = ops.boots().into_iter().map(|b| b.recovery).collect();
+                assert_eq!(recoveries.first(), Some(&Some(window)), "{recoveries:?}");
+                assert_eq!(recoveries.last(), Some(&None), "{recoveries:?}");
+            });
+        }
+    }
+
+    rusty_fork_test! {
+        #[test]
+        fn a_row_the_sweep_neither_stops_nor_adopts_becomes_a_crash_leftover() {
+            block_on(async {
+                let h = harness().await;
+                let cwd = h._dir.path().to_path_buf();
+                let argv = argv_of(&[&fake_agent().to_string_lossy(), "hang"]);
+                let old = h.instance().await;
+                // A crashed instance's terminal row that belongs to no session.
+                let (spawn_id, kid) = register(&old, ProcKind::Pty, &argv, &cwd).await;
+                drop(old);
+                std::thread::sleep(AGE_SETTLE);
+
+                let new = h.instance().await;
+                let (lc, _ops) = lifecycle();
+                let report = run_boot_sweep_with(&lc, &new, fast_opts()).await;
+                assert_eq!(report.sweep.pending, 1, "{report:?}");
+                assert_eq!(report.recovery, None, "nothing was scheduled: no window");
+                assert_eq!(lc.feed.boot().recovery, None);
+                assert!(reaper::crash_leftover_spawn_ids().contains(&spawn_id), "never dropped silently");
+
+                // The shared scan names it a GildeCrashLeftover and the feed
+                // publishes it (LeftoverUpsert → Upsert{Leftover}).
+                let row = h.row(&spawn_id).await;
+                let start = row.proc_start_ts.expect("a start time");
+                let view = registry_view(&new).await;
+                let fact = view.get(&(kid.pid(), start)).expect("the registry knows it");
+                assert!(fact.crash_leftover && !fact.current_instance);
+                let proc = ProcInfo {
+                    key: gilde_code_lib::contract::ids::ProcessKey::new(kid.pid() as u32, start as u64),
+                    pid: kid.pid(),
+                    ppid: 1,
+                    uid: 501,
+                    start_sec: start,
+                    exec_path: Some(argv[0].clone()),
+                    argv_redacted: argv.clone(),
+                    labels: TeammateLabels::default(),
+                    cwd: None,
+                    rss_bytes: 1 << 20,
+                    cpu_ns: 0,
+                    cco_team_member: None,
+                    gilde_app_instance: None,
+                    vendor: None,
+                };
+                let health = HealthState::new();
+                let snap = |at| Arc::new(ProcSnapshot { taken_at: at, procs: vec![proc.clone()] });
+                health.observe(snap(1), &view);
+                let leftovers = health.observe(snap(2), &view);
+                assert_eq!(leftovers.len(), 1);
+                assert_eq!(leftovers[0].leftover.as_ref().map(|l| l.reason), Some(LeftoverReason::GildeCrashLeftover));
+                let ops = Arc::new(Ops::default());
+                lc.feed.set_local_store(ops.clone());
+                lc.feed.set_leftovers(leftovers);
+                let published = ops.0.lock().iter().any(|op| matches!(
+                    op,
+                    StoreOp::Upsert { entity } if matches!(
+                        entity.as_ref(),
+                        Entity::Leftover { value } if value.pid == kid.pid()
+                            && value.leftover.as_ref().map(|l| l.reason) == Some(LeftoverReason::GildeCrashLeftover)
+                    )
+                ));
+                assert!(published, "{:?}", ops.0.lock());
+                assert!(is_alive(kid.pid()), "a leftover is shown, never signalled by the sweep");
+            });
+        }
+    }
+}
+
+// ===========================================================================
+// A41.3 (G7c-04): observing an orphan never waits on the spawn gate; every
+// marker-only orphan of a crashed instance is listed, never stopped
+// automatically. No signal is sent: the sweep's stop group is never armed.
+// ===========================================================================
+
+/// `n` processes stamped with `instance`'s marker that no row names.
+fn spawn_marker_orphans(instance: &str, cwd: &Path, n: usize) -> (Vec<i32>, Vec<Kid>) {
+    let mut pids = Vec::new();
+    let mut kids = Vec::new();
+    for _ in 0..n {
+        let child = Command::new(fake_agent())
+            .arg("hang")
+            .current_dir(cwd)
+            .env("GILDE_APP_INSTANCE", instance)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn orphan");
+        pids.push(child.id() as i32);
+        kids.push(Kid { child, reaped: false });
+    }
+    for pid in &pids {
+        wait_until_visible(*pid);
+    }
+    std::thread::sleep(AGE_SETTLE);
+    (pids, kids)
+}
+
+/// The next boot exactly as `boot.rs` builds it: the gate stays closed until
+/// the sweep has run.
+async fn next_boot_with_closed_gate(h: &Harness) -> Arc<Supervisor> {
+    Arc::new(
+        Supervisor::open_instance(&h.db, h.config.clone(), "0.0.0-test")
+            .await
+            .expect("new")
+            .with_spawn_gate(gilde_code_lib::lifecycle::spawn_gate::SpawnGate::closed()),
+    )
+}
+
+rusty_fork_test! {
+    /// G7c-04, the reviewer's test: both untracked orphans reach the Recovered
+    /// sheet within the boot budget although the gate is closed.
+    #[test]
+    fn g7c_04_the_boot_sweep_catches_an_untracked_orphan_with_the_boot_gate_closed() {
+        block_on(async {
+            let h = harness().await;
+            let old = h.instance().await;
+            let (pids, mut kids) = spawn_marker_orphans(old.app_instance_id(), h._dir.path(), 2);
+            let readable = ps_snapshot().expect("snap").with_env("GILDE_APP_INSTANCE", old.app_instance_id());
+            assert!(pids.iter().all(|p| readable.contains(p)), "precondition: our own children's env is readable");
+            let new = next_boot_with_closed_gate(&h).await;
+            let mut group = reaper::StopGroup::new();
+            let t0 = Instant::now();
+            let report = reaper::sweep_startup_into(&new, SweepOpts::default(), &mut group).await;
+            let took = t0.elapsed();
+            let caught: Vec<i32> = pids.iter().copied().filter(|p| report.pending.iter().any(|r| r.pid == Some(*p))).collect();
+            for kid in &mut kids {
+                assert!(is_alive(kid.pid()), "observing never signals");
+                kid.kill_and_reap();
+            }
+            assert!(
+                caught.len() == pids.len() && took < Duration::from_secs(3),
+                "§10.3: both untracked orphans reach the Recovered sheet within the boot budget; \
+                 caught {caught:?} of {pids:?} in {took:?}"
+            );
+        });
+    }
+}
+
+rusty_fork_test! {
+    /// A41.3: ten orphans cost no gate wait, every one is listed as a
+    /// `GildeCrashLeftover` (pending, in the boot sweep's crash set) and none
+    /// is scheduled for an automatic stop.
+    #[test]
+    fn a41_ten_orphans_are_all_listed_without_a_gate_wait_and_never_auto_stopped() {
+        block_on(async {
+            let h = harness().await;
+            let old = h.instance().await;
+            let (pids, mut kids) = spawn_marker_orphans(old.app_instance_id(), h._dir.path(), 10);
+            let readable = ps_snapshot().expect("snap").with_env("GILDE_APP_INSTANCE", old.app_instance_id());
+            assert!(pids.iter().all(|p| readable.contains(p)), "precondition: our own children's env is readable");
+            let new = next_boot_with_closed_gate(&h).await;
+            let mut group = reaper::StopGroup::new();
+            let t0 = Instant::now();
+            let report = reaper::sweep_startup_into(&new, SweepOpts::default(), &mut group).await;
+            let took = t0.elapsed();
+            let crash = reaper::crash_leftover_spawn_ids();
+            let listed: Vec<&reaper::RecoveredProc> = report.pending.iter().filter(|r| r.pid.is_some_and(|p| pids.contains(&p))).collect();
+            let alive: Vec<bool> = pids.iter().map(|p| is_alive(*p)).collect();
+            for kid in &mut kids {
+                kid.kill_and_reap();
+            }
+            assert_eq!(listed.len(), 10, "every orphan is listed: {report:?}");
+            assert!(listed.iter().all(|r| crash.contains(&r.spawn_id)), "as GildeCrashLeftover from the first scan");
+            assert!(report.auto_terminated.is_empty(), "a marker-only orphan is never stopped automatically: {report:?}");
+            assert!(took < Duration::from_secs(5), "no gate wait (10 × 5 s before A41.3): {took:?}");
+            assert!(alive.iter().all(|a| *a), "observing never signals");
         });
     }
 }

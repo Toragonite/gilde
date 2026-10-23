@@ -25,13 +25,14 @@
 //! [`SpawnRecorder`] so the two tasks can land in either order and so tests can
 //! run with no database at all.
 
+pub mod classify;
 pub mod launch;
 pub mod path;
 pub mod signatures;
 
-use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
@@ -58,8 +59,8 @@ pub const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a detection result stays warm (M1-PLAN T09.4).
 pub const DETECT_TTL: Duration = Duration::from_secs(60);
 
-/// Grace between `SIGTERM` and `SIGKILL` for a probe that overran.
-const PROBE_KILL_GRACE: Duration = Duration::from_millis(200);
+/// How long a probe that overran gets after `SIGTERM` (never `SIGKILL`).
+const PROBE_KILL_GRACE: Duration = Duration::from_millis(1_500);
 
 // ---------------------------------------------------------------------------
 // AgentKind
@@ -85,6 +86,17 @@ pub enum AgentKind {
 }
 
 impl AgentKind {
+    /// The detection kind of a contract vendor.
+    pub fn of_vendor(vendor: crate::contract::common::Vendor) -> AgentKind {
+        use crate::contract::common::Vendor;
+        match vendor {
+            Vendor::Claude => AgentKind::Claude,
+            Vendor::Codex => AgentKind::Codex,
+            Vendor::Cursor => AgentKind::Cursor,
+            Vendor::Agy => AgentKind::Antigravity,
+        }
+    }
+
     /// Every kind, in the order the UI lists them.
     pub const ALL: [AgentKind; 6] = [
         AgentKind::Claude,
@@ -304,7 +316,7 @@ fn verified_against(version: Option<&str>, range: Option<&str>) -> bool {
 /// A spawn about to happen, handed to the registry before it does.
 #[derive(Debug, Clone)]
 pub struct ProbePlan {
-    /// `proc_registry.kind` — always `"probe"` from this module.
+    /// `proc_registry.kind` — `"vendorcli"` for a `--version` probe (§3.8).
     pub kind: &'static str,
     pub vendor: Option<String>,
     pub argv: Vec<String>,
@@ -328,6 +340,14 @@ pub trait ProbeGuard: Send + Sync {
 /// which only ever happens in tests and before T29 has wired the registry.
 pub trait SpawnRecorder: Send + Sync + std::fmt::Debug {
     fn plan(&self, plan: ProbePlan) -> Option<Box<dyn ProbeGuard>>;
+
+    /// Whether `plan` may launch at all (§9.3). `false` = the probe does not
+    /// run — a refused launch never falls back to running unregistered
+    /// (A12.8). Recorders without a registry allow everything.
+    fn allows(&self, plan: &ProbePlan) -> bool {
+        let _ = plan;
+        true
+    }
 }
 
 /// Records nothing. The default until T29 injects the real registry.
@@ -358,7 +378,7 @@ pub fn noop_recorder() -> Recorder {
 /// Process Monitor and reachable by the reaper instead of being an anonymous
 /// `claude` nobody can explain.
 ///
-/// [`Supervisor::plan_spawn`] is `async` while detection runs on a blocking
+/// `SupervisorApi::plan_spawn` is `async` while detection runs on a blocking
 /// thread (a `--version` probe can take 20 s and must not occupy a runtime
 /// worker), so the plan is driven through a captured [`tokio::runtime::Handle`].
 /// That is safe **because the call site is a `spawn_blocking` thread**, never a
@@ -395,52 +415,88 @@ impl std::fmt::Debug for SupervisorRecorder {
 }
 
 impl SpawnRecorder for SupervisorRecorder {
-    fn plan(&self, plan: ProbePlan) -> Option<Box<dyn ProbeGuard>> {
-        debug_assert_eq!(plan.kind, "probe");
-        let mut spawn_plan = crate::supervise::SpawnPlan::new(
-            crate::store::models::ProcKind::Probe,
-            plan.argv,
-            plan.cwd,
-        );
-        if let Some(vendor) = plan.vendor {
-            spawn_plan = spawn_plan.vendor(vendor);
-        }
+    fn allows(&self, plan: &ProbePlan) -> bool {
+        let kind = crate::store::models::ProcKind::from_db_str(plan.kind)
+            .unwrap_or(crate::store::models::ProcKind::Vendorcli);
+        plan.argv
+            .first()
+            .is_some_and(|argv0| crate::supervise::spawn::is_allowed(Path::new(argv0), kind))
+    }
 
+    fn plan(&self, plan: ProbePlan) -> Option<Box<dyn ProbeGuard>> {
+        use crate::contract::process::ProcKind as K;
+        use crate::contract::services::{SpawnRequest, SupervisorApi};
+        // `--version` probes of vendor CLIs are `vendorcli` rows (contract
+        // §3.8), planned through the one spawn path (A12.8, A22.3).
+        let kind = if plan.kind == "probe" { K::Probe } else { K::Vendorcli };
+        let (argv0, args) = plan.argv.split_first()?;
+        let argv0 = crate::contract::common::AbsPath::parse(argv0.clone()).ok()?;
+        let request = SpawnRequest {
+            kind,
+            argv0,
+            args: args.to_vec(),
+            cwd: plan
+                .cwd
+                .to_str()
+                .and_then(|c| crate::contract::common::AbsPath::parse(c.to_string()).ok()),
+            env_keys: vec!["PATH".into(), "HOME".into(), "LANG".into(), "GILDE_SPAWN_ID".into()],
+            parent_uid: None,
+            generation: None,
+            turn_id: None,
+        };
         let supervisor = self.supervisor.clone();
         match self
             .handle
-            .block_on(async move { supervisor.plan_spawn(spawn_plan).await })
+            .block_on(async move { SupervisorApi::plan_spawn(supervisor.as_ref(), request).await })
         {
-            Ok(guard) => Some(Box::new(RegistryProbeGuard(guard))),
+            Ok(ticket) => Some(Box::new(RegistryProbeGuard {
+                supervisor: self.supervisor.clone(),
+                ticket,
+                handle: self.handle.clone(),
+            })),
             Err(e) => {
                 // A registry that cannot write is a real problem, but refusing
                 // to detect agents because of it would take the whole app down
                 // with it. Probe unregistered, loudly.
-                tracing::error!(target: "agents", error = %e, "could not register a version probe");
+                tracing::error!(target: "agents", code = e.code.as_str(), "could not register a version probe");
                 None
             }
         }
     }
 }
 
-/// A [`crate::supervise::SpawnGuard`] behind the [`ProbeGuard`] seam.
-struct RegistryProbeGuard(crate::supervise::SpawnGuard);
+/// A row planned through `SupervisorApi` behind the [`ProbeGuard`] seam (the
+/// calls run on the detection's blocking thread through the captured handle).
+struct RegistryProbeGuard {
+    supervisor: Arc<crate::supervise::Supervisor>,
+    ticket: crate::contract::services::SpawnTicket,
+    handle: tokio::runtime::Handle,
+}
 
 impl ProbeGuard for RegistryProbeGuard {
     fn env_marker(&self) -> String {
-        self.0.env_marker().to_string()
+        self.ticket.env_marker.clone()
     }
 
-    fn mark_running(&self, pid: i32, pgid: i32) {
-        if let Err(e) = self.0.mark_running(pid, pgid) {
-            tracing::warn!(target: "agents", error = %e, pid, "probe row not marked running");
+    fn mark_running(&self, pid: i32, _pgid: i32) {
+        use crate::contract::services::SupervisorApi;
+        let sup = self.supervisor.clone();
+        let ticket = self.ticket.clone();
+        if let Err(e) = self
+            .handle
+            .block_on(async move { SupervisorApi::mark_running(sup.as_ref(), &ticket, pid).await })
+        {
+            tracing::warn!(target: "agents", code = e.code.as_str(), pid, "probe row not marked running");
         }
     }
 
     fn mark_exited(&self, exit_code: Option<i32>, signal: Option<i32>) {
-        if let Err(e) = self.0.mark_exited(exit_code, signal) {
-            tracing::warn!(target: "agents", error = %e, "probe row not marked exited");
-        }
+        use crate::contract::services::SupervisorApi;
+        let sup = self.supervisor.clone();
+        let ticket = self.ticket.clone();
+        let exit = crate::contract::activity::ExitInfo { code: exit_code, signal };
+        self.handle
+            .block_on(async move { SupervisorApi::mark_exited(sup.as_ref(), &ticket, exit).await });
     }
 }
 
@@ -532,22 +588,31 @@ fn detect_one(
         return AgentBinary::absent(kind, None);
     };
 
+    // A located vendor binary (the configured pin or the resolved PATH) is
+    // allowlisted for the vendor kinds before its first launch (§9.3).
+    if kind != AgentKind::Shell {
+        crate::supervise::spawn::allow_executable(&abs_path, &VENDOR_KINDS);
+    }
     let argv = vec![
         abs_path.to_string_lossy().into_owned(),
         kind.version_flag().to_string(),
     ];
-    // Registered *before* the spawn, like every other process this app creates.
-    let guard = recorder.plan(ProbePlan {
-        kind: "probe",
+    let plan = ProbePlan {
+        kind: "vendorcli",
         vendor: Some(kind.key().to_string()),
         argv: argv.clone(),
         cwd: PathBuf::from("/"),
-    });
-
-    let outcome = run_probe(&abs_path, kind.version_flag(), path_env, guard.as_deref());
+    };
+    let outcome = if recorder.allows(&plan) {
+        // Registered *before* the spawn, like every other process this app creates.
+        let guard = recorder.plan(plan);
+        run_probe(&abs_path, kind.version_flag(), path_env, guard.as_deref())
+    } else {
+        ProbeOutcome::Failed("not allowlisted".to_string())
+    };
 
     let (version, warning, ok) = match outcome {
-        ProbeOutcome::Answered { stdout, stderr, code } if code == Some(0) => {
+        ProbeOutcome::Answered { stdout, stderr, code: Some(0) } => {
             match parse_version(&stdout).or_else(|| parse_version(&stderr)) {
                 Some(v) => (Some(v), None, true),
                 None => (
@@ -650,7 +715,9 @@ fn run_probe(
     path_env: &str,
     guard: Option<&dyn ProbeGuard>,
 ) -> ProbeOutcome {
-    let mut cmd = Command::new(binary);
+    // Own group (the supervise module's grouped builder, a §9.3 launch site),
+    // so a probe that forks a helper can be terminated whole.
+    let mut cmd = crate::supervise::spawn::std_command_grouped(binary);
     cmd.arg(flag)
         .env_clear()
         .env("PATH", path_env)
@@ -658,9 +725,7 @@ fn run_probe(
         .env("LANG", "en_US.UTF-8")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        // Own group, so a probe that forks a helper can be killed whole.
-        .process_group(0);
+        .stderr(Stdio::piped());
     if let Some(guard) = guard {
         cmd.env("GILDE_SPAWN_ID", guard.env_marker());
     }
@@ -689,10 +754,13 @@ fn run_probe(
             Err(e) => return ProbeOutcome::Failed(e.to_string()),
         }
         if Instant::now() >= deadline {
-            kill_group(pid);
-            let _ = child.wait();
-            if let Some(guard) = guard {
-                guard.mark_exited(None, Some(libc::SIGKILL));
+            // A vendor CLI is never SIGKILLed (contract §9.8, C5): SIGTERM to
+            // the probe's own group, a short grace, and a survivor is left to
+            // the registry (its row stays `running` for the reaper).
+            if terminate_group(pid, &mut child) {
+                if let Some(guard) = guard {
+                    guard.mark_exited(None, Some(libc::SIGTERM));
+                }
             }
             return ProbeOutcome::TimedOut;
         }
@@ -733,19 +801,26 @@ fn collect(rx: Option<mpsc::Receiver<Vec<u8>>>) -> String {
         .unwrap_or_default()
 }
 
-/// See `path::kill_group` — same reasoning: a process we created microseconds
-/// ago, in a group of its own, whose `Child` we still hold.
-fn kill_group(pid: i32) {
+/// `SIGTERM` to the probe's own group (a process we created microseconds ago,
+/// whose `Child` we still hold), then up to [`PROBE_KILL_GRACE`] for it to go.
+/// Never `SIGKILL`: the probe is a vendor CLI (contract §9.8, C5). Returns
+/// whether it exited; a survivor's `Child` is dropped without a wait.
+fn terminate_group(pid: i32, child: &mut std::process::Child) -> bool {
     use nix::sys::signal::{killpg, Signal};
     use nix::unistd::Pid;
 
     if pid <= 0 {
-        return;
+        return false;
     }
-    let group = Pid::from_raw(pid);
-    let _ = killpg(group, Signal::SIGTERM);
-    thread::sleep(PROBE_KILL_GRACE);
-    let _ = killpg(group, Signal::SIGKILL);
+    let _ = killpg(Pid::from_raw(pid), Signal::SIGTERM);
+    let deadline = Instant::now() + PROBE_KILL_GRACE;
+    while Instant::now() < deadline {
+        if let Ok(Some(_)) = child.try_wait() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    matches!(child.try_wait(), Ok(Some(_)))
 }
 
 /// Pull a version out of whatever the CLI printed.
@@ -864,6 +939,28 @@ impl AgentRegistry {
         report
     }
 
+    /// A vendor's binary as a spawn would use it (A12.6, the sidecar's
+    /// binary resolver, asked on every sidecar start): the configured pin or
+    /// the resolved `PATH`, then [`resolve_binary`] (realpath, the A1
+    /// fingerprint cache, the §9.3 allowlist). `None` = not installed or not
+    /// resolvable. The PATH lookup may run the login-shell probe once, so it
+    /// runs on the blocking pool; never on the boot path.
+    pub async fn resolve_vendor(
+        self: &Arc<Self>,
+        vendor: crate::contract::common::Vendor,
+    ) -> Option<crate::contract::common::AbsPath> {
+        let kind = AgentKind::of_vendor(vendor);
+        let me = Arc::clone(self);
+        let located = tokio::task::spawn_blocking(move || {
+            let report = me.path_report(false);
+            locate(kind, &me.config.get(), &report).map(|(path, _)| path)
+        })
+        .await
+        .ok()
+        .flatten()?;
+        resolve_binary(&located, kind, None).await.ok().map(|r| r.binary.realpath)
+    }
+
     /// `agents_detect(refresh)`.
     pub async fn detect(&self, refresh: bool) -> Result<Vec<AgentBinary>> {
         let _serialised = self.detect_lock.lock().await;
@@ -924,6 +1021,300 @@ impl AgentRegistry {
             }
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// binary resolution at spawn (contract §6.0 *Binary resolution*, §3.10) [A1]
+// ---------------------------------------------------------------------------
+
+/// A binary resolved for a spawn, with the compat record of its version
+/// (claude only, when the compat service is bound).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedBinary {
+    pub binary: crate::contract::session::BinaryRef,
+    pub compat: Option<crate::contract::compat::ClaudeCompat>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedBinary {
+    configured: PathBuf,
+    realpath: PathBuf,
+    binary: crate::contract::session::BinaryRef,
+}
+
+/// Invoked with the realpath of every binary whose cache entry an FSEvents
+/// change invalidated (B10: schedule a background static canary).
+pub type BinaryChanged = Arc<dyn Fn(&crate::contract::session::BinaryRef) + Send + Sync>;
+
+/// The `BinaryRef` cache behind [`resolve_binary`].
+///
+/// Keyed on the configured path; an entry is valid while the realpath and its
+/// `(size, mtime, inode)` fingerprint are unchanged. The directory of every
+/// resolved realpath and the directory of the configured (`PATH`) entry are
+/// watched (FSEvents, non-recursive); a change there drops the entries under
+/// it, so the **next** spawn re-runs `--version` — running sessions keep the
+/// `BinaryRef` recorded at their spawn and are never re-evaluated.
+pub struct BinaryResolver {
+    cache: Mutex<std::collections::HashMap<PathBuf, CachedBinary>>,
+    watched: Mutex<std::collections::HashSet<PathBuf>>,
+    watcher: Mutex<Option<notify::RecommendedWatcher>>,
+    recorder: RwLock<Recorder>,
+    path_env: RwLock<String>,
+    on_change: RwLock<Vec<BinaryChanged>>,
+    probes: std::sync::atomic::AtomicU64,
+}
+
+impl std::fmt::Debug for BinaryResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BinaryResolver")
+            .field("cached", &self.cache.lock().len())
+            .field("watched", &self.watched.lock().len())
+            .finish()
+    }
+}
+
+impl BinaryResolver {
+    pub fn new() -> Arc<BinaryResolver> {
+        Arc::new(BinaryResolver {
+            cache: Mutex::new(std::collections::HashMap::new()),
+            watched: Mutex::new(std::collections::HashSet::new()),
+            watcher: Mutex::new(None),
+            recorder: RwLock::new(noop_recorder()),
+            path_env: RwLock::new(std::env::var("PATH").unwrap_or_default()),
+            on_change: RwLock::new(Vec::new()),
+            probes: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    /// The process-wide resolver [`resolve_binary`] uses.
+    pub fn global() -> &'static Arc<BinaryResolver> {
+        static GLOBAL: std::sync::OnceLock<Arc<BinaryResolver>> = std::sync::OnceLock::new();
+        GLOBAL.get_or_init(BinaryResolver::new)
+    }
+
+    /// Register `--version` runs as `vendorcli` rows (boot wires the registry).
+    pub fn set_recorder(&self, recorder: Recorder) {
+        *self.recorder.write() = recorder;
+    }
+
+    /// The resolved login-shell `PATH` the `--version` runs get.
+    pub fn set_path_env(&self, path: impl Into<String>) {
+        *self.path_env.write() = path.into();
+    }
+
+    pub fn on_change(&self, f: BinaryChanged) {
+        self.on_change.write().push(f);
+    }
+
+    /// How many `--version` runs this resolver made (tests: a cache hit runs none).
+    pub fn version_runs(&self) -> u64 {
+        self.probes.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The cached `BinaryRef` for `configured`, if still valid on disk.
+    pub fn cached(&self, configured: &Path) -> Option<crate::contract::session::BinaryRef> {
+        let entry = self.cache.lock().get(configured).cloned()?;
+        let real = std::fs::canonicalize(configured).ok()?;
+        let fp = fingerprint_of(&real).ok()?;
+        (real == entry.realpath && fp == entry.binary.fingerprint).then_some(entry.binary)
+    }
+
+    /// Resolve `configured` for a spawn (see [`resolve_binary`]).
+    pub async fn resolve(
+        self: &Arc<Self>,
+        configured: &Path,
+        kind: AgentKind,
+        compat: Option<&dyn crate::contract::services::CompatApi>,
+    ) -> std::result::Result<ResolvedBinary, crate::contract::IpcError> {
+        use crate::contract::IpcError;
+        let binary = match self.cached(configured) {
+            Some(hit) => hit,
+            None => {
+                let real = std::fs::canonicalize(configured)
+                    .map_err(|_| IpcError::spawn_failed().with_detail("the agent binary was not found"))?;
+                let fp = fingerprint_of(&real)
+                    .map_err(|_| IpcError::spawn_failed().with_detail("the agent binary could not be read"))?;
+                let realpath = crate::contract::common::AbsPath::parse(real.to_string_lossy().into_owned())
+                    .map_err(|_| IpcError::spawn_failed())?;
+                // Allowlisted before its first launch, the `--version` run.
+                crate::supervise::spawn::allow_executable(&real, &VENDOR_KINDS);
+                let version = self.run_version(&real, kind).await;
+                let binary = crate::contract::session::BinaryRef {
+                    realpath,
+                    fingerprint: fp,
+                    version,
+                    pidpath: None,
+                };
+                self.cache.lock().insert(
+                    configured.to_path_buf(),
+                    CachedBinary {
+                        configured: configured.to_path_buf(),
+                        realpath: real.clone(),
+                        binary: binary.clone(),
+                    },
+                );
+                self.watch_dir_of(&real);
+                self.watch_dir_of(configured);
+                binary
+            }
+        };
+        let compat = match (kind, compat) {
+            (AgentKind::Claude, Some(api)) if binary.version.is_some() => Some(api.for_binary(&binary).await),
+            _ => None,
+        };
+        Ok(ResolvedBinary { binary, compat })
+    }
+
+    async fn run_version(&self, real: &Path, kind: AgentKind) -> Option<String> {
+        self.probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let recorder = self.recorder.read().clone();
+        let path_env = self.path_env.read().clone();
+        let binary = real.to_path_buf();
+        let flag = kind.version_flag();
+        let vendor = kind.key().to_string();
+        let out = tokio::task::spawn_blocking(move || {
+            let plan = ProbePlan {
+                kind: "vendorcli",
+                vendor: Some(vendor),
+                argv: vec![binary.to_string_lossy().into_owned(), flag.to_string()],
+                cwd: PathBuf::from("/"),
+            };
+            if !recorder.allows(&plan) {
+                return ProbeOutcome::Failed("not allowlisted".to_string());
+            }
+            let guard = recorder.plan(plan);
+            run_probe(&binary, flag, &path_env, guard.as_deref())
+        })
+        .await
+        .ok()?;
+        match out {
+            ProbeOutcome::Answered { stdout, stderr, .. } => {
+                parse_version(&stdout).or_else(|| parse_version(&stderr))
+            }
+            _ => None,
+        }
+    }
+
+    /// Drop every entry whose realpath or configured path lives in `dir` and
+    /// whose binary changed (the configured path resolves elsewhere now, or
+    /// the fingerprint differs); returns the dropped `BinaryRef`s (with their
+    /// fingerprint as cached). An FSEvents change of another file in the same
+    /// folder leaves the entry alone.
+    pub fn invalidate_under(&self, dir: &Path) -> Vec<crate::contract::session::BinaryRef> {
+        let mut dropped = Vec::new();
+        self.cache.lock().retain(|_, e| {
+            let in_dir = e.realpath.parent() == Some(dir) || e.configured.parent() == Some(dir);
+            let unchanged = || {
+                std::fs::canonicalize(&e.configured).ok().as_ref() == Some(&e.realpath)
+                    && fingerprint_of(&e.realpath).ok().as_ref() == Some(&e.binary.fingerprint)
+            };
+            let hit = in_dir && !unchanged();
+            if hit {
+                dropped.push(e.binary.clone());
+            }
+            !hit
+        });
+        dropped
+    }
+
+    fn watch_dir_of(self: &Arc<Self>, path: &Path) {
+        use notify::Watcher as _;
+        let Some(dir) = path.parent().map(Path::to_path_buf) else { return };
+        if !self.watched.lock().insert(dir.clone()) {
+            return;
+        }
+        let mut slot = self.watcher.lock();
+        if slot.is_none() {
+            let me = Arc::downgrade(self);
+            let handler = move |res: notify::Result<notify::Event>| {
+                let Ok(event) = res else { return };
+                let Some(me) = me.upgrade() else { return };
+                let mut dirs: Vec<PathBuf> = event
+                    .paths
+                    .iter()
+                    .filter_map(|p| p.parent().map(Path::to_path_buf))
+                    .collect();
+                dirs.sort();
+                dirs.dedup();
+                for d in dirs {
+                    for old in me.invalidate_under(&d) {
+                        tracing::info!(target: "agents", "an agent binary changed on disk; new spawns re-resolve it");
+                        let fresh = std::fs::canonicalize(old.realpath.as_str())
+                            .ok()
+                            .and_then(|real| {
+                                let fp = fingerprint_of(&real).ok()?;
+                                let realpath = crate::contract::common::AbsPath::parse(
+                                    real.to_string_lossy().into_owned(),
+                                )
+                                .ok()?;
+                                Some(crate::contract::session::BinaryRef {
+                                    realpath,
+                                    fingerprint: fp,
+                                    version: None,
+                                    pidpath: None,
+                                })
+                            });
+                        if let Some(fresh) = fresh {
+                            for f in me.on_change.read().iter() {
+                                f(&fresh);
+                            }
+                        }
+                    }
+                }
+            };
+            match notify::recommended_watcher(handler) {
+                Ok(w) => *slot = Some(w),
+                Err(err) => {
+                    tracing::warn!(target: "agents", error = %err, "cannot watch agent binaries; changes are caught at the next spawn");
+                    return;
+                }
+            }
+        }
+        if let Some(w) = slot.as_mut() {
+            if let Err(err) = w.watch(&dir, notify::RecursiveMode::NonRecursive) {
+                tracing::debug!(target: "agents", error = %err, "cannot watch a binary directory");
+            }
+        }
+    }
+}
+
+/// The kinds a resolved vendor binary is allowlisted for (contract §9.3:
+/// sessions, sidecar turns, probes, sign-in).
+pub const VENDOR_KINDS: [crate::contract::process::ProcKind; 5] = [
+    crate::contract::process::ProcKind::Convo,
+    crate::contract::process::ProcKind::Pty,
+    crate::contract::process::ProcKind::Attach,
+    crate::contract::process::ProcKind::Turn,
+    crate::contract::process::ProcKind::Vendorcli,
+];
+
+/// `(size, mtime_ms, inode)` of `path` (the `claude_compat_observed` key).
+pub fn fingerprint_of(path: &Path) -> std::io::Result<crate::contract::session::BinaryFingerprint> {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = std::fs::metadata(path)?;
+    Ok(crate::contract::session::BinaryFingerprint {
+        size: meta.len(),
+        mtime_ms: meta.mtime() * 1000 + meta.mtime_nsec() / 1_000_000,
+        inode: meta.ino(),
+    })
+}
+
+/// Resolve the configured binary of a vendor spawn (contract §6.0) [A1]:
+/// realpath + `stat`; a cache hit on the same fingerprint answers at once;
+/// otherwise `<realpath> --version` runs (a `vendorcli` row, 5 s cap), the
+/// realpath is allowlisted for vendor spawns (§9.3) and its directory and the
+/// configured entry's directory are watched. For claude, the version's compat
+/// record is looked up or created (waiting up to 1 s for a first static
+/// canary, `CompatApi::for_binary`).
+///
+/// `argv[0]` of the spawn is `binary.realpath`; the caller records the
+/// `BinaryRef` on the session and adds `pidpath` once the child runs.
+pub async fn resolve_binary(
+    configured: &Path,
+    kind: AgentKind,
+    compat: Option<&dyn crate::contract::services::CompatApi>,
+) -> std::result::Result<ResolvedBinary, crate::contract::IpcError> {
+    BinaryResolver::global().resolve(configured, kind, compat).await
 }
 
 #[cfg(test)]
@@ -1014,7 +1405,7 @@ mod tests {
         let pinned = dir.path().join("pinned/claude");
         write_exec(&bin_dir.join("claude"), "#!/bin/sh\necho path\n");
         write_exec(&pinned, "#!/bin/sh\necho pinned\n");
-        let report = report_for(&[bin_dir.clone()]);
+        let report = report_for(std::slice::from_ref(&bin_dir));
 
         let mut cfg = AppConfig::default();
         cfg.agents
@@ -1130,6 +1521,48 @@ mod tests {
         );
     }
 
+    #[derive(Debug, Default)]
+    struct RefusingRecorder {
+        planned: AtomicUsize,
+    }
+
+    impl SpawnRecorder for Arc<RefusingRecorder> {
+        fn allows(&self, _plan: &ProbePlan) -> bool {
+            false
+        }
+        fn plan(&self, _plan: ProbePlan) -> Option<Box<dyn ProbeGuard>> {
+            self.planned.fetch_add(1, Ordering::SeqCst);
+            None
+        }
+    }
+
+    /// A12.8: a probe the allowlist refuses does not run at all — it never
+    /// falls back to running unregistered.
+    #[tokio::test]
+    async fn a_refused_probe_never_runs_unregistered() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = dir.path().join("bin");
+        let ran = dir.path().join("ran");
+        write_exec(
+            &bin.join("claude"),
+            &format!("#!/bin/sh\ntouch '{}'\nprintf '2.1.263 (Claude Code)\\n'\n", ran.display()),
+        );
+        let refusing = Arc::new(RefusingRecorder::default());
+        let recorder: Recorder = Arc::new(refusing.clone());
+        let report = report_for(&[bin, PathBuf::from("/usr/bin"), PathBuf::from("/bin")]);
+
+        let found = detect(true, &AppConfig::default(), &report, None, &recorder)
+            .await
+            .expect("detect");
+
+        let claude = found.iter().find(|b| b.kind == AgentKind::Claude).expect("claude");
+        assert!(claude.installed && !claude.ok);
+        assert!(claude.version.is_none());
+        assert!(claude.warning.as_deref().is_some_and(|w| w.contains("not allowlisted")));
+        assert!(!ran.exists(), "the refused probe never ran");
+        assert_eq!(refusing.planned.load(Ordering::SeqCst), 0, "nothing was planned either");
+    }
+
     #[tokio::test]
     async fn a_binary_that_cannot_run_is_installed_but_not_ok() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1212,7 +1645,7 @@ mod tests {
     /// it is closed out afterwards.
     ///
     /// `multi_thread` because detection probes on a `spawn_blocking` thread and
-    /// [`SupervisorRecorder`] drives the async `plan_spawn` from there.
+    /// [`SupervisorRecorder`] drives the async `SupervisorApi::plan_spawn` from there.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn probes_land_in_the_real_pid_registry_as_probe_rows() {
         use crate::store::models::{ProcKind, ProcState};
@@ -1249,7 +1682,7 @@ mod tests {
 
         assert!(!rows.is_empty(), "every probe writes a row before it spawns");
         for row in &rows {
-            assert_eq!(row.kind, ProcKind::Probe);
+            assert_eq!(row.kind, ProcKind::Vendorcli);
             assert_eq!(
                 row.state,
                 ProcState::Exited,
@@ -1402,11 +1835,32 @@ mod tests {
         let config = Arc::new(ConfigStore::load(&paths).expect("config"));
         config
             .patch(serde_json::json!({
-                "agents": { "pathOverride": bin.to_string_lossy() }
+                // A38.3: the override is the whole search path (no login
+                // shell, no static ladder), and the Shell row reads this pin,
+                // never `$SHELL`.
+                "agents": { "pathOverride": bin.to_string_lossy() },
+                "terminal": { "shell": "/nonexistent/shell" }
             }))
             .expect("patch");
 
         let registry = AgentRegistry::without_db(paths, config);
+        let floor = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"].map(PathBuf::from);
+        let report = registry.path_report(false);
+        assert_eq!(report.source, PathSource::Override);
+        assert!(
+            report.entries.iter().all(|e| *e == bin || floor.contains(e)),
+            "the pinned search path reaches outside the fixture dir: {:?}",
+            report.entries
+        );
+        let found = registry.detect(false).await.expect("detect");
+        for b in found.iter().filter(|b| b.installed) {
+            assert!(
+                b.abs_path.as_deref().is_some_and(|p| p.starts_with(&bin)),
+                "{} was found (and probed) outside the fixture dir: {:?}",
+                b.kind,
+                b.abs_path
+            );
+        }
         let templates = registry.templates().await.expect("templates");
 
         let claude = templates

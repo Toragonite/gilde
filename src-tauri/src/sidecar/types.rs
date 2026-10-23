@@ -614,21 +614,14 @@ pub struct HostLogParams {
 }
 
 /// Whether a `host.exited` report is the signature of a **deliberate close**
-/// rather than a crash: no exit code at all, plus `SIGKILL`.
-///
-/// T17's note. The duplex usage probe (`sidecar/src/usage.ts`) reads the one
-/// `control_response` line it asked for and then SIGKILLs the child's process
-/// group — a CLI sitting on an open stdin has no other way to be ended, and
-/// waiting for it would hang the probe. Node reports that as
-/// `{ exitCode: null, signal: "SIGKILL" }`, which by shape alone is
-/// indistinguishable from a crash.
-///
-/// Callers that settle a run must not read this pair as a failure: the answer
-/// was already on stdout before the signal went out. The registry row still
-/// records signal 9 — that is what happened to the process — but the *run* is
-/// whatever its output said it was.
+/// rather than a crash: no exit code at all, plus the SIGTERM the sidecar's
+/// seam sends a child it has finished with (the duplex usage probe after it read
+/// its `control_response`; a cancelled turn). Since protocol 2 the seam never
+/// sends SIGKILL to a vendor CLI (contract §9.8, C5); a SIGKILL here was sent by
+/// someone else. The registry row records the signal either way; this only
+/// decides how the event is logged.
 pub fn is_deliberate_close(exit_code: Option<i32>, signal: Option<&str>) -> bool {
-    exit_code.is_none() && signal == Some("SIGKILL")
+    exit_code.is_none() && signal == Some("SIGTERM")
 }
 
 /// Map a Node signal name to its number, for the registry row.
@@ -1206,11 +1199,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_sigkill_with_no_exit_code_reads_as_a_deliberate_close_not_a_crash() {
-        // What the duplex usage probe leaves behind (T17 note).
-        assert!(is_deliberate_close(None, Some("SIGKILL")));
-        // A real crash carries a code, or a different signal, or both.
-        assert!(!is_deliberate_close(Some(1), Some("SIGKILL")));
+    fn a_sigterm_with_no_exit_code_reads_as_a_deliberate_close_not_a_crash() {
+        // What the duplex usage probe leaves behind since protocol 2 (C5: never SIGKILL).
+        assert!(is_deliberate_close(None, Some("SIGTERM")));
+        // A SIGKILL is never ours any more; a real crash carries a code, or a
+        // different signal, or both.
+        assert!(!is_deliberate_close(None, Some("SIGKILL")));
+        assert!(!is_deliberate_close(Some(1), Some("SIGTERM")));
         assert!(!is_deliberate_close(Some(0), None));
         assert!(!is_deliberate_close(None, Some("SIGSEGV")));
         assert!(!is_deliberate_close(None, None));

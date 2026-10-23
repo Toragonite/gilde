@@ -1,269 +1,157 @@
 /**
- * UI slice tests — the layout contract (T05 acceptance 3) and the tab/pane
- * model that the keyboard layer drives (acceptance 4, 7).
+ * The UI slice: main-view history, Split, zoom, the ⌘J chain, bootstrap
+ * hydration of untrusted persisted values.
  */
 
-import { assert, assertEqual, test } from '../test/harness';
-import { setExperimentalLanesForTests } from '../features';
-import { resolveLocale } from '../i18n';
-import type { AppConfig } from '../lib/ipc';
-import { useAppStore } from './useAppStore';
-import {
-  cancelPersistLayout,
-  INSPECTOR_MAX,
-  INSPECTOR_MIN,
-  SIDEBAR_MAX,
-  SIDEBAR_MIN,
-  initialUiState,
-  pickPersistedLayout,
-  viewTabTitleKey,
-} from './uiSlice';
+import type { AppBootstrapRes } from '../lib/gen/AppBootstrapRes';
+import { queueItem, uid } from '../test/fixtures';
+import { assert, assertDeepEqual, assertEqual, test } from '../test/harness';
+import { MAX_SPLIT, MAX_VIEW_HISTORY, chainStep, clampZoom, parseSplit, parseTeamLayout, parseView } from './uiSlice';
+import { createAppStore } from './useAppStore';
 
-/** Run `body` with the experimental lanes forced on or off, then restore. */
-function withLanes(on: boolean, body: () => void): void {
-  setExperimentalLanesForTests(on);
-  try {
-    body();
-  } finally {
-    setExperimentalLanesForTests(null);
-  }
+function bootstrap(extra: Partial<AppBootstrapRes> = {}): AppBootstrapRes {
+  return {
+    buildId: 'b1',
+    version: '2.0.0',
+    locale: 'en',
+    theme: 'dark',
+    launch: { kind: 'restore' },
+    uiState: {},
+    platform: { macosMajor: 15, arm64: true },
+    features: { orchestrator: true },
+    compat: [],
+    ...extra,
+  };
 }
 
-function reset(): void {
-  // Layout writes are debounced; drop anything a previous test queued so no
-  // `app_settings_set` fires after the run finishes.
-  cancelPersistLayout();
-  useAppStore.setState({ ui: initialUiState() });
-}
-
-function configWith(layout: unknown): AppConfig {
-  return { layout } as unknown as AppConfig;
-}
-
-test('sidebar and inspector widths are clamped to the design range', () => {
-  reset();
-  const store = useAppStore.getState();
-  store.setSidebarWidth(10);
-  assertEqual(useAppStore.getState().ui.sidebarWidth, SIDEBAR_MIN, 'below the minimum clamps up');
-  store.setSidebarWidth(9999);
-  assertEqual(useAppStore.getState().ui.sidebarWidth, SIDEBAR_MAX, 'above the maximum clamps down');
-  store.setInspectorWidth(0);
-  assertEqual(useAppStore.getState().ui.inspectorWidth, INSPECTOR_MIN, 'inspector minimum');
-  store.setInspectorWidth(10_000);
-  assertEqual(useAppStore.getState().ui.inspectorWidth, INSPECTOR_MAX, 'inspector maximum');
+test('⌘[ / ⌘] walk the main-view history; a new view clears forward', () => {
+  const store = createAppStore();
+  const s = () => store.getState();
+  s().navigate({ screen: 'history' });
+  s().openSession(uid(1));
+  s().setSessionSub('changes');
+  assertDeepEqual(s().ui.view, { screen: 'session', uid: uid(1), sub: 'changes' }, 'sub-view switch is not a history step');
+  s().goBack();
+  assertEqual(s().ui.view.screen, 'history', 'back');
+  s().goBack();
+  assertEqual(s().ui.view.screen, 'home', 'back to home');
+  s().goBack();
+  assertEqual(s().ui.view.screen, 'home', 'nothing further back');
+  s().goForward();
+  assertEqual(s().ui.view.screen, 'history', 'forward');
+  s().navigate({ screen: 'floor' });
+  assertEqual(s().ui.forward.length, 0, 'a new view clears forward');
+  s().navigate({ screen: 'floor' });
+  assertEqual(s().ui.back[s().ui.back.length - 1]?.screen, 'history', 'the same view twice is one entry');
+  for (let i = 0; i < MAX_VIEW_HISTORY + 20; i++) s().navigate(i % 2 ? { screen: 'home' } : { screen: 'history' });
+  assertEqual(s().ui.back.length, MAX_VIEW_HISTORY, 'history is bounded');
 });
 
-test('the layout round-trips through config.layout (experimental lanes on)', () => withLanes(true, () => {
-  reset();
-  const store = useAppStore.getState();
-  store.setSidebarWidth(340);
-  store.setInspectorWidth(400);
-  store.toggleDrawer();
-  store.setDrawerTab('monitor');
-  store.setActiveView('graph');
-  store.setSplit(4);
-  store.toggleSidebar();
-
-  const saved = pickPersistedLayout(useAppStore.getState().ui);
-  assertEqual(saved.sidebarWidth, 340, 'width is a declared LayoutConfig field');
-  assertEqual(saved.panes.split, 4, 'the split lives in the free-form panes slot');
-  assertEqual(saved.panes.drawerTab, 'monitor', 'the drawer tab is remembered');
-  assertEqual(saved.panes.sidebarVisible, false, 'sidebar visibility is remembered');
-
-  // A fresh launch reads it back.
-  reset();
-  useAppStore.getState().hydrateFromConfig(configWith(saved));
-  const ui = useAppStore.getState().ui;
-  assertEqual(ui.sidebarWidth, 340, 'width restored');
-  assertEqual(ui.inspectorWidth, 400, 'inspector width restored');
-  assertEqual(ui.drawerOpen, true, 'drawer restored');
-  assertEqual(ui.drawerTab, 'monitor', 'drawer tab restored');
-  assertEqual(ui.activeView, 'graph', 'active view restored');
-  assertEqual(ui.panes.split, 4, 'split restored');
-  assertEqual(ui.panes.slots.length, 4, 'four pane slots exist');
-  assertEqual(ui.sidebarVisible, false, 'sidebar visibility restored');
-  assertEqual(ui.hydrated, true, 'the store is marked hydrated');
-}));
-
-test('the app opens on Team, with the inspector closed and no drawer', () => {
-  const ui = initialUiState();
-  assertEqual(ui.activeView, 'team', 'the default view is Team');
-  assertEqual(ui.inspectorOpen, false, 'the inspector starts closed (F5)');
-  assertEqual(ui.drawerOpen, false, 'no drawer');
-  assertEqual(ui.localePref, 'system', 'the language follows the system until chosen');
-  assertEqual(viewTabTitleKey({ view: 'team' }), 'view.team', 'a view tab is titled from its key');
-  assertEqual(viewTabTitleKey({ view: 'terminal', sessionId: 's' }), null, 'a terminal tab keeps its own title');
+test('Split holds at most 6; closing a focused tile focuses the previous one', () => {
+  const store = createAppStore();
+  const s = () => store.getState();
+  for (let i = 1; i <= MAX_SPLIT; i++) assert(s().addToSplit(uid(i)), `tile ${i} added`);
+  assertEqual(s().addToSplit(uid(7)), false, 'the 7th is refused');
+  assertEqual(s().addToSplit(uid(3)), true, 'adding a present uid is a no-op success');
+  assertEqual(s().ui.split.uids.length, MAX_SPLIT, 'still 6');
+  s().setSplitFocus(uid(4));
+  s().toggleSplitZoom(uid(4));
+  s().removeFromSplit(uid(4));
+  assertEqual(s().ui.split.focused, uid(3), 'focus moved to the previous tile in reading order');
+  assertEqual(s().ui.split.zoomed, null, 'zoom cleared with its tile');
+  s().setSplitFocus(uid(9));
+  assertEqual(s().ui.split.focused, uid(3), 'a uid outside the Split cannot take focus');
 });
 
-test('the preview never enters or restores a hidden lane', () => withLanes(false, () => {
-  reset();
-  useAppStore.getState().setActiveView('graph');
-  assertEqual(useAppStore.getState().ui.activeView, 'team', 'setActiveView refuses a hidden lane');
-  useAppStore.getState().toggleDrawer();
-  assertEqual(useAppStore.getState().ui.drawerOpen, false, 'the drawer never opens in the preview');
+test('zoom stays within 80–200 %', () => {
+  assertEqual(clampZoom(0.1), 0.8, 'min');
+  assertEqual(clampZoom(5), 2, 'max');
+  assertEqual(clampZoom(Number.NaN), 1, 'NaN resets');
+  const store = createAppStore();
+  store.getState().zoomBy(3);
+  assertEqual(store.getState().ui.zoom, 1.3, 'three steps up');
+  store.getState().zoomBy(-20);
+  assertEqual(store.getState().ui.zoom, 0.8, 'clamped');
+});
 
-  // A layout saved by an experimental build: a graph view, a terminal tab, an
-  // open drawer on the old Events tab.
-  reset();
-  useAppStore.getState().hydrateFromConfig(
-    configWith({
-      panes: {
-        activeView: 'graph',
-        drawerOpen: true,
-        drawerTab: 'events',
-        tabs: [
-          { id: 'tab-3', title: 'claude', descriptor: { view: 'terminal', sessionId: 's1' }, closable: true },
-          { id: 'tab-4', title: 'team', descriptor: { view: 'team' }, closable: true },
-          { id: 'tab-5', title: 'settings', descriptor: { view: 'settings' }, closable: true },
-        ],
-        slots: ['tab-3'],
+test('⌘J chain: next item, the handled item\'s slot, and back to the origin at the end', () => {
+  const items = [queueItem(1), queueItem(2), queueItem(3)];
+  const store = createAppStore();
+  const s = () => store.getState();
+  s().navigate({ screen: 'history' });
+  assertEqual(s().chainStep(items, 1)?.key, items[0]?.key, 'first ⌘J goes to the top item');
+  assertDeepEqual(s().ui.view, { screen: 'session', uid: uid(1), sub: 'conversation' }, 'opens its session');
+  assertEqual(s().ui.focusCard?.uid, uid(1), 'asks its card to take focus');
+  assertEqual(s().chainStep(items, 1)?.key, items[1]?.key, 'next');
+  // Item 2 was handled; the queue moved up. Next is the item now in its slot.
+  const after = [queueItem(1), queueItem(3)];
+  assertEqual(s().chainStep(after, 1)?.key, items[2]?.key, 'the item that took the handled slot');
+  assertEqual(s().chainStep(after, 1), null, 'past the end');
+  assertEqual(s().ui.view.screen, 'history', 'back where the chain started');
+  assertEqual(s().ui.chain, null, 'chain ended');
+  assertEqual(s().chainStep([], 1), null, 'an empty queue does nothing');
+});
+
+test('⌘J chain: leftovers open Accounts & health; answerIn routes to the lead', () => {
+  const lo = queueItem(9, 6, { key: 'q_leftovers', subject: { kind: 'leftovers', count: 2, bytes: 10 } });
+  const member = queueItem(5, 1, { subject: { kind: 'session', uid: uid(5), onBehalfOf: null, answerIn: uid(6) } });
+  const r1 = chainStep([member, lo], null, 1);
+  assertEqual(r1?.item.key, member.key, 'pure step');
+  const store = createAppStore();
+  store.getState().chainStep([member, lo], 1);
+  assertDeepEqual(store.getState().ui.view, { screen: 'session', uid: uid(6), sub: 'conversation' }, 'the lead that shows the card');
+  store.getState().chainStep([member, lo], 1);
+  assertDeepEqual(store.getState().ui.view, { screen: 'accounts', section: 'health' }, 'leftovers');
+  store.getState().chainStep([member, lo], -1);
+  assertEqual(store.getState().ui.view.screen, 'session', 'previous');
+  store.getState().navigate({ screen: 'floor' });
+  assertEqual(store.getState().ui.chain, null, 'any other navigation ends the chain');
+});
+
+test('bootstrap hydrates locale, theme and validated persisted values', () => {
+  const store = createAppStore();
+  store.getState().hydrateFromBootstrap(
+    bootstrap({
+      uiState: {
+        lastView: { screen: 'team', teamKey: 'team-1', mode: 'board' },
+        splitSet: { uids: [uid(1), uid(1), 'not-a-uid', uid(2), 7], focused: uid(2) },
+        homeMode: 'classic',
+        'teamLayout:team-1': { mode: 'floor', focused: 'm-1', zoomed: 42 },
+        sidebarFolds: { a: true },
       },
     }),
   );
-  const ui = useAppStore.getState().ui;
-  assertEqual(ui.activeView, 'team', 'a hidden saved view falls back to Team');
-  assertEqual(ui.drawerOpen, false, 'the drawer stays closed');
-  assertEqual(ui.drawerTab, 'monitor', 'the removed Events tab is not restored');
-  assertEqual(ui.tabs.map((tab) => tab.id).join(','), 'tab-4', 'only the Team tab survives');
-  assertEqual(ui.panes.slots[0].tabId, null, 'a slot that pointed at a dropped tab is empty');
-}));
+  const ui = store.getState().ui;
+  assertEqual(ui.locale, 'en', 'locale');
+  assertEqual(ui.theme, 'dark', 'theme');
+  assert(ui.hydrated, 'hydrated');
+  assertDeepEqual(ui.view, { screen: 'team', teamKey: 'team-1', mode: 'board' }, 'last view restored on a restore launch');
+  assertDeepEqual(ui.split.uids, [uid(1), uid(2)], 'malformed and duplicate uids dropped');
+  assertEqual(ui.split.focused, uid(2), 'focus kept');
+  assertEqual(ui.homeMode, 'classic', 'home mode');
+  assertDeepEqual(ui.teamLayouts['team-1'], { mode: 'floor', focused: 'm-1', zoomed: null, leadRatio: null, tileOrder: null }, 'team layout validated');
+  assertDeepEqual(ui.sidebarFolds, { a: true }, 'opaque value kept');
 
-test('the experimental flag restores the lanes', () => withLanes(true, () => {
-  reset();
-  useAppStore.getState().setActiveView('graph');
-  assertEqual(useAppStore.getState().ui.activeView, 'graph', 'with the lanes on the graph is reachable');
-  useAppStore.getState().hydrateFromConfig(
-    configWith({
-      panes: {
-        activeView: 'sessions',
-        tabs: [{ id: 'tab-3', title: 'claude', descriptor: { view: 'terminal', sessionId: 's1' }, closable: true }],
-        slots: ['tab-3'],
-      },
-    }),
-  );
-  assertEqual(useAppStore.getState().ui.activeView, 'sessions', 'a saved lane view is restored');
-  assertEqual(useAppStore.getState().ui.tabs.length, 1, 'and its terminal tab');
-}));
-
-test('locale "system" resolves from the OS language; an explicit choice wins (F1)', () => {
-  assertEqual(resolveLocale('system', 'ko-KR'), 'ko', 'ko-KR → Korean');
-  assertEqual(resolveLocale('system', 'ko'), 'ko', 'bare ko → Korean');
-  assertEqual(resolveLocale('system', 'en-US'), 'en', 'en-US → English');
-  assertEqual(resolveLocale('system', 'de-DE'), 'en', 'anything else → English');
-  assertEqual(resolveLocale(undefined, 'ko-KR'), 'ko', 'a missing value follows the system');
-  assertEqual(resolveLocale('fr', 'en-US'), 'en', 'an unknown value follows the system');
-  assertEqual(resolveLocale('en', 'ko-KR'), 'en', 'an explicit en beats a Korean system');
-  assertEqual(resolveLocale('ko', 'en-US'), 'ko', 'an explicit ko beats an English system');
-
-  reset();
-  // The test environment's navigator says ko-KR.
-  useAppStore.getState().hydrateFromConfig({ locale: 'system' } as unknown as AppConfig);
-  assertEqual(useAppStore.getState().ui.locale, 'ko', 'system → the OS language');
-  assertEqual(useAppStore.getState().ui.localePref, 'system', 'and the preference stays system');
-  useAppStore.getState().hydrateFromConfig({ locale: 'en' } as unknown as AppConfig);
-  assertEqual(useAppStore.getState().ui.locale, 'en', 'an old config with an explicit en keeps it');
-  useAppStore.getState().hydrateFromConfig({} as unknown as AppConfig);
-  assertEqual(useAppStore.getState().ui.locale, 'ko', 'no locale at all → the OS language');
-  reset();
+  const other = createAppStore();
+  other.getState().hydrateFromBootstrap(bootstrap({ launch: { kind: 'homeAfter8h' }, uiState: { lastView: { screen: 'history' } } }));
+  assertEqual(other.getState().ui.view.screen, 'home', 'other launch kinds open Home');
 });
 
-test('hydrating from a config without a layout keeps the defaults', () => {
-  reset();
-  useAppStore.getState().hydrateFromConfig(configWith(undefined));
-  const ui = useAppStore.getState().ui;
-  assertEqual(ui.sidebarWidth, 300, 'default width survives');
-  assertEqual(ui.panes.split, 1, 'default split survives');
+test('parsers reject malformed persisted values', () => {
+  assertDeepEqual(parseView(null), { screen: 'home' }, 'null');
+  assertDeepEqual(parseView({ screen: 'session', uid: '../etc' }), { screen: 'home' }, 'bad uid');
+  assertDeepEqual(parseView({ screen: 'session', uid: uid(1), sub: 'bogus' }), { screen: 'session', uid: uid(1), sub: 'conversation' }, 'bad sub');
+  assertDeepEqual(parseView({ screen: 'accounts', section: 'x' }), { screen: 'accounts', section: 'accounts' }, 'bad section');
+  assertDeepEqual(parseView({ screen: 'nope' }), { screen: 'home' }, 'unknown screen');
+  assertEqual(parseSplit(Array.from({ length: 10 }, (_, i) => uid(i + 1))).uids.length, MAX_SPLIT, 'capped at 6');
+  assertDeepEqual(parseSplit('x'), { uids: [], focused: null, zoomed: null }, 'not a list');
+  assertDeepEqual(parseTeamLayout([]), { mode: 'panes', focused: null, zoomed: null, leadRatio: null, tileOrder: null }, 'not an object');
 });
 
-test('tabs open into the active pane and survive a split change', () => {
-  reset();
-  const store = useAppStore.getState();
-  const a = store.openTab({ title: 'a', descriptor: { view: 'graph' }, closable: true });
-  const b = store.openTab({ title: 'b', descriptor: { view: 'monitor' }, closable: true });
-
-  let ui = useAppStore.getState().ui;
-  assertEqual(ui.tabs.length, 2, 'both tabs exist');
-  assertEqual(ui.panes.slots[0].tabId, b, 'the newest tab took the active pane');
-
-  useAppStore.getState().setSplit(2);
-  ui = useAppStore.getState().ui;
-  assertEqual(ui.panes.slots.length, 2, 'a second slot appeared');
-  assertEqual(ui.panes.slots[0].tabId, b, 'the first slot kept its tab');
-  assertEqual(ui.panes.slots[1].tabId, null, 'the new slot starts empty');
-
-  useAppStore.getState().assignTab('pane-2', a);
-  ui = useAppStore.getState().ui;
-  assertEqual(ui.panes.slots[1].tabId, a, 'the tab moved into the second pane');
-  assertEqual(ui.activePaneId, 'pane-2', 'assigning also focuses the pane');
-});
-
-test('focusTabIndex and cycleTab drive the cmd+1..9 and cmd+alt+arrow bindings', () => {
-  reset();
-  const store = useAppStore.getState();
-  const a = store.openTab({ title: 'a', descriptor: { view: 'graph' }, closable: true });
-  const b = store.openTab({ title: 'b', descriptor: { view: 'monitor' }, closable: true });
-
-  useAppStore.getState().focusTabIndex(0);
-  assertEqual(useAppStore.getState().ui.panes.slots[0].tabId, a, 'cmd+1 focuses the first tab');
-
-  useAppStore.getState().cycleTab(1);
-  assertEqual(useAppStore.getState().ui.panes.slots[0].tabId, b, 'cycling forward moves on');
-
-  useAppStore.getState().cycleTab(1);
-  assertEqual(useAppStore.getState().ui.panes.slots[0].tabId, a, 'cycling wraps around');
-
-  useAppStore.getState().focusTabIndex(8);
-  assertEqual(useAppStore.getState().ui.panes.slots[0].tabId, a, 'an out-of-range index is a no-op');
-});
-
-test('closing the active pane closes its tab and re-points the slot', () => {
-  reset();
-  const store = useAppStore.getState();
-  const a = store.openTab({ title: 'a', descriptor: { view: 'graph' }, closable: true });
-  store.openTab({ title: 'b', descriptor: { view: 'monitor' }, closable: true });
-
-  useAppStore.getState().closeActivePane();
-  const ui = useAppStore.getState().ui;
-  assertEqual(ui.tabs.length, 1, 'one tab was closed');
-  assertEqual(ui.tabs[0].id, a, 'the remaining tab is the other one');
-  assertEqual(ui.panes.slots[0].tabId, a, 'the slot fell back to the remaining tab');
-});
-
-test('a session status update reaches every tab bound to that session', () => {
-  reset();
-  const store = useAppStore.getState();
-  store.openTab({
-    title: 'claude',
-    descriptor: { view: 'terminal', sessionId: 's-1' },
-    closable: true,
-  });
-  store.openTab({
-    title: 'codex',
-    descriptor: { view: 'terminal', sessionId: 's-2' },
-    closable: true,
-  });
-
-  useAppStore.getState().updateSessionTabs('s-1', { status: 'waiting' });
-  const tabs = useAppStore.getState().ui.tabs;
-  assertEqual(tabs[0].status, 'waiting', 'the matching tab took the status');
-  assert(tabs[1].status === undefined, 'the other session was untouched');
-});
-
-test('escape-driven overlays open and close as one group', () => {
-  reset();
-  const store = useAppStore.getState();
-  store.setPaletteOpen(true);
-  store.setHelpOpen(true);
-  assert(useAppStore.getState().ui.paletteOpen, 'the palette is open');
-  useAppStore.getState().closeOverlays();
-  const ui = useAppStore.getState().ui;
-  assert(
-    !ui.paletteOpen && !ui.helpOpen && !ui.switcherOpen && !ui.settingsOpen,
-    'closeOverlays clears all of them',
-  );
-});
-
-test('pending layout writes can be cancelled on teardown', () => {
-  cancelPersistLayout();
-  assert(true, 'cancelling a pending debounce is safe when nothing is queued');
+test('drafts are per session and clear', () => {
+  const store = createAppStore();
+  store.getState().setDraft(uid(1), 'a');
+  store.getState().setDraft(uid(2), 'b');
+  store.getState().clearDraft(uid(1));
+  assertDeepEqual(store.getState().ui.drafts, { [uid(2)]: 'b' }, 'one left');
 });

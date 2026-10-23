@@ -18,7 +18,8 @@
 //! Read-only and bounded. Every git call: an argv (never a shell), `git -C`,
 //! `GIT_OPTIONAL_LOCKS=0` + `GIT_TERMINAL_PROMPT=0`, its own process group, a
 //! [`GIT_DEADLINE`] after which the group is killed, and the write-before-spawn
-//! hook like every other git spawn (`worktree::git::plan_spawn`). Answers are
+//! registration like every other git spawn — it runs through the one git
+//! launcher, `worktree::git::exec_env` (A17.3). Answers are
 //! cached per path for [`CACHE_TTL`]; an answer that could not be read in time
 //! (`unknown`) is never cached, so the next call tries again.
 //!
@@ -36,16 +37,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use tokio::process::Command;
 use tokio::task::JoinSet;
 
 use crate::error::{CmdResult, GildeError, GildeErrorPayload};
-use crate::worktree::git::{git_binary, plan_spawn};
+use crate::worktree::git::{exec_env, ExecOpts, GitError};
 
 /// Wall-clock cap on one git call here. These are local, read-only queries
 /// that answer in milliseconds; a slow one is a stuck filesystem, and the UI
@@ -237,70 +236,40 @@ impl GitAnswer {
     }
 }
 
-/// `git -C <cwd> <args…>`; `None` when it could not be run or ran past the deadline.
+/// Every exit code is an answer here (`128` = not a repository, `1` = no
+/// such key); only a spawn failure or the deadline is "no answer".
+const ANY_EXIT: &[i32] = &[0, 1, 2, 3, 4, 5, 6, 128, 129];
+
+/// `git -C <cwd> <args…>` through the one git launcher (registration, own
+/// group, `GIT_OPTIONAL_LOCKS=0` + `GIT_TERMINAL_PROMPT=0`, the group killed at
+/// the deadline); `None` when it could not be run or ran past the deadline.
 async fn git_read(cwd: &Path, args: &[&str], env: &ProbeEnv) -> Option<GitAnswer> {
-    let mut argv: Vec<String> = Vec::with_capacity(args.len() + 3);
-    argv.push(git_binary().to_string_lossy().into_owned());
-    argv.push("-C".into());
-    argv.push(cwd.to_string_lossy().into_owned());
-    argv.extend(args.iter().map(|a| (*a).to_string()));
-    let ticket = plan_spawn("git", &argv, cwd).await;
-
-    let mut cmd = Command::new(git_binary());
-    cmd.arg("-C").arg(cwd).args(args);
-    cmd.env("GIT_OPTIONAL_LOCKS", "0");
-    cmd.env("GIT_TERMINAL_PROMPT", "0");
-    for (key, value) in &env.vars {
-        cmd.env(key, value);
-    }
-    if let Some(t) = ticket.as_deref() {
-        cmd.env("GILDE_SPAWN_ID", t.env_marker());
-    }
-    cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::null());
-    cmd.process_group(0);
-    cmd.kill_on_drop(true);
-
-    let child = cmd.spawn().ok()?;
-    let pid = child.id().map(|p| p as i32);
-    if let (Some(t), Some(pid)) = (ticket.as_deref(), pid) {
-        t.mark_running(pid, pid);
-    }
-    match tokio::time::timeout(env.deadline, child.wait_with_output()).await {
-        Ok(Ok(output)) => {
-            if let Some(t) = ticket.as_deref() {
-                t.mark_exited(output.status.code(), exit_signal(&output.status));
-            }
-            Some(GitAnswer {
-                code: output.status.code().unwrap_or(-1),
-                stdout: output.stdout,
-            })
-        }
-        Ok(Err(_)) => None,
-        Err(_) => {
-            if let Some(pid) = pid {
-                kill_group(pid);
-            }
-            if let Some(t) = ticket.as_deref() {
-                t.mark_exited(None, Some(libc::SIGKILL));
-            }
+    let opts = ExecOpts {
+        allowed: ANY_EXIT,
+        timeout: env.deadline,
+        stdin: None,
+        stdout_cap: ANSWER_CAP,
+    };
+    match exec_env(cwd, args, opts, &env.vars).await {
+        Ok(out) => Some(GitAnswer {
+            code: out.code,
+            stdout: out.stdout,
+        }),
+        // An exit code outside `ANY_EXIT` is still an answer (never 0).
+        Err(GitError::Failed { code, .. }) => Some(GitAnswer {
+            code,
+            stdout: Vec::new(),
+        }),
+        Err(GitError::Timeout) => {
             tracing::debug!(target: "git", cwd = %cwd.display(), "repo identity probe ran past its deadline");
             None
         }
+        Err(GitError::Spawn(_)) | Err(GitError::TooLarge) => None,
     }
 }
 
-fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
-    use std::os::unix::process::ExitStatusExt as _;
-    status.signal()
-}
-
-fn kill_group(pid: i32) {
-    use nix::sys::signal::{killpg, Signal};
-    use nix::unistd::Pid;
-    let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
-}
+/// stdout kept per answer: these are one-line answers.
+const ANSWER_CAP: usize = 64 * 1024;
 
 async fn canonical(path: &str) -> PathBuf {
     let raw = PathBuf::from(path);
@@ -490,6 +459,8 @@ pub async fn repo_identity(paths: Vec<String>) -> CmdResult<Vec<RepoIdentity>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worktree::git::git_binary;
+    use std::process::Stdio;
 
     // -- normalization ------------------------------------------------------
 

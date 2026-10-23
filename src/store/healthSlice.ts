@@ -1,224 +1,67 @@
 /**
- * Health slice — "is everything running well" (gilde://health).
- *
- * Rust builds a `HealthSnapshot` on every watchdog tick (5 s) from the scan it
- * already takes, and decides every alert. This slice only keeps the newest
- * snapshot and turns alerts into the two things the user sees besides the
- * status-bar indicator and the popover:
- *
- *  1. **One sticky toast per `action` alert raise.** A toast is keyed by
- *     `(id, raisedAt)`: an alert that holds is updated in place by Rust and is
- *     not toasted again; one that is re-raised (after a dismissal cooldown, or
- *     because its severity rose) carries a new `raisedAt` and is toasted once
- *     more. `attention` alerts never toast — they only colour the indicator.
- *     When an alert ends, is dismissed, or is no longer `action`, its toast goes.
- *     The same moment — and only then — is when a system notification may be
- *     posted (`lib/notify.ts`: setting on, window not focused, macOS allows
- *     it). It runs on its own and can never hold up or break the toast.
- *  2. **Actions.** Copy command (clipboard), Details / Show agents (the
- *     popover), Clean up (the existing kill sheet, restricted by Rust to the
- *     confirmed leftovers via `onlyHealthOrphans`).
- *
- * Dismissing goes to Rust (`health_dismiss`), which owns the 10-minute quiet
- * period; the answer is applied as the new snapshot.
+ * Health — what the Accounts & health screen and the sidebar footer summarise
+ * (ux-ia §3.15, §2.4 footer). Health alerts and notifications are Rust's now
+ * (contract §2.2.4); the WebView keeps only its popover state and derives the
+ * figures from the World mirror, so every surface shows the same numbers.
  */
 
 import type { StateCreator } from 'zustand';
 
-import { cmd, isUnavailable } from '../lib/commands';
-import { notifyHealthAlert } from '../lib/notify';
-import type { HealthAction, HealthAlert, HealthSnapshot } from '../lib/ipc';
-import { cleanUpAgents } from '../shell/healthText';
-import type { ProcSlice } from './procSlice';
-import type { ToastSlice } from './toastSlice';
-import type { UiSlice } from './uiSlice';
+import type { SourceStatus } from '../lib/gen/SourceStatus';
+import type { WorldState } from './worldSlice';
 
 export interface HealthState {
-  /** The newest snapshot; null before the first `health_get` / event. */
-  snapshot: HealthSnapshot | null;
   popoverOpen: boolean;
-  /** `${id}@${raisedAt}` of every alert raise already toasted. */
-  toasted: Set<string>;
-  /** alert id → the toast showing it now. */
-  toastOf: Map<string, number>;
 }
 
 export interface HealthSlice {
   health: HealthState;
-  /** Fold one snapshot in (the event, `health_get`, `health_dismiss`). */
-  applyHealth: (snapshot: HealthSnapshot) => void;
-  /** `health_get` once (boot). Never throws. */
-  loadHealth: () => Promise<void>;
   setHealthPopover: (open: boolean) => void;
-  /** Dismiss in Rust (10 min quiet unless it escalates) and drop its toast. Never throws. */
-  dismissHealthAlert: (id: string) => Promise<void>;
-  /** Run one action of one alert. Never throws. */
-  runHealthAction: (alert: HealthAlert, action: HealthAction) => Promise<void>;
 }
 
-export function initialHealthState(): HealthState {
-  return { snapshot: null, popoverOpen: false, toasted: new Set(), toastOf: new Map() };
-}
+export const createHealthSlice: StateCreator<HealthSlice, [['zustand/subscribeWithSelector', never]], [], HealthSlice> = (
+  set,
+) => ({
+  health: { popoverOpen: false },
+  setHealthPopover: (open) => set({ health: { popoverOpen: open } }),
+});
 
-export function raiseKey(alert: HealthAlert): string {
-  return `${alert.id}@${alert.raisedAt}`;
-}
-
-/** Whether an alert should be on screen as a toast now. */
-export function wantsToast(alert: HealthAlert): boolean {
-  return alert.severity === 'action' && !alert.dismissed;
-}
-
-/**
- * Copy text to the clipboard: the async Clipboard API first, then the old
- * hidden-textarea path. Resolves `false` when neither worked.
- */
-export async function copyText(text: string): Promise<boolean> {
-  try {
-    const clipboard = (globalThis.navigator as Navigator | undefined)?.clipboard;
-    if (clipboard && typeof clipboard.writeText === 'function') {
-      await clipboard.writeText(text);
-      return true;
-    }
-  } catch {
-    // fall through to the textarea path
+/** Leftover processes (§3.4.10 `leftover`): count and resident bytes. */
+export function leftoverSummary(world: WorldState): { count: number; bytes: number } {
+  let count = 0;
+  let bytes = 0;
+  for (const p of world.leftovers.values()) {
+    if (p.leftover === null) continue;
+    count += 1;
+    bytes += p.rssBytes;
   }
-  try {
-    if (typeof document === 'undefined') return false;
-    const area = document.createElement('textarea');
-    area.value = text;
-    area.setAttribute('readonly', '');
-    area.style.position = 'fixed';
-    area.style.opacity = '0';
-    document.body.appendChild(area);
-    area.select();
-    const ok = document.execCommand('copy');
-    document.body.removeChild(area);
-    return ok;
-  } catch {
-    return false;
-  }
+  return { count, bytes };
 }
 
-export const createHealthSlice: StateCreator<
-  HealthSlice & ToastSlice & ProcSlice & UiSlice,
-  [['zustand/subscribeWithSelector', never]],
-  [],
-  HealthSlice
-> = (set, get) => {
-  const patch = (update: Partial<HealthState>) => set({ health: { ...get().health, ...update } });
-
-  /** The OS notification for a raise that was just toasted. Fire and forget; it never throws. */
-  const postSystemNotification = (alert: HealthAlert) => {
-    try {
-      const ui = get().ui;
-      void notifyHealthAlert(alert, { locale: ui.locale, enabled: ui.systemNotifications !== false }).catch(
-        () => undefined,
-      );
-    } catch (e) {
-      console.warn('[gilde] notify: not started', e);
+/** Memory of the agents shown (sum of known session memory; unknown stays out, never 0-filled). */
+export function agentMemory(world: WorldState): { bytes: number; known: number; unknown: number } {
+  let bytes = 0;
+  let known = 0;
+  let unknown = 0;
+  for (const s of world.sessions.values()) {
+    if (s.control.kind === 'notRunning') continue;
+    if (s.memoryBytes === null) unknown += 1;
+    else {
+      bytes += s.memoryBytes;
+      known += 1;
     }
-  };
+  }
+  return { bytes, known, unknown };
+}
 
-  return {
-    health: initialHealthState(),
+/** Running sessions (any control other than NotRunning). */
+export function runningCount(world: WorldState): number {
+  let n = 0;
+  for (const s of world.sessions.values()) if (s.control.kind !== 'notRunning') n += 1;
+  return n;
+}
 
-    applyHealth: (snapshot) => {
-      if (!snapshot || !Array.isArray(snapshot.alerts)) return;
-      const held = get().health;
-      // An older snapshot (a slow `health_get` answering after an event) is ignored.
-      if (held.snapshot && snapshot.at < held.snapshot.at) return;
-
-      const toasted = new Set(held.toasted);
-      const toastOf = new Map(held.toastOf);
-      const byId = new Map(snapshot.alerts.map((a) => [a.id, a]));
-
-      // Toasts whose alert ended, was dismissed, or is no longer `action`.
-      for (const [id, toastId] of held.toastOf) {
-        const alert = byId.get(id);
-        if (!alert || !wantsToast(alert)) {
-          get().dismissToast(toastId);
-          toastOf.delete(id);
-        }
-      }
-      for (const alert of snapshot.alerts) {
-        if (!wantsToast(alert)) continue;
-        const key = raiseKey(alert);
-        if (toasted.has(key)) continue;
-        toasted.add(key);
-        const previous = toastOf.get(alert.id);
-        if (previous !== undefined) get().dismissToast(previous);
-        const id = get().pushToast({
-          level: 'error',
-          key: alert.titleKey,
-          params: {},
-          detail: null,
-          actionId: null,
-          undoToken: null,
-          ttlMs: 0,
-          healthAlertId: alert.id,
-          actions: alert.actions,
-        });
-        toastOf.set(alert.id, id);
-        postSystemNotification(alert);
-      }
-      patch({ snapshot, toasted, toastOf });
-    },
-
-    loadHealth: async () => {
-      try {
-        get().applyHealth(await cmd.healthGet());
-      } catch (e) {
-        if (!isUnavailable(e)) console.warn('[gilde] health_get failed', e);
-      }
-    },
-
-    setHealthPopover: (open) => patch({ popoverOpen: open }),
-
-    dismissHealthAlert: async (id) => {
-      const toastId = get().health.toastOf.get(id);
-      if (toastId !== undefined) {
-        get().dismissToast(toastId);
-        const toastOf = new Map(get().health.toastOf);
-        toastOf.delete(id);
-        patch({ toastOf });
-      }
-      try {
-        get().applyHealth(await cmd.healthDismiss(id));
-      } catch (e) {
-        if (!isUnavailable(e)) console.warn('[gilde] health_dismiss failed', e);
-      }
-    },
-
-    runHealthAction: async (alert, action) => {
-      switch (action.kind) {
-        case 'copyCommand': {
-          const command = action.command ?? (typeof alert.params?.command === 'string' ? alert.params.command : '');
-          if (!command) return;
-          const ok = await copyText(command);
-          get().pushToast({
-            level: ok ? 'success' : 'warn',
-            key: ok ? 'health.copied' : 'health.copyFailed',
-            params: { command },
-            detail: null,
-            actionId: null,
-            undoToken: null,
-            ttlMs: ok ? 3000 : 8000,
-          });
-          return;
-        }
-        case 'cleanUp': {
-          const rows = cleanUpAgents(get().health.snapshot, action.pids ?? []).map((a) => a.row);
-          if (rows.length === 0) return;
-          get().setHealthPopover(false);
-          get().openKillSheet(rows, { onlyHealthOrphans: true });
-          return;
-        }
-        case 'details':
-        case 'showAgents':
-        default:
-          get().setHealthPopover(true);
-      }
-    },
-  };
-};
+/** Discovery sources macOS denied (drives the TCC notice, §5.8). */
+export function deniedSources(world: WorldState): SourceStatus[] {
+  return world.sources.filter((s) => s.state.kind === 'permissionDenied');
+}

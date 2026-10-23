@@ -176,6 +176,17 @@ pub trait ProcProbe {
     fn args_string(&self, pid: i32) -> Option<String>;
     /// `KEY=VALUE` entries, or `None` when the block could not be read.
     fn environ(&self, pid: i32) -> Option<Vec<String>>;
+    /// Whether the environment holds exactly `key=value`: `None` when the
+    /// block could not be read (or was empty). The live probe compares in
+    /// place without copying any value (contract §5.2.2, §9.7).
+    fn env_entry(&self, pid: i32, key: &str, value: &str) -> Option<bool> {
+        let environ = self.environ(pid)?;
+        if environ.is_empty() {
+            return None;
+        }
+        let needle = format!("{key}={value}");
+        Some(environ.iter().any(|e| e == &needle))
+    }
     fn our_uid(&self) -> Option<u32>;
     fn our_user_name(&self) -> Option<String> {
         std::env::var("USER").ok()
@@ -236,6 +247,10 @@ impl ProcProbe for LiveProbe<'_> {
         procscan::environ_of(pid)
     }
 
+    fn env_entry(&self, pid: i32, key: &str, value: &str) -> Option<bool> {
+        procscan::env_entry_matches(pid, key, value)
+    }
+
     fn our_uid(&self) -> Option<u32> {
         self.our_uid
     }
@@ -293,9 +308,8 @@ pub fn verify_with<P: ProcProbe + ?Sized>(row: &ProcRow, probe: &P) -> Fence {
 
     // 2. Ownership. Checked before the start time so that a foreign process
     //    reports the reason that actually matters to the operator.
-    match owner_matches(pid, probe) {
-        Some(false) => return Fence::Mismatch(MismatchReason::Uid),
-        Some(true) | None => {}
+    if owner_matches(pid, probe) == Some(false) {
+        return Fence::Mismatch(MismatchReason::Uid);
     }
 
     // 3. Fence 1 — kernel start time. Mandatory, no exceptions.
@@ -408,17 +422,9 @@ fn env_marker_matches<P: ProcProbe + ?Sized>(row: &ProcRow, pid: i32, probe: &P)
     if row.env_marker.is_empty() {
         return None;
     }
-    let environ = probe.environ(pid)?;
-    if environ.is_empty() {
-        return None;
-    }
-    let needle = format!("{ENV_SPAWN_ID}={}", row.env_marker);
-    if environ.iter().any(|e| e == &needle) {
-        return Some(true);
-    }
-    // The block was readable. Either it carries somebody else's marker, or the
-    // child dropped it — both are "not proven ours" by this fence.
-    Some(false)
+    // `Some(false)`: the block was readable and either carries somebody else's
+    // marker or none — both are "not proven ours" by this fence.
+    probe.env_entry(pid, ENV_SPAWN_ID, &row.env_marker)
 }
 
 #[cfg(test)]

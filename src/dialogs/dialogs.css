@@ -1,322 +1,71 @@
-/*
- * Recovery / settings / accounts / toast styles (T26).
- *
- * Every colour is a var(--token) from styles/tokens.css — this file adds no
- * literal (scripts/lint-ui.sh fails on one). Density and spacing follow
- * docs/ui-mockups/Components.dc.html: flat surfaces, 1 px borders, 24–28 px
- * rows, 8/12 px padding, 13/12/11 px type, colour only at a threshold.
- *
- * It lives next to the modules that use it instead of in styles/global.css,
- * which is owned by T05.
- */
+/* The Recovered dialog: non-modal, top right under the top bar. Tokens only. */
 
-/* ===========================================================================
-   1. Recovered sessions sheet
-   =========================================================================== */
-
-.rec {
-  display: flex;
-  flex-direction: column;
-  gap: var(--sp-8);
-}
-
-.rec-intro {
-  color: var(--n11);
-  line-height: 1.5;
-}
-
-.rec-list {
-  display: flex;
-  flex-direction: column;
-  gap: var(--sp-4);
-}
-
-.rec-row {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto auto;
-  align-items: center;
-  gap: var(--sp-8);
-  padding: var(--sp-6) var(--sp-8);
-  border: 1px solid var(--border);
-  border-radius: var(--r-md);
-  background: var(--n1);
-}
-
-.rec-main {
-  display: flex;
-  flex-direction: column;
-  gap: var(--sp-2);
-  min-width: 0;
-}
-
-.rec-meta {
-  display: flex;
-  align-items: center;
-  gap: var(--sp-6);
-  min-width: 0;
-  color: var(--n8);
-  font-size: var(--fs-label);
-}
-
-.rec-metrics {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-end;
-  gap: var(--sp-2);
-  color: var(--n9);
-}
-
-.rec-outcome {
-  grid-column: 1 / -1;
-  display: flex;
-  flex-direction: column;
-  gap: var(--sp-2);
-  padding-top: var(--sp-6);
-  border-top: 1px solid var(--border);
-  color: var(--n9);
-  font-size: var(--fs-label);
-}
-
-.rec-outcome[data-tone='warn'] {
-  color: var(--warn);
-}
-
-.rec-outcome[data-tone='error'] {
-  color: var(--error);
-}
-
-.rec-outcome[data-tone='ok'] {
-  color: var(--ok);
-}
-
-/* ===========================================================================
-   2. Settings sheet
-   =========================================================================== */
-
-.set {
-  display: flex;
-  flex-direction: column;
-  gap: var(--sp-12);
-}
-
-.set-sec {
-  display: flex;
-  align-items: center;
-  gap: var(--sp-6);
-  height: 24px;
-  border-bottom: 1px solid var(--border);
-  color: var(--n8);
-  font-size: var(--fs-label);
-}
-
-.set-group {
-  display: flex;
-  flex-direction: column;
-  gap: var(--sp-6);
-}
-
-.set-row {
-  display: grid;
-  grid-template-columns: 172px minmax(0, 1fr);
-  align-items: center;
-  gap: var(--sp-8);
-  min-height: 24px;
-}
-
-.set-label {
-  color: var(--n9);
-  font-size: var(--fs-sub);
-}
-
-.set-control {
-  display: flex;
-  align-items: center;
-  gap: var(--sp-6);
-  min-width: 0;
-}
-
-.set-hint {
-  color: var(--n8);
-  font-size: var(--fs-label);
-  line-height: 1.45;
-}
-
-.set-num {
-  width: 84px;
-  text-align: right;
-  font-family: var(--mono);
-  font-variant-numeric: tabular-nums;
-}
-
-.set-path {
-  flex: 1 1 auto;
-  min-width: 0;
-  font-family: var(--mono);
-  font-size: var(--fs-label);
-}
-
-.set-issue {
-  color: var(--error);
-  font-size: var(--fs-sub);
-  line-height: 1.45;
-}
-
-.set-diag {
-  display: grid;
-  grid-template-columns: 172px minmax(0, 1fr);
-  gap: var(--sp-4) var(--sp-8);
-  font-size: var(--fs-label);
-}
-
-.set-diag .k {
-  color: var(--n8);
-}
-
-.set-diag .v {
-  color: var(--n11);
-  font-family: var(--mono);
-  font-variant-numeric: tabular-nums;
-  overflow-wrap: anywhere;
-}
-
-/* ===========================================================================
-   3. Accounts panel
-   =========================================================================== */
-
-.acct {
-  display: flex;
-  flex-direction: column;
-  gap: var(--sp-6);
-}
-
-.acct-list {
-  display: flex;
-  flex-direction: column;
-  border: 1px solid var(--border);
-  border-radius: var(--r-md);
-  overflow: hidden;
-}
-
-.acct-row {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
-  align-items: center;
-  gap: var(--sp-8);
-  padding: var(--sp-6) var(--sp-8);
-  border-bottom: 1px solid var(--border);
-  background: var(--n1);
-}
-
-.acct-row:last-child {
-  border-bottom: 0;
-}
-
-.acct-main {
-  display: flex;
-  flex-direction: column;
-  gap: var(--sp-2);
-  min-width: 0;
-}
-
-.acct-meta {
-  color: var(--n8);
-  font-size: var(--fs-label);
-}
-
-/* ===========================================================================
-   4. Toasts
-   =========================================================================== */
-
-.toast-stack {
+.rc {
   position: fixed;
-  right: var(--sp-12);
-  bottom: 32px;
-  z-index: 32;
+  top: calc(var(--topbar-h) + var(--sp-8));
+  right: var(--sp-16);
+  z-index: 45;
+  width: min(400px, calc(100vw - 32px));
   display: flex;
   flex-direction: column;
   gap: var(--sp-6);
-  width: 360px;
-  max-width: calc(100vw - var(--sp-24));
-}
-
-.toast {
-  display: flex;
-  align-items: flex-start;
-  gap: var(--sp-8);
-  padding: var(--sp-8);
+  padding: var(--sp-12);
   border: 1px solid var(--border);
   border-radius: var(--r-md);
   background: var(--n2);
   box-shadow: var(--shadow-popover);
   font-size: var(--fs-sub);
-  color: var(--n11);
-  animation: gilde-toast-in 140ms ease-out;
 }
 
-@keyframes gilde-toast-in {
-  from {
-    opacity: 0;
-    transform: translateY(4px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .toast {
-    animation: none;
-  }
-}
-
-.toast-body {
-  display: flex;
-  flex-direction: column;
-  gap: var(--sp-4);
-  min-width: 0;
-  flex: 1 1 auto;
-}
-
-.toast-detail {
+.rc-title {
   margin: 0;
-  color: var(--n8);
-  font-family: var(--mono);
-  font-size: var(--fs-label);
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  max-height: 72px;
-  overflow: auto;
-}
-
-.toast-undo {
-  border: 0;
-  background: transparent;
-  padding: 0;
-  color: var(--accent);
-  font-size: var(--fs-sub);
-  cursor: default;
-}
-
-.toast-undo:hover:not(:disabled) {
+  font-size: var(--fs-body);
+  font-weight: 600;
   color: var(--n12);
-  text-decoration: underline;
 }
 
-.toast-undo:disabled {
-  color: var(--n7);
+.rc-text {
+  margin: 0;
+  color: var(--n10);
 }
 
-.toast-close {
-  border: 0;
-  background: transparent;
+.rc-list {
+  list-style: none;
+  margin: 0;
   padding: 0;
-  color: var(--n8);
+}
+
+.rc-row {
   display: flex;
   align-items: center;
-  cursor: default;
+  gap: var(--sp-8);
+  min-height: var(--row-h);
 }
 
-.toast-close:hover {
+.rc-why {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   color: var(--n11);
+}
+
+.rc-sub,
+.rc-more {
+  color: var(--n8);
+}
+
+.rc-mem {
+  color: var(--n10);
+}
+
+.rc-error {
+  color: var(--error);
+}
+
+.rc-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--sp-8);
 }
