@@ -1,7 +1,7 @@
 //! The libproc scan, argv/env parsing and kqueue (contract §5.2.2, §5.9):
 //! T-disc-procs, T-disc-bgHelpers, T-disc-teammateArgv, T-disc-kqueue and the
 //! ≤ 5 ms-per-scan budget. Real processes are only ones this test starts (a
-//! copy of `/bin/sh` named `claude`, `/bin/sleep`); every scan of the real
+//! copy of `/bin/bash` named `claude`, `/bin/sleep`); every scan of the real
 //! process table is scoped so no other process's argv is ever read.
 
 #[path = "fixtures/vendor/support.rs"]
@@ -29,7 +29,7 @@ struct Fake {
 
 impl Drop for Fake {
     fn drop(&mut self) {
-        // Our own process group (the copy of sh and its sleep).
+        // Our own process group (the copy of bash and its sleep).
         // SAFETY: killpg on a group this test created.
         unsafe {
             libc::killpg(self.child.id() as i32, libc::SIGTERM);
@@ -38,11 +38,14 @@ impl Drop for Fake {
     }
 }
 
-/// A copy of `/bin/sh` named `claude` running `sleep` with `args` after it.
+/// A copy of `/bin/bash` named `claude` running `sleep` with `args` after it.
 fn spawn_fake_claude(args: &[&str], env: &[(&str, &str)]) -> Fake {
     let dir = tempfile::tempdir().unwrap();
     let exe = dir.path().join("claude");
-    std::fs::copy("/bin/sh", &exe).unwrap();
+    // `/bin/bash`, not `/bin/sh`: macOS's `/bin/sh` is a trampoline that
+    // re-executes the shell `/private/var/select/sh` names, so its process
+    // can report another executable path (CI's first public run did).
+    std::fs::copy("/bin/bash", &exe).unwrap();
     let mut cmd = Command::new(&exe);
     cmd.arg("-c").arg("sleep 30; :");
     cmd.args(args);

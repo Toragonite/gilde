@@ -170,9 +170,12 @@ fn rate_class_query_returns_busy() {
 }
 
 /// A51.1: the fill rests by thread CPU time, not by blocked time. Every row
-/// blocks 40 ms without CPU (the test-only hook, inside the measured work),
-/// so the old wall-time rule (rest 3× wall) takes ≥ N × 40 ms × 4. Counts
-/// and a generous ceiling of N × 40 ms × 2 (A10.7), not a tight duration.
+/// blocks 40 ms without CPU (the test-only hook, inside the measured work).
+/// `fill` runs on this thread, so its CPU time `c` is measured here. The new
+/// rule takes about N × 40 ms + 4c; the old wall-time rule (rest 3× wall)
+/// takes at least 4 × (N × 40 ms + c). The bound N × 40 ms × 2 + 4c holds on a
+/// machine of any speed and still fails the old rule (A10.7; CI's first
+/// public run spent 2.8 s on a slow runner).
 #[test]
 fn fill_rests_by_cpu_time_not_blocked_time() {
     const N: u32 = 20;
@@ -187,11 +190,12 @@ fn fill_rests_by_cpu_time_not_blocked_time() {
         s.lock().unwrap().push(p.file_stem().unwrap().to_string_lossy().into_owned());
         std::thread::sleep(BLOCK); // blocked, no CPU
     })));
-    let t0 = Instant::now();
+    let (t0, c0) = (Instant::now(), thread_cpu());
     let loaded = svc.fill();
-    let elapsed = t0.elapsed();
+    let (elapsed, cpu) = (t0.elapsed(), thread_cpu().saturating_sub(c0));
     svc.set_fill_row_hook(None);
-    eprintln!("fill: {loaded} rows, each blocked {BLOCK:?}, in {elapsed:?} (old rule ≥ {:?}, ceiling {:?})", BLOCK * N * 4, BLOCK * N * 2);
+    let bound = BLOCK * N * 2 + cpu * 4;
+    eprintln!("fill: {loaded} rows, each blocked {BLOCK:?}, in {elapsed:?}, CPU {cpu:?} (old rule ≥ {:?}, bound {bound:?})", (BLOCK * N + cpu) * 4);
     assert_eq!(loaded, N, "every row loaded");
     let seen = seen.lock().unwrap().clone();
     let newest_first: Vec<String> = sids.iter().rev().cloned().collect();
@@ -199,7 +203,16 @@ fn fill_rests_by_cpu_time_not_blocked_time() {
     let cov = svc.query(&req("q-cpu", "", 1, None)).unwrap().coverage;
     assert_eq!((cov.titles_loaded, cov.total), (N, N), "every title loaded");
     assert!(elapsed >= BLOCK * N, "the blocks themselves ran: {elapsed:?}");
-    assert!(elapsed < BLOCK * N * 2, "the fill rested by blocked time: {elapsed:?} ≥ {:?}", BLOCK * N * 2);
+    assert!(elapsed < bound, "the fill rested by blocked time: {elapsed:?} ≥ {bound:?} (CPU {cpu:?})");
+}
+
+/// This thread's CPU time (`CLOCK_THREAD_CPUTIME_ID`).
+fn thread_cpu() -> Duration {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: `ts` is a valid out-parameter.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+    assert_eq!(rc, 0, "the thread CPU clock reads");
+    Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
 }
 
 /// A real index store on a temp `state.db`, laid out as the app has it: the
