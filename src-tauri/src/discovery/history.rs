@@ -499,6 +499,10 @@ pub struct HistoryService {
     /// inside the row's measured work.
     #[cfg(any(test, feature = "test-fixtures"))]
     fill_row_hook: Mutex<Option<FillRowHook>>,
+    /// Test-only (A51.1): called by [`HistoryService::fill`] with each rest
+    /// it is about to take, so a test checks the rule without timing it.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    fill_rest_hook: Mutex<Option<FillRestHook>>,
 }
 
 /// The writer drains what is queued and exits; its thread is joined.
@@ -516,6 +520,11 @@ impl Drop for HistoryService {
 /// from builds without `test-fixtures`.
 #[cfg(any(test, feature = "test-fixtures"))]
 pub type FillRowHook = Arc<dyn Fn(&Path) + Send + Sync>;
+
+/// A closure [`HistoryService::fill`] calls with each rest it is about to
+/// take — a **test hook only** (A51.1): absent without `test-fixtures`.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub type FillRestHook = Arc<dyn Fn(Duration) + Send + Sync>;
 
 /// The calling thread's CPU time, or `None` when the clock cannot be read.
 ///
@@ -682,6 +691,8 @@ impl HistoryService {
             kick: (Mutex::new(false), Condvar::new()),
             #[cfg(any(test, feature = "test-fixtures"))]
             fill_row_hook: Mutex::new(None),
+            #[cfg(any(test, feature = "test-fixtures"))]
+            fill_rest_hook: Mutex::new(None),
         })
     }
 
@@ -1053,6 +1064,27 @@ impl HistoryService {
     #[inline(always)]
     fn run_fill_row_hook(&self, _path: &Path) {}
 
+    /// Test-only (A51.1): set the closure [`HistoryService::fill`] calls with
+    /// each rest it is about to take (`None` clears it).
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn set_fill_rest_hook(&self, hook: Option<FillRestHook>) {
+        if let Ok(mut h) = self.fill_rest_hook.lock() {
+            *h = hook;
+        }
+    }
+
+    #[cfg(any(test, feature = "test-fixtures"))]
+    fn run_fill_rest_hook(&self, rest: Duration) {
+        let hook = self.fill_rest_hook.lock().ok().and_then(|h| h.clone());
+        if let Some(hook) = hook {
+            hook(rest);
+        }
+    }
+
+    #[cfg(not(any(test, feature = "test-fixtures")))]
+    #[inline(always)]
+    fn run_fill_rest_hook(&self, _rest: Duration) {}
+
     /// Test-only (A51.4): set the index writer's batch interval (the app's
     /// is [`INDEX_BATCH_INTERVAL`]); nothing when memory-only.
     #[cfg(any(test, feature = "test-fixtures"))]
@@ -1091,7 +1123,9 @@ impl HistoryService {
                 self.queue_upsert(&p);
             }
             // Work 1, rest 3 — by CPU time, so waiting is not multiplied.
-            std::thread::sleep(fill_rest(cpu0, thread_cpu_time(), wall0.elapsed()));
+            let rest = fill_rest(cpu0, thread_cpu_time(), wall0.elapsed());
+            self.run_fill_rest_hook(rest);
+            std::thread::sleep(rest);
         }
         n
     }

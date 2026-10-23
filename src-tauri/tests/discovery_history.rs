@@ -170,12 +170,12 @@ fn rate_class_query_returns_busy() {
 }
 
 /// A51.1: the fill rests by thread CPU time, not by blocked time. Every row
-/// blocks 40 ms without CPU (the test-only hook, inside the measured work).
-/// `fill` runs on this thread, so its CPU time `c` is measured here. The new
-/// rule takes about N × 40 ms + 4c; the old wall-time rule (rest 3× wall)
-/// takes at least 4 × (N × 40 ms + c). The bound N × 40 ms × 2 + 4c holds on a
-/// machine of any speed and still fails the old rule (A10.7; CI's first
-/// public run spent 2.8 s on a slow runner).
+/// blocks 40 ms without CPU (the test-only row hook, inside the measured
+/// work). The rest hook records each rest the fill asks for, so the rule is
+/// checked without timing it (A10.7; a CI runner's sleeps overshoot by tens
+/// of milliseconds). `fill` runs on this thread, so its CPU time `c` is
+/// measured here. The rests must add up to at most 3c. The old wall-time
+/// rule asked for at least 3 × N × 40 ms.
 #[test]
 fn fill_rests_by_cpu_time_not_blocked_time() {
     const N: u32 = 20;
@@ -185,17 +185,22 @@ fn fill_rests_by_cpu_time_not_blocked_time() {
     let svc = h.history();
     assert_eq!(svc.refresh_index().total, N);
     let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+    let rests: Arc<Mutex<Vec<Duration>>> = Arc::default();
     let s = seen.clone();
     svc.set_fill_row_hook(Some(Arc::new(move |p: &std::path::Path| {
         s.lock().unwrap().push(p.file_stem().unwrap().to_string_lossy().into_owned());
         std::thread::sleep(BLOCK); // blocked, no CPU
     })));
+    let r = rests.clone();
+    svc.set_fill_rest_hook(Some(Arc::new(move |rest: Duration| r.lock().unwrap().push(rest))));
     let (t0, c0) = (Instant::now(), thread_cpu());
     let loaded = svc.fill();
     let (elapsed, cpu) = (t0.elapsed(), thread_cpu().saturating_sub(c0));
     svc.set_fill_row_hook(None);
-    let bound = BLOCK * N * 2 + cpu * 4;
-    eprintln!("fill: {loaded} rows, each blocked {BLOCK:?}, in {elapsed:?}, CPU {cpu:?} (old rule ≥ {:?}, bound {bound:?})", (BLOCK * N + cpu) * 4);
+    svc.set_fill_rest_hook(None);
+    let rests = rests.lock().unwrap().clone();
+    let rested: Duration = rests.iter().sum();
+    eprintln!("fill: {loaded} rows, each blocked {BLOCK:?}, in {elapsed:?}; CPU {cpu:?}; rests asked {rested:?} (≤ 3×CPU = {:?}; the old rule ≥ {:?})", cpu * 3, BLOCK * N * 3);
     assert_eq!(loaded, N, "every row loaded");
     let seen = seen.lock().unwrap().clone();
     let newest_first: Vec<String> = sids.iter().rev().cloned().collect();
@@ -203,7 +208,9 @@ fn fill_rests_by_cpu_time_not_blocked_time() {
     let cov = svc.query(&req("q-cpu", "", 1, None)).unwrap().coverage;
     assert_eq!((cov.titles_loaded, cov.total), (N, N), "every title loaded");
     assert!(elapsed >= BLOCK * N, "the blocks themselves ran: {elapsed:?}");
-    assert!(elapsed < bound, "the fill rested by blocked time: {elapsed:?} ≥ {bound:?} (CPU {cpu:?})");
+    assert_eq!(rests.len(), N as usize, "one rest per row");
+    assert!(rested <= cpu * 3, "the rests follow CPU time: asked {rested:?} > 3 × CPU {cpu:?}");
+    assert!(rested < BLOCK * N, "the rests do not follow blocked time: asked {rested:?}");
 }
 
 /// This thread's CPU time (`CLOCK_THREAD_CPUTIME_ID`).
