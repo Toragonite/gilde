@@ -35,6 +35,7 @@ jobs:
           node-version: '22'
           cache: npm
       - run: npm ci
+      - run: (cd src-tauri/sidecar && npm ci)   # notices:check reads the sidecar's installed packages
       - run: npm run lint:ui
       - run: npm run check:version
       - run: npm run notices:check
@@ -90,7 +91,9 @@ jobs:
         with:
           node-version: '22'
           cache: npm
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned to the toolchain the release gates ran on, so a new stable's
+      # lints never break CI unannounced; bump it deliberately.
+      - uses: dtolnay/rust-toolchain@1.96.1
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2

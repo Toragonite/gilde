@@ -1395,7 +1395,7 @@ pub fn kernel_proc_table() -> Result<Vec<KernelProc>> {
         if !len.is_multiple_of(KINFO_SIZE) {
             return Err(GildeError::Spawn("unexpected kinfo_proc size".into()));
         }
-        return Ok(buf[..len].chunks_exact(KINFO_SIZE).filter_map(parse_kinfo).collect());
+        return Ok(buf[..len].as_chunks::<KINFO_SIZE>().0.iter().filter_map(|rec| parse_kinfo(rec)).collect());
     }
     Err(GildeError::Spawn("the process table kept growing".into()))
 }

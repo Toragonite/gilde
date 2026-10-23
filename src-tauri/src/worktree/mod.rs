@@ -995,8 +995,7 @@ impl WorktreeManager {
 
         self.stop_watch(id);
 
-        let removed;
-        if path.exists() {
+        let removed = if path.exists() {
             // Gilde's own lock is released for the removal and restored when
             // it fails (A36.6); any other lock refused above.
             if lock == LockState::Gilde {
@@ -1016,7 +1015,7 @@ impl WorktreeManager {
                 restore_after_failed_remove(&repo, &canonical, lock).await;
                 return Err(WorktreeFailure::Other(err.into_gilde("worktree remove", &repo)));
             }
-            removed = true;
+            true
         } else {
             // Only this worktree's own admin entry, and only while its
             // directory is gone (A36.5) — never a repo-wide prune.
@@ -1025,8 +1024,8 @@ impl WorktreeManager {
                 Err(err) => warnings.push(format!("could not clean the admin entry: {}", err.kind())),
             }
             warnings.push("worktree directory was already gone".to_string());
-            removed = true;
-        }
+            true
+        };
 
         let id_owned = id.to_string();
         let at = now_ms();

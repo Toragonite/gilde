@@ -1736,11 +1736,10 @@ impl Core {
             return Err(IpcError::invalid_argument("text", "size"));
         }
         let active = self.turn_active();
-        let delivery;
-        if !self.ready {
+        let delivery = if !self.ready {
             // Held until the `initialize` response (§6.1.2 step 1).
             self.held.push(HeldFrame { id: msg.client_msg_id.clone(), line });
-            delivery = SendDelivery::Queued;
+            SendDelivery::Queued
         } else if wants_now && !now_capable && active && self.after_result.is_none() {
             // P9 fallback: interrupt, wait for the turn's result (≤ 5 s), then send.
             let target = self.interrupt_target();
@@ -1753,7 +1752,7 @@ impl Core {
             self.mark_interrupt(target);
             self.interrupt_sent_mono = Some(now.mono);
             self.after_result = Some((HeldFrame { id: msg.client_msg_id.clone(), line }, now.mono + SEND_NOW_WAIT_MS));
-            delivery = SendDelivery::Queued;
+            SendDelivery::Queued
         } else {
             if let Err(e) = out.try_write(line, FrameClass::User) {
                 if e == WriteError::Full {
@@ -1767,8 +1766,8 @@ impl Core {
                     self.awaiting_turn = true;
                 }
             }
-            delivery = if active { SendDelivery::Queued } else { SendDelivery::Sent };
-        }
+            if active { SendDelivery::Queued } else { SendDelivery::Sent }
+        };
         let d = (delivery == SendDelivery::Queued).then_some(Delivery::Queued);
         for u in self.render.user_sent(&msg.client_msg_id, &msg.text, now.wall, d) {
             fx.push(Effect::Content(u));
