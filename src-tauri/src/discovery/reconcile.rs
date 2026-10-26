@@ -42,7 +42,7 @@ use super::history::{self, HistoryService, HistorySources};
 use super::kqueue::{KqEvent, KqWatcher, Track};
 use super::procs::{
     app_server_origin, claude_origin, other_vendor_origin, BundleInfo, Libproc, NsBundleInfo, OriginInputs, ProcSource,
-    ScannedProc, Scanner, SCAN_BACKGROUND_MS, SCAN_FOCUSED_MS, UNREGISTERED_GRACE_MS,
+    is_temp_dir_print_probe, ScannedProc, Scanner, SCAN_BACKGROUND_MS, SCAN_FOCUSED_MS, UNREGISTERED_GRACE_MS,
 };
 use super::safe_read::{self, Backoff, FileId, ReadError, Root};
 use super::{
@@ -753,6 +753,9 @@ impl Engine {
                 Vendor::Claude => {
                     if p.own.is_none() && now_up.saturating_sub(p.first_seen_up_ms) < UNREGISTERED_GRACE_MS {
                         continue; // it may be starting (§5.2.2)
+                    }
+                    if p.own.is_none() && is_temp_dir_print_probe(&p.argv_redacted, p.cwd.as_deref()) {
+                        continue; // another tool's usage probe, not a session
                     }
                     meta.origin = Some(claude_origin(OriginInputs {
                         other_gilde,

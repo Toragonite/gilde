@@ -18,7 +18,8 @@
 //!   output is all that is kept, and the raw strings are zeroed.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use zeroize::Zeroize;
 
@@ -599,6 +600,27 @@ pub fn classify(exec_path: &str, argv: Option<&[String]>) -> Classified {
         None => None,
     };
     Classified { vendor, role, candidate: vendor.is_some() || is_tmux, labels }
+}
+
+/// A one-shot `claude -p` whose working folder is the OS temporary folder:
+/// how usage tools ask the CLI for its rate limits (the Claude Code
+/// Orchestrator extension probes every account every 5 min from
+/// `os.tmpdir()`, so no project's `.mcp.json` loads). It is nobody's session;
+/// shown as one it filled a room named after the folder ("T") with ended
+/// headless desks. `argv_redacted` keeps flags, so `-p`/`--print` survive.
+pub fn is_temp_dir_print_probe(argv_redacted: &[String], cwd: Option<&str>) -> bool {
+    static TEMP_DIRS: OnceLock<Vec<PathBuf>> = OnceLock::new();
+    let print = argv_redacted.iter().skip(1).any(|a| a == "-p" || a == "--print");
+    let Some(cwd) = cwd.filter(|_| print) else { return false };
+    let temp = TEMP_DIRS.get_or_init(|| {
+        [std::env::temp_dir(), PathBuf::from("/tmp")]
+            .into_iter()
+            .flat_map(|d| [std::fs::canonicalize(&d).unwrap_or_else(|_| d.clone()), d])
+            .map(|d| PathBuf::from(d.to_string_lossy().trim_end_matches('/')))
+            .collect()
+    });
+    let cwd = Path::new(cwd.trim_end_matches('/'));
+    temp.iter().any(|t| t == cwd)
 }
 
 /// **The one process-role classifier** (A11.2): `ProcInfo` carries no role
@@ -1207,6 +1229,29 @@ mod tests {
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn a_print_run_in_the_temp_folder_is_a_probe_and_nothing_else_is() {
+        let temp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let temp = temp.to_string_lossy();
+        let probe = crate::supervise::redact::redact_argv(&[
+            "/opt/homebrew/bin/claude",
+            "-p",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+        ]);
+        assert!(is_temp_dir_print_probe(&probe, Some(&temp)), "the usage probe in {temp}");
+        assert!(is_temp_dir_print_probe(&probe, Some(&format!("{temp}/"))));
+        assert!(is_temp_dir_print_probe(&probe, Some("/private/tmp")), "/tmp, resolved");
+        assert!(!is_temp_dir_print_probe(&probe, Some("/Users/u/project")), "a print run in a project is a session");
+        assert!(!is_temp_dir_print_probe(&probe, Some(&format!("{temp}/work"))), "only the folder itself");
+        assert!(!is_temp_dir_print_probe(&probe, None));
+        let interactive = s(&["/opt/homebrew/bin/claude", "--resume", "x"]);
+        assert!(!is_temp_dir_print_probe(&interactive, Some(&temp)), "an interactive session in the temp folder stays one");
     }
 
     fn procargs(argv: &[&str], env: &[&str]) -> Vec<u8> {
