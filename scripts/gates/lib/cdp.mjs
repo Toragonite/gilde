@@ -129,6 +129,10 @@ export class Page {
     const page = new Page(cdp, targetId, sessionId);
     await page.send('Page.enable');
     await page.send('Runtime.enable');
+    // As in the app: Tauri's `freezePrototype` (contract §9.2) runs before any
+    // page script, so code that assigns over an `Object.prototype` member
+    // (the "override mistake") throws here as it would in the WebView.
+    await page.send('Page.addScriptToEvaluateOnNewDocument', { source: 'Object.freeze(Object.prototype);' });
     cdp.on('Runtime.exceptionThrown', (p, s) => {
       if (s === sessionId) page.exceptions.push(p.exceptionDetails?.exception?.description?.split('\n')[0] ?? p.exceptionDetails?.text ?? 'exception');
     });

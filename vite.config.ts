@@ -1,4 +1,5 @@
 import { defineConfig } from "vite";
+import type { Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 
 import pkg from "./package.json";
@@ -16,9 +17,33 @@ const host = env.TAURI_DEV_HOST;
 // `app_bootstrap.buildId` (src/hooks/useEventBridge.ts).
 const buildId = resolveBuildId(env.GILDE_BUILD_ID, pkg.version);
 
+// `freezePrototype` (contract §9.2) freezes `Object.prototype` before any of
+// our scripts runs. xterm and its WebGL addon carry VS Code's `KeyCodeUtils`
+// namespace, which assigns `ns.toString = fn` on a plain object; with
+// `toString` read-only on the frozen prototype that assignment throws in
+// strict code (the "override mistake") and the WebView never boots. The
+// member is defined instead of assigned. Only `ident.toString=ident` inside
+// `@xterm/*` is touched. Tauri freezes in `tauri dev` too, so those packages
+// skip the dev pre-bundle (which no plugin sees) and come through here.
+function xtermOnFrozenPrototype(): Plugin {
+  const assign = /(?<![\w$.])([A-Za-z_$][\w$]*)\.toString=(?!=)([A-Za-z_$][\w$]*)/g;
+  return {
+    name: "gilde-xterm-frozen-prototype",
+    transform(code, id) {
+      if (!/[\\/]node_modules[\\/]@xterm[\\/]/.test(id)) return null;
+      const next = code.replace(assign, 'Object.defineProperty($1,"toString",{value:$2,writable:!0,enumerable:!0,configurable:!0})');
+      return next === code ? null : { code: next, map: null };
+    },
+  };
+}
+
 // https://vite.dev/config/
 export default defineConfig(() => ({
-  plugins: [react()],
+  plugins: [react(), xtermOnFrozenPrototype()],
+
+  optimizeDeps: {
+    exclude: ["@xterm/xterm", "@xterm/addon-webgl"],
+  },
 
   define: {
     "import.meta.env.VITE_GILDE_BUILD_ID": JSON.stringify(buildId),
