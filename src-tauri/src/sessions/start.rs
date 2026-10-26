@@ -965,7 +965,13 @@ impl AgentBinaries {
 #[async_trait]
 impl Binaries for AgentBinaries {
     async fn installed(&self) -> Result<Vec<VendorOption>, IpcError> {
-        let bins = self.agents.detect(false).await.map_err(|_| IpcError::not_ready("agentsNotDetected"))?;
+        // Never a fresh detection once one exists: past its TTL it outlasts
+        // the sheet's 1 s, and a sheet that timed out showed "Finding
+        // installed agents…" with no vendor and no team.
+        let bins = match self.agents.latest() {
+            Some(bins) => bins,
+            None => self.agents.detect(false).await.map_err(|_| IpcError::not_ready("agentsNotDetected"))?,
+        };
         // A29.1: the same mapping as `BootStatus.agents`.
         Ok(crate::lifecycle::boot::agent_rows(&bins))
     }

@@ -29,6 +29,7 @@ import { isImeComposing } from '../hooks/useHotkeys';
 import { useI18n } from '../i18n/useI18n';
 import { clock } from '../lib/clock';
 import { commands } from '../lib/commands';
+import type { ClientMsgId } from '../lib/gen/ClientMsgId';
 import type { PendingInteraction } from '../lib/gen/PendingInteraction';
 import type { SendPriority } from '../lib/gen/SendPriority';
 import type { Session } from '../lib/gen/Session';
@@ -56,7 +57,8 @@ export interface ComposerProps {
   compact?: boolean;
 }
 
-type Line = { key: string; params: Readonly<Record<string, unknown>>; detail?: string | null } | null;
+/** `queued`: the line is "Queued…" for this message and holds only while it waits. */
+type Line = { key: string; params: Readonly<Record<string, unknown>>; detail?: string | null; queued?: ClientMsgId } | null;
 
 type StopState = { phase: 'stopping'; at: number } | { phase: 'still'; at: number } | { phase: 'stopped' } | null;
 
@@ -172,7 +174,7 @@ function ComposerBody({ uid, inputRef, active = true, onFocusCard, compact = fal
           clearDraft(session.uid);
           draftStart.current = null;
           setReplyIntent(session.uid, null);
-          setLine(result.queued ? { key: 'composer.queued', params: { agent } } : null);
+          setLine(result.queued ? { key: 'composer.queued', params: { agent }, queued: result.queued } : null);
           break;
         case 'kept':
           setLine(result.line.key === '' ? null : { ...result.line, detail: result.error?.detail ?? null });
@@ -270,6 +272,9 @@ function ComposerBody({ uid, inputRef, active = true, onFocusCard, compact = fal
   if (!session) return null;
   const canSend = session.caps.send !== 'none';
   const armedDeny = intent.kind === 'denyWithMessage';
+  // "Queued…" goes with its message: once the agent read it (or merged it into
+  // the turn, or it was cancelled) the line is gone, not at the next keystroke.
+  const shownLine = line?.queued && !queued.some((q) => q.clientMsgId === line.queued) ? null : line;
 
   return (
     <div className="g-composer" data-compact={compact ? 'true' : undefined} data-intent={intent.kind}>
@@ -291,10 +296,10 @@ function ComposerBody({ uid, inputRef, active = true, onFocusCard, compact = fal
         onChange={onChange}
         onKeyDown={onKeyDown}
       />
-      {line && line.key !== '' && (
+      {shownLine && shownLine.key !== '' && (
         <p className="g-composer-line" role="status">
-          {td(line.key, line.params)}
-          {line.detail ? <span className="g-composer-detail mono">{line.detail}</span> : null}
+          {td(shownLine.key, shownLine.params)}
+          {shownLine.detail ? <span className="g-composer-detail mono">{shownLine.detail}</span> : null}
         </p>
       )}
       {!compact && queued.length > 0 && (

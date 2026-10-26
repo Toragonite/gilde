@@ -287,6 +287,27 @@ domTest(
 );
 
 domTest(
+  '"Queued…" holds while its message waits and goes once the agent read it, with nothing typed',
+  harness(async (_c, core) => {
+    core.on('turn_send', () => ({ delivery: 'queued', position: 1 }));
+    const working = { ...session(1).activity, state: { kind: 'working' as const } };
+    setSessions([session(1, { activity: working })]);
+    const view = render(<Composer uid={uid(1)} />);
+    const el = input(view);
+    type(el, 'then run the linter');
+    enter(el);
+    await settle();
+    const queuedLine = translate('en', 'composer.queued', { agent: 'claude' });
+    const id = sends(core)[0]?.clientMsgId as ClientMsgId;
+    setSessions([session(1, { activity: working, queued: [{ clientMsgId: id, text: 'then run the linter', queuedAt: 0 }] })]);
+    assert(view.queryByText(queuedLine) !== null, 'shown while the message waits');
+    setSessions([session(1, { activity: working, queued: [] })]);
+    assertEqual(view.queryByText(queuedLine), null, 'gone once it left the queue');
+    assertEqual(el.value, '', 'with nothing typed');
+  }),
+);
+
+domTest(
   '⌘. stops: "Stopping…", then after 5 s "Still stopping…" with Force stop',
   harness(async (c, core) => {
     setSessions([session(1, { activity: { ...session(1).activity, state: { kind: 'working' } } })]);

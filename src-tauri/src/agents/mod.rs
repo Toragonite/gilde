@@ -984,6 +984,27 @@ impl AgentRegistry {
         Ok(binaries)
     }
 
+    /// The last detection whatever its age, for an answer that cannot wait
+    /// for the `--version` probes (`newsession_options` has 1 s; a detection
+    /// takes longer). One past [`DETECT_TTL`] starts a detection in the
+    /// background for the next ask. `None` until a detection completes.
+    pub fn latest(self: &Arc<Self>) -> Option<Vec<AgentBinary>> {
+        let (binaries, stale) = {
+            let detected = self.detected.lock();
+            let d = detected.as_ref()?;
+            (d.binaries.clone(), d.at.elapsed() >= DETECT_TTL)
+        };
+        if stale {
+            let me = Arc::clone(self);
+            tokio::spawn(async move {
+                if let Err(err) = me.detect(false).await {
+                    tracing::debug!(target: "agents", error = %err, "background agent detection failed");
+                }
+            });
+        }
+        Some(binaries)
+    }
+
     /// `agents_launch_templates()`.
     pub async fn templates(&self) -> Result<Vec<LaunchTemplate>> {
         let binaries = self.detect(false).await?;
@@ -1870,5 +1891,42 @@ mod tests {
         assert_eq!(claude.binary, bin.join("claude").to_string_lossy());
         assert_eq!(claude.prompt_mode, PromptMode::Argv);
         assert!(claude.verified);
+    }
+
+    #[tokio::test]
+    async fn a_stale_detection_still_answers_at_once_and_is_refreshed_behind_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = AppPaths::for_home(dir.path());
+        paths.ensure_all().expect("dirs");
+        let bin = dir.path().join("bin");
+        write_exec(&bin.join("claude"), "#!/bin/sh\necho 2.1.263\n");
+        let config = Arc::new(ConfigStore::load(&paths).expect("config"));
+        config
+            .patch(serde_json::json!({
+                "agents": { "pathOverride": bin.to_string_lossy() },
+                "terminal": { "shell": "/nonexistent/shell" }
+            }))
+            .expect("patch");
+        let registry = Arc::new(AgentRegistry::without_db(paths, config));
+
+        assert_eq!(registry.latest(), None, "nothing before the first detection");
+        let found = registry.detect(false).await.expect("detect");
+        assert_eq!(registry.latest(), Some(found.clone()));
+
+        // Past the TTL: the same rows at once, and a detection behind them.
+        let aged = Instant::now()
+            .checked_sub(DETECT_TTL + Duration::from_secs(1))
+            .expect("an instant before the TTL");
+        registry.detected.lock().as_mut().expect("detection").at = aged;
+        assert_eq!(registry.latest(), Some(found.clone()), "a stale detection answers without waiting");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while registry.detected.lock().as_ref().is_none_or(|d| d.at <= aged) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the stale detection was refreshed in the background");
+        let paths_of = |bins: &[AgentBinary]| bins.iter().map(|b| (b.kind, b.abs_path.clone())).collect::<Vec<_>>();
+        assert_eq!(registry.latest().as_deref().map(paths_of), Some(paths_of(&found)), "the same binaries, detected again");
     }
 }

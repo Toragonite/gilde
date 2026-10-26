@@ -13,6 +13,7 @@ import { answerTarget, composerModeFor, isArmed, markHandledHere, sendDecision, 
 import type { ComposerMode, ReplyIntent } from '../approval';
 import { utf8Length } from '../approval/decisions';
 import { commands } from '../lib/commands';
+import type { ClientMsgId } from '../lib/gen/ClientMsgId';
 import type { PendingInteraction } from '../lib/gen/PendingInteraction';
 import type { SendPriority } from '../lib/gen/SendPriority';
 import type { SessionUid } from '../lib/gen/SessionUid';
@@ -95,8 +96,8 @@ export function cleanText(text: string): string {
 }
 
 export type SubmitResult =
-  /** Sent (or answered): clear the draft. */
-  | { kind: 'done'; queued: boolean }
+  /** Sent (or answered): clear the draft. `queued`: the id of a message that waits behind the turn. */
+  | { kind: 'done'; queued: ClientMsgId | null }
   /** Nothing sent; keep the draft and show a line. */
   | { kind: 'kept'; line: { key: string; params: Readonly<Record<string, unknown>> }; error?: IpcError }
   /** Several unanswered questions: move focus to the card. */
@@ -118,7 +119,7 @@ export async function submit(uid: SessionUid, intent: ComposerIntent, rawText: s
   const tooLongReply = { kind: 'kept' as const, line: { key: 'composer.replyTooLong', params: {} } };
   const answer = async (run: () => ReturnType<typeof sendDecision>): Promise<SubmitResult> => {
     const outcome = await run();
-    if (outcome.ok) return { kind: 'done', queued: false };
+    if (outcome.ok) return { kind: 'done', queued: null };
     if ('busy' in outcome) return { kind: 'busy' };
     return keptError(outcome.error);
   };
@@ -126,8 +127,9 @@ export async function submit(uid: SessionUid, intent: ComposerIntent, rawText: s
     case 'send': {
       if (utf8Length(text) > MESSAGE_MAX_BYTES) return { kind: 'kept', line: { key: 'composer.tooLong', params: {} } };
       try {
-        const res = await commands.turn_send({ uid, clientMsgId: newClientMsgId(), text, priority });
-        return { kind: 'done', queued: res.delivery === 'queued' };
+        const clientMsgId = newClientMsgId();
+        const res = await commands.turn_send({ uid, clientMsgId, text, priority });
+        return { kind: 'done', queued: res.delivery === 'queued' ? clientMsgId : null };
       } catch (e) {
         if (isIpcError(e)) return keptError(e);
         throw e;
