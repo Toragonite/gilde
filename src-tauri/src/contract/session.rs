@@ -120,6 +120,8 @@ pub enum Transport {
 pub enum Origin {
     Terminal,
     VsCode,
+    /// The ChatGPT (Codex) desktop app's own codex server.
+    ChatGptApp,
     ItermTeam,
     TmuxTeam,
     TerminalTeam,

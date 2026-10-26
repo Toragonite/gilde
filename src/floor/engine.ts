@@ -16,6 +16,7 @@
 
 import { clock } from '../lib/clock';
 import type { MemberKey } from '../lib/gen/MemberKey';
+import type { Origin } from '../lib/gen/Origin';
 import type { SessionUid } from '../lib/gen/SessionUid';
 import type { TeamKey } from '../lib/gen/TeamKey';
 import { appStore } from '../store/useAppStore';
@@ -53,6 +54,7 @@ import { floorRing } from './ring';
 import type { ReplayRing } from './ring';
 import type { Ctx2D, Identity } from './sprites';
 import { SpriteCache, identityOf } from './sprites';
+import { originKey } from './words';
 
 // ---------------------------------------------------------------------------
 // A context for environments without a canvas (tests): records nothing,
@@ -435,8 +437,13 @@ export class FloorEngine {
 
   /** Lay out at the largest integer scale that fits (text bands re-sized per scale); zoom steps from there. */
   private layout(vm: FlVm, lanes: StripLane[], cssW: number, availH: number, dpr: number): { scale: number; M: Metrics; rooms: Room[]; world: { w: number; h: number }; dpr: number } {
-    const noProject = this.words ? this.words.t('floor.noProject') : '';
-    const opts = { scope: this.scope, noProjectLabel: noProject };
+    const words = this.words;
+    const noProject = words ? words.t('floor.noProject') : '';
+    const appLabel = (o: Origin): string => {
+      const key = originKey(o);
+      return words && key ? words.t(key) : o;
+    };
+    const opts = { scope: this.scope, noProjectLabel: noProject, appLabel };
     const at = (sv: number) => {
       const M = metrics(sv);
       const rooms = buildRooms(vm, M, this.book, opts);

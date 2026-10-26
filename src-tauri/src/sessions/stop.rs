@@ -67,6 +67,7 @@ fn owner_name(session: &Session) -> String {
     match &session.control {
         Control::Watching { owner: Some(o), .. } if !o.app_name.is_empty() => o.app_name.clone(),
         Control::Watching { origin: Origin::VsCode, .. } => "VS Code".to_string(),
+        Control::Watching { origin: Origin::ChatGptApp, .. } => "ChatGPT".to_string(),
         Control::Watching { origin: Origin::Terminal, .. } => "Terminal".to_string(),
         _ => session.vendor.as_str().to_string(),
     }

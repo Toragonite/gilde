@@ -13,7 +13,8 @@ use gilde_code_lib::contract::activity::ProcessFacts;
 use gilde_code_lib::contract::common::Vendor;
 use gilde_code_lib::contract::services::SourceFacts;
 use gilde_code_lib::contract::session::Origin;
-use gilde_code_lib::discovery::procs::FakeProc;
+use gilde_code_lib::discovery::history::{HistoryService, HistorySources, MemoryUids};
+use gilde_code_lib::discovery::procs::{FakeBundles, FakeProc, FakeProcs};
 use gilde_code_lib::discovery::safe_read::{self, Root};
 use gilde_code_lib::discovery::{agy, codex, cursor, Engine};
 use support::*;
@@ -73,6 +74,98 @@ fn t_disc_codex_rollouts_index_and_processes() {
     let res = rec.for_pid(2001);
     assert!(res.iter().any(|u| u.hint.vendor_session_id.as_deref() == Some(id.as_str())));
     assert!(res.iter().any(|u| matches!(u.facts, SourceFacts::Process(ProcessFacts::Alive { .. }))));
+}
+
+/// A rollout of `originator` (rollout `source: "vscode"`) in `cwd`, written up to now.
+fn app_thread(codex: &Path, n: u32, originator: &str, cwd: &Path) -> String {
+    let id = uuid(n);
+    let now = gilde_code_lib::discovery::now_wall_ms();
+    let day = codex.join("sessions/2026/10/26");
+    std::fs::create_dir_all(&day).unwrap();
+    let head = serde_json::json!({"timestamp": iso(now - 60_000), "type": "session_meta", "payload": {"id": id, "timestamp": iso(now - 60_000), "cwd": cwd, "originator": originator, "cli_version": "0.153.4", "source": "vscode"}});
+    let tail = serde_json::json!({"timestamp": iso(now - 5_000), "type": "event_msg", "payload": {"type": "task_started"}});
+    std::fs::write(day.join(format!("rollout-2026-10-26T10-00-00-{id}.jsonl")), format!("{head}\n{tail}\n")).unwrap();
+    id
+}
+
+/// A codex `app-server` under `host` (pid `pid - 1`, the app or the extension host).
+fn app_server(p: &FakeProcs, pid: i32, host_exec: &str, server_exec: &str) {
+    let start = gilde_code_lib::discovery::now_wall_ms() / 1000 - 600;
+    p.insert(pid - 1, FakeProc { ppid: 1, uid: UID, start_sec: start, comm: "host".into(), exec_path: Some(host_exec.into()), ..FakeProc::default() });
+    let mut s = claude_proc(start, pid - 1, &["codex", "-c", "features.code_mode_host=true", "app-server"], Path::new("/"));
+    s.exec_path = Some(server_exec.into());
+    p.insert(pid, s);
+}
+
+/// Codex app-servers: the desktop app's is ChatGptApp, an extension's VsCode;
+/// one is tied to a thread only as its app's only server with exactly one
+/// thread of that app written since it started, and then takes the thread's
+/// cwd unless it is the desktop app's per-chat folder.
+#[test]
+fn t_disc_codex_app_servers_and_their_threads() {
+    let h = Home::new();
+    let codex_dir = h.home.join(".codex");
+    let chat = h.home.join("Documents/Codex/2026-10-26/new-chat");
+    std::fs::create_dir_all(&chat).unwrap();
+    let repo = h.workdir("repo");
+    let desktop = app_thread(&codex_dir, 900, "codex_work_desktop", &chat);
+    let editor = app_thread(&codex_dir, 901, "codex_vscode", &repo);
+    let history = HistoryService::new(
+        HistorySources {
+            claude: vec![],
+            codex: vec![(gilde_code_lib::discovery::AccountSpec::new(Vendor::Codex, &codex_dir).id, codex_dir.clone())],
+            cursor_chats: None,
+            agy_dir: None,
+            home: h.home.clone(),
+            app_data: h.app_data.clone(),
+        },
+        Arc::new(MemoryUids::default()),
+        None,
+    );
+    history.refresh_index();
+    history.fill();
+
+    let p = procs();
+    let vscode_ext = "/Users/u/.vscode/extensions/openai.chatgpt-1-darwin-arm64/bin/macos-aarch64/codex";
+    let helper = "/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (Plugin).app/Contents/MacOS/Code Helper (Plugin)";
+    app_server(&p, 3001, "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT", "/Applications/ChatGPT.app/Contents/Resources/codex");
+    app_server(&p, 3101, helper, vscode_ext);
+    app_server(&p, 3201, helper, vscode_ext);
+    let mut bundles = FakeBundles::default();
+    bundles.0.insert("/Applications/ChatGPT.app".into(), ("com.openai.codex".into(), "ChatGPT".into()));
+    bundles.0.insert("/Applications/Visual Studio Code.app".into(), ("com.microsoft.VSCode".into(), "Code".into()));
+    let rec = Arc::new(Rec::default());
+    let mut cfg = h.config(p.clone(), Arc::new(TeamsRec::default()), Some(history));
+    cfg.accounts = vec![gilde_code_lib::discovery::AccountSpec::new(Vendor::Codex, &codex_dir)];
+    cfg.bundles = Arc::new(bundles);
+    let mut e = Engine::new(cfg, rec.clone());
+    e.reconcile();
+
+    let meta = |pid: i32| {
+        rec.for_pid(pid).into_iter().find_map(|u| match u.facts {
+            SourceFacts::Meta(m) => Some((u.hint.vendor_session_id.clone(), *m)),
+            _ => None,
+        })
+    };
+    let (sid, m) = meta(3001).expect("the desktop server");
+    assert_eq!(m.origin, Some(Origin::ChatGptApp));
+    assert_eq!(sid.as_deref(), Some(desktop.as_str()), "the desktop app's only server, its only live thread");
+    assert!(m.transcript_path.is_some(), "status comes from the thread's rollout");
+    assert_eq!(m.cwd, None, "a per-chat folder is not a project");
+    for pid in [3101, 3201] {
+        let (sid, m) = meta(pid).expect("an extension server");
+        assert_eq!(m.origin, Some(Origin::VsCode));
+        assert_eq!(sid, None, "two VS Code servers: which one runs the thread is unknown");
+    }
+
+    // One VS Code window left: its server is the thread's.
+    p.remove(3201);
+    rec.clear();
+    e.tick();
+    e.reconcile();
+    let (sid, m) = meta(3101).expect("the extension server");
+    assert_eq!(sid.as_deref(), Some(editor.as_str()));
+    assert_eq!(m.cwd.as_ref().map(|c| c.as_str()), Some(repo.to_str().unwrap()), "the thread's cwd is where the work is");
 }
 
 /// T-disc-resumeIds (§3.2): cursor ids need `meta.json` under `md5(cwd)`, agy

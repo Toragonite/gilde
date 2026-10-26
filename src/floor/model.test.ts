@@ -5,13 +5,17 @@
  */
 
 import type { MemberKey } from '../lib/gen/MemberKey';
+import type { Origin } from '../lib/gen/Origin';
 import type { Session } from '../lib/gen/Session';
 import type { StoreSnapshot } from '../lib/gen/StoreSnapshot';
 import { createAppStore } from '../store/useAppStore';
 import { assert, assertEqual, test } from '../test/harness';
+import { metrics } from './constants';
+import { SeatBook, buildRooms } from './layout';
 import type { FlVm } from './model';
 import { bottleneckOf, buildVm, cardAtCounter, counterBottleneck, oneLine } from './model';
 import { T0, showcaseSnapshot } from './testing';
+import { groupLabel, twinGroups } from './twinText';
 import { changes, factsOf } from './useAnnouncements';
 import { makeWords } from './words';
 
@@ -134,6 +138,40 @@ test('T-floor-model: a ticket carries its member’s card waiting on you', () =>
   snap.tasks = snap.tasks.map((t) => (t.key === task.key ? { ...t, owner: asker.key, status: 'inProgress', station: 'needsYou' } : t));
   const vm = vmOf(snap);
   assertEqual(cardAtCounter(vm, asker.sessionUid)?.key, task.key, 'the card is on the ticket');
+});
+
+test('T-floor-model: desks with no project sit in their app’s bay (ChatGPT app, VS Code), others under "no project"', () => {
+  const snap = showcaseSnapshot(8, [], 0);
+  const [a, b, c] = snap.sessions as Session[];
+  assert(a && b && c, 'three standalone sessions');
+  const watching = (origin: Origin): Session['control'] => ({ kind: 'watching', origin, owner: null });
+  snap.sessions = snap.sessions.map((x) =>
+    x.uid === a.uid
+      ? { ...x, projectId: null, control: watching('chatGptApp') }
+      : x.uid === b.uid
+        ? { ...x, projectId: null, control: watching('vsCode') }
+        : x.uid === c.uid
+          ? { ...x, projectId: null, control: watching('terminal') }
+          : x,
+  );
+  const vm = vmOf(snap);
+  const w = makeWords('ko');
+  const rooms = buildRooms(vm, metrics(1), new SeatBook(), {
+    scope: { kind: 'global' },
+    noProjectLabel: w.t('floor.noProject'),
+    appLabel: (o) => w.t(o === 'chatGptApp' ? 'origin.chatGptApp' : 'origin.vscode'),
+  });
+  const roomOf = (uid: string) => rooms.find((r) => r.seats.some((s) => s.id === uid));
+  assertEqual(roomOf(a.uid)?.label, 'ChatGPT 앱', 'the desktop app’s bay');
+  assertEqual(roomOf(b.uid)?.label, 'VS Code', 'the editor’s bay');
+  assertEqual(roomOf(c.uid)?.label, '프로젝트 없음', 'a terminal session with no project');
+  assertEqual(roomOf(a.uid)?.projectId, null, 'an app bay is no project');
+  const labels = rooms.map((r) => r.label);
+  assert(labels.indexOf('VS Code') < labels.indexOf('프로젝트 없음'), 'app bays come before "no project"');
+  const twin = twinGroups(vm, { kind: 'global' });
+  assertEqual(twin.map((g) => g.key).join(), rooms.map((r) => r.key).join(), 'the text twin has the canvas’s bays');
+  const app = twin.find((g) => g.solo.some((s) => s.id === a.uid));
+  assert(app && groupLabel('ko', app, false).includes('ChatGPT 앱'), 'the twin names the app');
 });
 
 test('T-floor-model: names are one line', () => {

@@ -640,7 +640,20 @@ fn before(a: &CursorPos, b: &CursorPos) -> bool {
     (b.score, b.mtime, std::cmp::Reverse(&b.phash)) < (a.score, a.mtime, std::cmp::Reverse(&a.phash))
 }
 
-fn origin_of(row: &IndexRow) -> Origin {
+/// A codex row's entrypoint for a thread of the desktop app: its rollouts say
+/// `source: "vscode"` like the VS Code extension's, only the `originator`
+/// (`codex_work_desktop`, `codex_vscode`) tells them apart.
+const CODEX_DESKTOP_ENTRYPOINT: &str = "desktop";
+
+/// A codex rollout's `source`, or [`CODEX_DESKTOP_ENTRYPOINT`] for the desktop app.
+fn codex_entrypoint(source: Option<String>, originator: Option<&str>) -> Option<String> {
+    match (source.as_deref(), originator) {
+        (Some("vscode"), Some(o)) if o.contains("desktop") => Some(CODEX_DESKTOP_ENTRYPOINT.to_string()),
+        _ => source,
+    }
+}
+
+pub(crate) fn origin_of(row: &IndexRow) -> Origin {
     match row.vendor {
         Vendor::Claude if row.is_teammate => Origin::TerminalTeam,
         Vendor::Claude => match row.entrypoint.as_deref() {
@@ -650,6 +663,7 @@ fn origin_of(row: &IndexRow) -> Origin {
             _ => Origin::Unknown,
         },
         Vendor::Codex => match row.entrypoint.as_deref() {
+            Some(CODEX_DESKTOP_ENTRYPOINT) => Origin::ChatGptApp,
             Some("vscode") => Origin::VsCode,
             Some("exec") => Origin::Headless,
             Some("cli") => Origin::Terminal,
@@ -1020,7 +1034,7 @@ impl HistoryService {
         m.file = id;
         if let Some(h) = head {
             m.cwd = h.cwd;
-            m.entrypoint = h.source;
+            m.entrypoint = codex_entrypoint(h.source, h.originator.as_deref());
             m.first_row_at = h.started_at;
         }
         m.last_row_at = last;
@@ -1665,6 +1679,9 @@ impl IndexStore for SqliteIndexStore {
                     Vendor::Cursor => RowKind::CursorChat,
                     Vendor::Agy => RowKind::AgySummary,
                 };
+                // A desktop-app thread stored before its entrypoint was told
+                // apart from the VS Code extension's reads its head again.
+                let loaded = !(vendor == Vendor::Codex && t.9.as_deref() == Some("vscode"));
                 Some(IndexRow {
                     path: PathBuf::from(t.0),
                     kind,
@@ -1683,7 +1700,7 @@ impl IndexStore for SqliteIndexStore {
                     first_row_at: t.15,
                     last_row_at: t.16,
                     scanned_at: t.17,
-                    loaded: true,
+                    loaded,
                 })
             })
             .collect()
@@ -1724,6 +1741,20 @@ mod tests {
         assert!(fuzzy_score(&fold("한글"), &fold(&nfd)).is_some());
         assert!(fuzzy_score(&fold("graph"), &fold("Graph panel")).unwrap() > fuzzy_score(&fold("graph"), &fold("go run a parse helper")).unwrap_or(i32::MIN));
         assert_eq!(fuzzy_score("", "x"), Some(0));
+    }
+
+    #[test]
+    fn a_desktop_app_thread_is_told_apart_from_the_vscode_extensions_by_originator() {
+        let row = |entrypoint: Option<String>| {
+            let mut r = IndexRow::new(PathBuf::from("/r.jsonl"), RowKind::Rollout, Vendor::Codex, None, None, FileId::default());
+            r.entrypoint = entrypoint;
+            r
+        };
+        let desktop = codex_entrypoint(Some("vscode".into()), Some("codex_work_desktop"));
+        assert_eq!(origin_of(&row(desktop)), Origin::ChatGptApp);
+        assert_eq!(origin_of(&row(codex_entrypoint(Some("vscode".into()), Some("codex_vscode")))), Origin::VsCode);
+        assert_eq!(origin_of(&row(codex_entrypoint(Some("vscode".into()), None))), Origin::VsCode);
+        assert_eq!(origin_of(&row(codex_entrypoint(Some("exec".into()), Some("codex_exec")))), Origin::Headless);
     }
 
     #[test]

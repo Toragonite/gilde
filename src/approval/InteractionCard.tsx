@@ -134,6 +134,8 @@ export function ownerWord(session: Session, t: T): string {
   switch (session.control.origin) {
     case 'vsCode':
       return t('origin.vscode');
+    case 'chatGptApp':
+      return t('origin.chatGptApp');
     case 'itermTeam':
       return t('origin.itermTeam');
     case 'background':

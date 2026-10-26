@@ -111,6 +111,7 @@ export const GROUP_KEY: Readonly<Record<Group, MessageKey>> = {
 export const ORIGIN_KEY: Readonly<Record<Origin, MessageKey>> = {
   terminal: 'origin.terminal',
   vsCode: 'origin.vscode',
+  chatGptApp: 'origin.chatGptApp',
   itermTeam: 'origin.itermTeam',
   tmuxTeam: 'origin.tmuxTeam',
   terminalTeam: 'origin.terminalTeam',
@@ -123,7 +124,7 @@ export const ORIGIN_KEY: Readonly<Record<Origin, MessageKey>> = {
 
 /** The origins the "Where" filter offers; the orchestrator only when that layer is present (P8). */
 export function originChoices(orchestrator: boolean): Origin[] {
-  const all: Origin[] = ['terminal', 'vsCode', 'itermTeam', 'tmuxTeam', 'terminalTeam', 'background', 'headless', 'otherGilde'];
+  const all: Origin[] = ['terminal', 'vsCode', 'chatGptApp', 'itermTeam', 'tmuxTeam', 'terminalTeam', 'background', 'headless', 'otherGilde'];
   return orchestrator ? [...all, 'orchestrator'] : all;
 }
 

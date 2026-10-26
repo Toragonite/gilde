@@ -8,9 +8,12 @@
 //!   first_user_message, created_at_ms, updated_at_ms, source, archived FROM
 //!   threads` (`title`/`first_user_message` are **[content]**, memory only).
 //!   `auth.json` is never opened.
-//! * Processes: `app-server` (a VS Code child) → VsCode origin, thread unknown;
-//!   `codex resume <id>` → that id; plain TUI → cwd only. An unmapped live
-//!   session is Status unknown{NoThreadMap}; mapping heuristics are not shipped.
+//! * Processes: `app-server` → ChatGptApp origin under the OpenAI desktop app,
+//!   else VsCode (an editor extension); tied to a thread only when it is its
+//!   app's only server and exactly one thread of that app (`originator`) was
+//!   written since it started (`reconcile::app_server_thread`), then its cwd
+//!   is the thread's. `codex resume <id>` → that id; plain TUI → cwd only. An
+//!   unmapped live session is Status unknown{NoThreadMap}.
 
 use std::path::{Path, PathBuf};
 

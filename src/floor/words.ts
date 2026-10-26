@@ -36,6 +36,7 @@ const ERROR_KEY: Readonly<Record<string, MessageKey>> = {
 const ORIGIN_KEY: Readonly<Partial<Record<Origin, MessageKey>>> = {
   terminal: 'origin.terminal',
   vsCode: 'origin.vscode',
+  chatGptApp: 'origin.chatGptApp',
   itermTeam: 'origin.itermTeam',
   background: 'origin.background',
   headless: 'origin.headless',
@@ -49,11 +50,21 @@ export function stateWord(locale: Locale, seat: Pick<FlSeat, 'state' | 'errorSub
   return seat.likely ? translate(locale, 'state.likely', { state: word }) : word;
 }
 
+/** The message key of an origin's word, when the Floor names it. */
+export function originKey(origin: Origin): MessageKey | undefined {
+  return ORIGIN_KEY[origin];
+}
+
+/** The word of an origin ("VS Code", "ChatGPT 앱"), or `null`. */
+export function originWord(locale: Locale, origin: Origin): string | null {
+  const key = originKey(origin);
+  return key ? translate(locale, key) : null;
+}
+
 /** Where a Watching session runs ("VS Code", "Terminal"), or `null`. */
 export function ownerWord(locale: Locale, seat: Pick<FlSeat, 'ownerApp' | 'origin'>): string | null {
   if (seat.ownerApp) return seat.ownerApp;
-  const key = seat.origin ? ORIGIN_KEY[seat.origin] : undefined;
-  return key ? translate(locale, key) : null;
+  return seat.origin ? originWord(locale, seat.origin) : null;
 }
 
 /** "Gilde에서 실행" or "지켜보는 중 · {owner}에서 실행". */

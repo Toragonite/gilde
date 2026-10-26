@@ -55,6 +55,14 @@ fn civil(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+/// ISO-8601 UTC with milliseconds (rollout `timestamp`) for wall ms.
+pub fn iso(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let (y, m, d) = civil(secs.div_euclid(86_400));
+    let rem = secs.rem_euclid(86_400);
+    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.{:03}Z", rem / 3600, rem % 3600 / 60, rem % 60, ms.rem_euclid(1000))
+}
+
 /// `procStart` (UTC ctime, space-padded day) for kernel start `secs`.
 pub fn ctime_utc(secs: i64) -> String {
     let days = secs.div_euclid(86_400);

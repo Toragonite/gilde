@@ -12,6 +12,7 @@
  * can be checked without a browser.
  */
 
+import type { Origin } from '../lib/gen/Origin';
 import type { ProjectId } from '../lib/gen/ProjectId';
 import type { TeamKey } from '../lib/gen/TeamKey';
 import { AX, BUB_BAND, CELL, LANES, LANE_BAND, LANE_GAP, MARGIN, PAD, SHELF_GAP, SHELF_H, SHELF_W, STRIP_LANES, WALL } from './constants';
@@ -83,6 +84,25 @@ export class SeatBook {
 
 export const NO_PROJECT = '__none__';
 
+/**
+ * Apps whose desks with no project get a bay of their own, before "no
+ * project": their codex servers run in `/` and serve the app, not a folder.
+ */
+export const APP_BAYS: readonly Origin[] = ['chatGptApp', 'vsCode'];
+
+export const appBay = (origin: Origin): string => `__app:${origin}__`;
+
+/** The app of an app bay's id (or seat-book key), else `null`. */
+export function appOfBay(id: string): Origin | null {
+  return APP_BAYS.find((o) => id.endsWith(appBay(o))) ?? null;
+}
+
+/** A desk's bay: its project when known, else its app's bay, else "no project". */
+export function bayOf(known: ReadonlySet<string>, projectId: ProjectId | null, origin: Origin | null = null): string {
+  if (projectId && known.has(projectId)) return projectId;
+  return origin && APP_BAYS.includes(origin) ? appBay(origin) : NO_PROJECT;
+}
+
 export function lineWidth(team: FlTeam): number {
   return PAD * 2 + (team.inferred ? 0 : SHELF_W + SHELF_GAP) + team.line.length * CELL + SHELF_GAP + SHELF_W;
 }
@@ -91,6 +111,8 @@ export interface SceneOptions {
   scope: FloorScope;
   /** Bay label for sessions and teams with no known project. */
   noProjectLabel: string;
+  /** Bay label of an app's desks with no project (`APP_BAYS`). */
+  appLabel: (origin: Origin) => string;
 }
 
 /** Bays with their lines and seats (unplaced: x = y = 0). */
@@ -98,14 +120,19 @@ export function buildRooms(vm: FlVm, M: Metrics, book: SeatBook, opts: SceneOpti
   const global = opts.scope.kind === 'global';
   const scopeKey = opts.scope.kind === 'team' ? opts.scope.teamKey : null;
   const teams = global ? vm.teams.filter((t) => t.alive) : vm.teams.filter((t) => t.key === scopeKey);
-  const known = new Set(vm.projects.map((p) => p.id));
-  const bucket = (pid: ProjectId | null): string => (pid && known.has(pid) ? pid : NO_PROJECT);
+  const known = new Set<string>(vm.projects.map((p) => p.id));
   const order: { id: string; label: string }[] = vm.projects.map((p) => ({ id: p.id as string, label: p.name }));
+  for (const o of APP_BAYS) order.push({ id: appBay(o), label: opts.appLabel(o) });
   order.push({ id: NO_PROJECT, label: opts.noProjectLabel });
   const rooms: Room[] = [];
   for (const p of order) {
-    const lineTeams = teams.filter((t) => bucket(t.projectId) === p.id);
-    const solo = global ? vm.solo.filter((id) => bucket(vm.seats.get(id)?.projectId ?? null) === p.id) : [];
+    const lineTeams = teams.filter((t) => bayOf(known, t.projectId) === p.id);
+    const solo = global
+      ? vm.solo.filter((id) => {
+          const seat = vm.seats.get(id);
+          return bayOf(known, seat?.projectId ?? null, seat?.origin ?? null) === p.id;
+        })
+      : [];
     if (lineTeams.length === 0 && solo.length === 0) continue;
     const key = (global ? 'g:' : 't:') + p.id;
     const seats = solo.map((id) => ({ id, idx: book.seatOf(key, id) }));
@@ -121,7 +148,7 @@ export function buildRooms(vm: FlVm, M: Metrics, book: SeatBook, opts: SceneOpti
     const linesH = lineTeams.length ? lineTeams.length * M.lineH + (lineTeams.length - 1) * M.signH : 0;
     const room: Room = {
       key,
-      projectId: p.id === NO_PROJECT ? null : (p.id as ProjectId),
+      projectId: known.has(p.id) ? (p.id as ProjectId) : null,
       label: p.label,
       x: 0,
       y: 0,

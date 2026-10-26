@@ -112,6 +112,12 @@ pub trait ProcSource: Send + Sync {
     fn task_info(&self, pid: i32) -> Option<TaskInfo>;
     fn alive(&self, pid: i32) -> Alive;
     fn my_uid(&self) -> u32;
+    /// The parent pid and command name, for the owner walk. Unlike
+    /// [`Self::bsd_info`] it also answers for another user's process: the
+    /// root-owned `login` between Terminal and the shell.
+    fn parent_of(&self, pid: i32) -> Option<(i32, String)> {
+        self.bsd_info(pid).map(|b| (b.ppid, b.comm))
+    }
 }
 
 /// The real source.
@@ -217,6 +223,22 @@ impl ProcSource for Libproc {
             start_sec: info.pbi_start_tvsec as i64,
             comm,
         })
+    }
+
+    /// `PROC_PIDTBSDINFO` is refused (`EPERM`) for another user's process;
+    /// `PROC_PIDT_SHORTBSDINFO` is not.
+    fn parent_of(&self, pid: i32) -> Option<(i32, String)> {
+        if let Some(b) = self.bsd_info(pid) {
+            return Some((b.ppid, b.comm));
+        }
+        // SAFETY: all-zero is a valid `proc_bsdshortinfo`.
+        let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdshortinfo>() as libc::c_int;
+        // SAFETY: `info` is valid for `size` bytes.
+        let r = unsafe {
+            libc::proc_pidinfo(pid, libc::PROC_PIDT_SHORTBSDINFO, 0, (&mut info as *mut libc::proc_bsdshortinfo).cast(), size)
+        };
+        (r == size).then(|| (info.pbsi_ppid as i32, c_chars_to_string(&info.pbsi_comm)))
     }
 
     fn exec_path(&self, pid: i32) -> Option<String> {
@@ -695,13 +717,13 @@ pub fn walk_ancestry(source: &dyn ProcSource, bundles: &dyn BundleInfo, start_pp
         if pid <= 1 || !seen.insert(pid) {
             break;
         }
-        let Some(info) = source.bsd_info(pid) else { break };
+        let Some((ppid, comm)) = source.parent_of(pid) else { break };
         let path = source.exec_path(pid);
-        let base = path.as_deref().map(basename).unwrap_or(info.comm.as_str()).to_string();
-        if base.starts_with("iTermServer") || base == "Terminal" || base == "login" || info.comm == "login" {
+        let base = path.as_deref().map(basename).unwrap_or(comm.as_str()).to_string();
+        if base.starts_with("iTermServer") || base == "Terminal" || base == "login" || comm == "login" {
             out.terminal_ancestor = true;
         }
-        if base == "Code Helper (Plugin)" || info.comm.starts_with("Code Helper (Plugin") {
+        if base == "Code Helper (Plugin)" || comm.starts_with("Code Helper (Plugin") {
             out.vscode_plugin_ancestor = true;
         }
         if out.owner.is_none() {
@@ -712,7 +734,7 @@ pub fn walk_ancestry(source: &dyn ProcSource, bundles: &dyn BundleInfo, start_pp
                 }
             }
         }
-        pid = info.ppid;
+        pid = ppid;
     }
     out
 }
@@ -769,6 +791,21 @@ pub fn other_vendor_origin(a: &Ancestry, gilde_marker_without_row: bool) -> Orig
         Origin::Terminal
     } else {
         Origin::Unknown
+    }
+}
+
+/// Bundle ids of the OpenAI desktop app, which runs its own `codex app-server`.
+pub const CHATGPT_APP_BUNDLES: &[&str] = &["com.openai.codex", "com.openai.chat"];
+
+/// A codex `app-server`: the desktop app's own server when the owner app is
+/// the OpenAI desktop app, else an editor extension's (VS Code and its forks).
+pub fn app_server_origin(a: &Ancestry) -> Origin {
+    let desktop = !a.vscode_plugin_ancestor
+        && a.owner.as_ref().is_some_and(|o| CHATGPT_APP_BUNDLES.contains(&o.bundle_id.as_str()));
+    if desktop {
+        Origin::ChatGptApp
+    } else {
+        Origin::VsCode
     }
 }
 
@@ -1107,6 +1144,8 @@ impl ProcSource for FakeProcs {
         v.sort_unstable();
         v
     }
+    /// Refused for another user's process, as the kernel refuses
+    /// `PROC_PIDTBSDINFO` to anyone but root.
     fn bsd_info(&self, pid: i32) -> Option<BsdInfo> {
         self.with(pid, |p| BsdInfo {
             pid,
@@ -1115,6 +1154,10 @@ impl ProcSource for FakeProcs {
             start_sec: p.start_sec,
             comm: p.comm.clone(),
         })
+        .filter(|b| self.uid == 0 || b.uid == self.uid)
+    }
+    fn parent_of(&self, pid: i32) -> Option<(i32, String)> {
+        self.with(pid, |p| (p.ppid, p.comm.clone()))
     }
     fn exec_path(&self, pid: i32) -> Option<String> {
         self.with(pid, |p| p.exec_path.clone()).flatten()
@@ -1314,5 +1357,34 @@ mod tests {
         assert!(a.vscode_plugin_ancestor);
         assert_eq!(owner_kind("com.example.x", "Example").0, "Example");
         assert_eq!(app_bundle_of("/A/B.app/Contents/MacOS/b"), Some("/A/B.app"));
+    }
+
+    #[test]
+    fn the_walk_passes_the_root_owned_login_between_terminal_and_the_shell() {
+        let fake = FakeProcs::new(501);
+        fake.insert(10, FakeProc { ppid: 1, uid: 501, start_sec: 1, comm: "Terminal".into(), exec_path: Some("/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal".into()), ..Default::default() });
+        fake.insert(11, FakeProc { ppid: 10, uid: 0, start_sec: 2, comm: "login".into(), exec_path: Some("/usr/bin/login".into()), ..Default::default() });
+        fake.insert(12, FakeProc { ppid: 11, uid: 501, start_sec: 3, comm: "zsh".into(), exec_path: Some("/bin/zsh".into()), ..Default::default() });
+        assert_eq!(fake.bsd_info(11), None, "PROC_PIDTBSDINFO is refused for root's login");
+        let mut b = FakeBundles::default();
+        b.0.insert("/System/Applications/Utilities/Terminal.app".into(), ("com.apple.Terminal".into(), "Terminal".into()));
+        let a = walk_ancestry(&fake, &b, 12);
+        assert!(a.terminal_ancestor);
+        assert_eq!(a.owner.map(|o| o.app_name).as_deref(), Some("Terminal"), "the walk goes on past login");
+        assert_eq!(other_vendor_origin(&walk_ancestry(&fake, &b, 12), false), Origin::Terminal);
+    }
+
+    #[test]
+    fn an_app_server_is_the_desktop_apps_only_under_the_openai_app() {
+        let owner = |bundle: &str| Ancestry {
+            owner: Some(OwnerApp { app_pid: 9, app_name: "x".into(), kind: OwnerKind::Other, bundle_id: bundle.into() }),
+            ..Ancestry::default()
+        };
+        assert_eq!(app_server_origin(&owner("com.openai.codex")), Origin::ChatGptApp);
+        assert_eq!(app_server_origin(&owner("com.openai.chat")), Origin::ChatGptApp);
+        let vscode = Ancestry { vscode_plugin_ancestor: true, ..owner("com.microsoft.VSCode") };
+        assert_eq!(app_server_origin(&vscode), Origin::VsCode);
+        assert_eq!(app_server_origin(&owner("com.todesktop.cursor")), Origin::VsCode, "another editor's extension");
+        assert_eq!(app_server_origin(&Ancestry::default()), Origin::VsCode);
     }
 }

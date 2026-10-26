@@ -38,11 +38,11 @@ use super::claude::registry::{self, RegKind, Verdict};
 use super::claude::teams::{self, InProcessMeta, InboxCache, LeadJoin, LiveLeadCandidate, LiveTeammate, TasksRead, TeamDirRead};
 use super::claude::transcripts::{self, HeadMeta, TailMeta, TailMode};
 use super::fsevents::{FsSignal, FsWatch, RootTag, WatchSpec};
-use super::history::{HistoryService, HistorySources};
+use super::history::{self, HistoryService, HistorySources};
 use super::kqueue::{KqEvent, KqWatcher, Track};
 use super::procs::{
-    claude_origin, other_vendor_origin, BundleInfo, Libproc, NsBundleInfo, OriginInputs, ProcSource, ScannedProc,
-    Scanner, SCAN_BACKGROUND_MS, SCAN_FOCUSED_MS, UNREGISTERED_GRACE_MS,
+    app_server_origin, claude_origin, other_vendor_origin, BundleInfo, Libproc, NsBundleInfo, OriginInputs, ProcSource,
+    ScannedProc, Scanner, SCAN_BACKGROUND_MS, SCAN_FOCUSED_MS, UNREGISTERED_GRACE_MS,
 };
 use super::safe_read::{self, Backoff, FileId, ReadError, Root};
 use super::{
@@ -54,6 +54,10 @@ use super::{
 pub const RECONCILE_MS: u64 = 60_000;
 /// Per-path FSEvents debounce floor (§5.9).
 pub const DEBOUNCE_MS: u64 = 250;
+/// How recently a thread must have been written to tie a codex `app-server` to it.
+pub const APP_SERVER_THREAD_MS: i64 = 300_000;
+/// The desktop app's per-chat folders (`~/Documents/Codex/<date>/<chat>`): not projects.
+const DESKTOP_CHATS_DIR: &str = "Documents/Codex";
 /// The kqueue token of `$HOME` and of the orchestrator dir.
 const TOKEN_HOME: u64 = 1;
 const TOKEN_ORCH: u64 = 2;
@@ -666,11 +670,42 @@ impl Engine {
         self.accounts.iter().find(|a| a.spec.vendor == Vendor::Codex).map(|a| a.spec.id.clone())
     }
 
+    /// The thread a codex `app-server` runs. An app-server can host several
+    /// threads and nothing on disk names its pid, so it is tied to one only
+    /// when it is its app's only server and exactly one thread of that app
+    /// (`originator`) was written since it started, in the last
+    /// [`APP_SERVER_THREAD_MS`]. The tie holds while the process lives,
+    /// until another single thread takes its place.
+    fn app_server_thread(&self, p: &ScannedProc, origin: Origin, servers: &HashMap<Origin, u32>) -> Option<String> {
+        let tied = self.tracked.get(&(p.pid, p.start_sec)).and_then(|t| t.hint.vendor_session_id.clone());
+        let Some(h) = self.cfg.history.as_ref().filter(|_| servers.get(&origin) == Some(&1)) else { return tied };
+        let taken: HashSet<&str> = self
+            .tracked
+            .iter()
+            .filter(|(k, _)| **k != (p.pid, p.start_sec))
+            .filter_map(|(_, t)| t.hint.vendor_session_id.as_deref())
+            .collect();
+        let since = (p.start_sec * 1000).max(now_wall_ms() - APP_SERVER_THREAD_MS);
+        let mut live = h.rows_since(since).into_iter().filter(|r| {
+            r.vendor == Vendor::Codex
+                && history::origin_of(r) == origin
+                && r.vendor_session_id.as_deref().is_some_and(|s| !taken.contains(s))
+        });
+        match (live.next(), live.next()) {
+            (Some(r), None) => r.vendor_session_id,
+            _ => tied,
+        }
+    }
+
     /// Sessions known from processes only: teammates, unregistered Claude
     /// processes (after 10 s), codex/cursor/agy processes, own processes.
     fn process_sessions(&mut self, now_up: u64) {
         let registered = self.registered_pids();
         let procs: Vec<ScannedProc> = self.scanner.procs().filter(|p| p.candidate).cloned().collect();
+        let mut servers: HashMap<Origin, u32> = HashMap::new();
+        for p in procs.iter().filter(|p| p.vendor == Some(Vendor::Codex) && p.labels.app_server && p.gilde_app_instance != Some(true)) {
+            *servers.entry(app_server_origin(&p.ancestry.clone().unwrap_or_default())).or_default() += 1;
+        }
         for p in procs {
             if registered.contains(&p.pid) {
                 continue; // the registry path owns it
@@ -727,16 +762,25 @@ impl Engine {
                     }));
                 }
                 Vendor::Codex => {
+                    let app_server = p.labels.app_server && !other_gilde;
                     hint.account_id = self.codex_account();
-                    hint.vendor_session_id = p.labels.resume.clone();
-                    meta.origin = Some(if p.labels.app_server && !other_gilde {
-                        Origin::VsCode
+                    if app_server {
+                        let origin = app_server_origin(&ancestry);
+                        meta.origin = Some(origin);
+                        hint.vendor_session_id = self.app_server_thread(&p, origin, &servers);
                     } else {
-                        other_vendor_origin(&ancestry, other_gilde)
-                    });
-                    if let (Some(h), Some(id)) = (&self.cfg.history, &p.labels.resume) {
-                        if let Some(row) = h.row_of(Vendor::Codex, id) {
-                            meta.transcript_path = abs_path(&row.path);
+                        meta.origin = Some(other_vendor_origin(&ancestry, other_gilde));
+                        hint.vendor_session_id = p.labels.resume.clone();
+                    }
+                    let row = self.cfg.history.as_ref().zip(hint.vendor_session_id.as_ref()).and_then(|(h, id)| h.row_of(Vendor::Codex, id));
+                    if let Some(row) = row {
+                        meta.transcript_path = abs_path(&row.path);
+                        // An app-server runs in `/`: the thread's cwd is where
+                        // the work is, except the desktop app's per-chat folder.
+                        let scratch = self.cfg.home.join(DESKTOP_CHATS_DIR);
+                        if let Some(c) = row.cwd.filter(|c| app_server && !Path::new(c).starts_with(&scratch)) {
+                            meta.cwd = real_abs_path(Path::new(&c));
+                            self.location_for(&c);
                         }
                     }
                 }

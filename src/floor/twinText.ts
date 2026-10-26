@@ -7,10 +7,10 @@
 import type { Locale } from '../i18n';
 import { translate } from '../i18n';
 import type { FloorScope } from './layout';
-import { NO_PROJECT } from './layout';
+import { APP_BAYS, NO_PROJECT, appBay, appOfBay, bayOf } from './layout';
 import type { FlItem, FlSeat, FlTeam, FlVm } from './model';
 import { currentItem, orderedItems } from './model';
-import { floorDuration, ownershipWord, stateWord } from './words';
+import { floorDuration, originWord, ownershipWord, stateWord } from './words';
 
 export interface TwinGroup {
   key: string;
@@ -19,22 +19,22 @@ export interface TwinGroup {
   solo: FlSeat[];
 }
 
-/** Bays in canvas order: project order, then "no project"; global shows live teams and standalone sessions. */
+/** Bays in canvas order: project order, the apps' bays, then "no project"; global shows live teams and standalone sessions. */
 export function twinGroups(vm: FlVm, scope: FloorScope, soloIndex: (bay: string, id: string) => number | undefined = () => undefined): TwinGroup[] {
   const global = scope.kind === 'global';
   const teams = global ? vm.teams.filter((t) => t.alive) : vm.teams.filter((t) => scope.kind === 'team' && t.key === scope.teamKey);
   const known = new Set(vm.projects.map((p) => p.id as string));
-  const bucket = (pid: string | null) => (pid && known.has(pid) ? pid : NO_PROJECT);
   const order: { id: string; label: string }[] = vm.projects.map((p) => ({ id: p.id as string, label: p.name }));
+  for (const o of APP_BAYS) order.push({ id: appBay(o), label: originWord('en', o) ?? o });
   order.push({ id: NO_PROJECT, label: translate('en', 'floor.noProject') });
   const out: TwinGroup[] = [];
   for (const p of order) {
-    const ts = teams.filter((t) => bucket(t.projectId) === p.id);
+    const ts = teams.filter((t) => bayOf(known, t.projectId) === p.id);
     const key = (global ? 'g:' : 't:') + p.id;
     const solo = global
       ? vm.solo
           .map((id) => vm.seats.get(id))
-          .filter((s): s is FlSeat => !!s && bucket(s.projectId) === p.id)
+          .filter((s): s is FlSeat => !!s && bayOf(known, s.projectId, s.origin) === p.id)
           .map((s, i) => ({ s, i, idx: soloIndex(key, s.id) }))
           .sort((a, b) => (a.idx ?? 1e9 + a.i) - (b.idx ?? 1e9 + b.i))
           .map((x) => x.s)
@@ -47,7 +47,8 @@ export function twinGroups(vm: FlVm, scope: FloorScope, soloIndex: (bay: string,
 
 export function groupLabel(locale: Locale, g: TwinGroup, noProject: boolean): string {
   const sessions = g.teams.reduce((n, t) => n + t.line.length, 0) + g.solo.length;
-  const project = noProject ? translate(locale, 'floor.noProject') : g.label;
+  const app = appOfBay(g.key);
+  const project = noProject ? translate(locale, 'floor.noProject') : app ? (originWord(locale, app) ?? g.label) : g.label;
   return translate(locale, 'floor.twinRoom', { project, sessions });
 }
 

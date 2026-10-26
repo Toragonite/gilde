@@ -4,4 +4,4 @@
 /**
  * Origin precedence: §3.4.4 `origin` row; `OtherGilde` from §5.2.2 [F-42, N-05].
  */
-export type Origin = "terminal" | "vsCode" | "itermTeam" | "tmuxTeam" | "terminalTeam" | "background" | "headless" | "orchestrator" | "otherGilde" | "unknown";
+export type Origin = "terminal" | "vsCode" | "chatGptApp" | "itermTeam" | "tmuxTeam" | "terminalTeam" | "background" | "headless" | "orchestrator" | "otherGilde" | "unknown";

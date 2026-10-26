@@ -89,6 +89,7 @@ export function glyphOf(session: Pick<Session, 'activity'>): GlyphKind {
 const ORIGIN_KEYS: Readonly<Record<Origin, MessageKey>> = {
   terminal: 'origin.terminal',
   vsCode: 'origin.vscode',
+  chatGptApp: 'origin.chatGptApp',
   itermTeam: 'origin.itermTeam',
   tmuxTeam: 'origin.tmuxTeam',
   terminalTeam: 'origin.terminalTeam',
