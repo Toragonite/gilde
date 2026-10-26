@@ -295,6 +295,66 @@
   accent-color: var(--n12);
 }
 
+.g-card-qheader {
+  align-self: flex-start;
+}
+
+/* Options that say more than a label (a description, a preview) stack and wrap. */
+.g-card-options:has(.g-card-odesc, .g-card-opreview) {
+  flex-direction: column;
+  align-items: stretch;
+}
+
+.g-card-options .g-cbtn:has(.g-card-odesc, .g-card-opreview) {
+  height: auto;
+  min-height: 28px;
+  padding: 4px 8px;
+  white-space: normal;
+  align-items: flex-start;
+  text-align: start;
+}
+
+.g-card-olabel {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.g-card-odesc {
+  color: var(--n9);
+  font-size: var(--fs-label);
+}
+
+.g-card-opreview {
+  margin: 2px 0 0;
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--n1);
+  font-size: var(--fs-label);
+  white-space: pre-wrap;
+  max-height: 160px;
+  overflow: auto;
+}
+
+.g-card-other {
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--n1);
+  color: var(--n11);
+  font: inherit;
+  font-size: var(--fs-sub);
+  min-width: 0;
+}
+
+.g-card-other:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .g-cbtn {
     transition: none;

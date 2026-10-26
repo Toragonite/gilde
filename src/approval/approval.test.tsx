@@ -156,16 +156,16 @@ test('A25.1: option roles — trustFolder marks the trust action, allowWithNote 
 test('T-ui-composerByKind: what ⏎ sends per card kind [F-11, N-12]', () => {
   assertEqual(composerModeFor(null).kind, 'send', 'no card: a message');
   assertEqual(composerModeFor(pending('a')).kind, 'denyWithMessage', 'tool approval');
-  const oneQ = pending('q', { kind: 'question', questions: [{ text: 'Which?', options: ['A', 'B'], multiSelect: false }] });
+  const oneQ = pending('q', { kind: 'question', questions: [{ text: 'Which?', options: ['A', 'B'], multiSelect: false, header: null, descriptions: [], previews: [] }] });
   assertDeepEqual(composerModeFor(oneQ), { kind: 'freeAnswer', requestId: 'q', questionIndex: 0 }, 'one question: free answer');
   const twoQ = pending('q2', {
     kind: 'question',
     questions: [
-      { text: 'Which?', options: ['A'], multiSelect: false },
-      { text: 'And?', options: ['B'], multiSelect: false },
+      { text: 'Which?', options: ['A'], multiSelect: false, header: null, descriptions: [], previews: [] },
+      { text: 'And?', options: ['B'], multiSelect: false, header: null, descriptions: [], previews: [] },
     ],
   });
-  assertEqual(composerModeFor(twoQ).kind, 'focusCard', 'several questions: focus the card, never a partial map');
+  assertEqual(composerModeFor(twoQ).kind, 'replyInstead', 'several questions: a reply instead of them, never a partial map');
   assertEqual(composerModeFor(pending('p', { kind: 'planApproval' })).kind, 'keepPlanning', 'plan');
   assertEqual(composerModeFor(pending('s', { kind: 'screenPrompt', promptRev: 'ab' })).kind, 'screenDenyWithReply', 'screen');
   assertEqual(composerModeFor(pending('u', { kind: 'setupPrompt', promptRev: 'ab' })).kind, 'keepDraft', 'setup: draft kept');
@@ -592,7 +592,7 @@ domTest(
     const q = pending('q1', {
       kind: 'question',
       title: '',
-      questions: [{ text: 'Apply to staging only?', options: ['Staging only', 'Both'], multiSelect: false }],
+      questions: [{ text: 'Apply to staging only?', options: ['Staging only', 'Both'], multiSelect: false, header: null, descriptions: [], previews: [] }],
     });
     setSessions([session(6, { pending: [q] })]);
     const view = render(<CardStack uid={uid(6)} />);
@@ -612,8 +612,8 @@ domTest(
       kind: 'question',
       detailLines: [{ key: 'card.duplicateQuestion', params: {} }],
       questions: [
-        { text: 'Same?', options: ['A', 'B'], multiSelect: false },
-        { text: 'Same?', options: ['C'], multiSelect: false },
+        { text: 'Same?', options: ['A', 'B'], multiSelect: false, header: null, descriptions: [], previews: [] },
+        { text: 'Same?', options: ['C'], multiSelect: false, header: null, descriptions: [], previews: [] },
       ],
     });
     setSessions([session(7, { pending: [q] })]);
@@ -626,6 +626,49 @@ domTest(
     key(card, 'Digit1');
     await settle();
     assertDeepEqual(answers(core).map((a) => a.decision), [{ kind: 'answer', answers: [{ questionIndex: 0, labels: ['A'], freeText: null }] }], 'only the first');
+  }),
+);
+
+domTest(
+  'Question: chips and option descriptions show; an answer typed in "Other" goes with the picks of the other questions',
+  harness(async (c, core) => {
+    const q = pending('q3', {
+      kind: 'question',
+      questions: [
+        {
+          text: 'Where should the codex servers go?',
+          header: 'app-server',
+          options: ['Hide them', 'Own room'],
+          descriptions: ['Not sessions: hidden from the Floor.', null],
+          previews: [null, null],
+          multiSelect: false,
+        },
+        { text: 'Which mode first?', header: null, options: ['Conversation'], descriptions: [], previews: [], multiSelect: false },
+      ],
+    });
+    setSessions([session(9, { pending: [q] })]);
+    const view = render(<CardStack uid={uid(9)} />);
+    pass(c);
+    assert(view.getByText('app-server') !== null, 'the chip');
+    assert(view.getByText('Not sessions: hidden from the Floor.') !== null, 'the description');
+    fireEvent.click(view.getByText('Own room'));
+    const other = view.getByLabelText(translate('en', 'card.otherLabel', { index: 2 })) as HTMLInputElement;
+    fireEvent.change(other, { target: { value: 'both modes, but Conversation first' } });
+    fireEvent.keyDown(other, { key: 'Enter', code: 'Enter' });
+    await settle();
+    assertDeepEqual(
+      answers(core).map((a) => a.decision),
+      [
+        {
+          kind: 'answer',
+          answers: [
+            { questionIndex: 0, labels: ['Own room'], freeText: null },
+            { questionIndex: 1, labels: [], freeText: 'both modes, but Conversation first' },
+          ],
+        },
+      ],
+      'the pick and the typed answer, in one map',
+    );
   }),
 );
 
@@ -753,7 +796,7 @@ test('A44.2 answerShortcut: every surface sends only what shortcutAction decides
       assertDeepEqual(answerShortcut(uid(1), headerless, 'primary'), { kind: 'inert', line: 'approval.useOwnKeys' }, 'A35.2 default_to_no screen card: inert');
       const careful = tool('r_no', { defaultToNo: true });
       assertDeepEqual(answerShortcut(uid(1), careful, 'primary'), { kind: 'inert', line: 'approval.defaultNo' }, 'default_to_no: ⌘⏎ inert');
-      const question = pending('q', { kind: 'question', questions: [{ text: 'Which?', options: ['a'], multiSelect: false }] });
+      const question = pending('q', { kind: 'question', questions: [{ text: 'Which?', options: ['a'], multiSelect: false, header: null, descriptions: [], previews: [] }] });
       assertEqual(answerShortcut(uid(1), question, 'primary').kind, 'open', 'a question needs its card');
       assertEqual(answerShortcut(uid(1), pending('p', { kind: 'planApproval' }), 'deny').kind, 'open', "a plan's reply needs its card");
       assertEqual(answerShortcut(uid(1), pending('w', { kind: 'watchedApproval' }), 'primary').kind, 'inert', 'a watched card is never answered');

@@ -241,6 +241,15 @@ export function answerableQuestions(pending: Pick<PendingInteraction, 'questions
 /** Selections per question index (labels in the order offered). */
 export type Selections = Readonly<Record<number, readonly string[]>>;
 
+/** Answers typed per question index (the card's "Other" field). */
+export type FreeTexts = Readonly<Record<number, string>>;
+
+/** The typed answer of a question, or null when nothing but whitespace was typed. */
+function typedAnswer(freeTexts: FreeTexts, questionIndex: number): string | null {
+  const text = freeTexts[questionIndex] ?? '';
+  return text.trim() === '' ? null : text;
+}
+
 /** Toggle `label` for a question: multi-select adds/removes, single-select replaces. */
 export function toggleSelection(selections: Selections, questionIndex: number, label: string, multiSelect: boolean): Selections {
   const current = selections[questionIndex] ?? [];
@@ -250,11 +259,24 @@ export function toggleSelection(selections: Selections, questionIndex: number, l
   return { ...selections, [questionIndex]: next };
 }
 
-/** The `Answer` decision for the selections, or null while an answerable question has none. */
-export function answerFromSelections(pending: Pick<PendingInteraction, 'questions'>, selections: Selections): Decision | null {
+/**
+ * The `Answer` decision for the selections, or null while an answerable
+ * question has neither a pick nor a typed answer. A typed answer wins over the
+ * picks of its question (the vendor takes one value per question).
+ */
+export function answerFromSelections(
+  pending: Pick<PendingInteraction, 'questions'>,
+  selections: Selections,
+  freeTexts: FreeTexts = {},
+): Decision | null {
   const answers: QuestionAnswer[] = [];
   for (const i of answerableQuestions(pending)) {
     const q = pending.questions[i];
+    const typed = typedAnswer(freeTexts, i);
+    if (q && typed !== null) {
+      answers.push({ questionIndex: i, labels: [], freeText: typed });
+      continue;
+    }
     const picked = selections[i] ?? [];
     if (!q || picked.length === 0) return null;
     const labels = q.options.filter((o) => picked.includes(o));
@@ -264,10 +286,10 @@ export function answerFromSelections(pending: Pick<PendingInteraction, 'question
   return answers.length > 0 ? { kind: 'answer', answers } : null;
 }
 
-/** The first answerable question without a selection (where digits apply), else the last answerable one. */
-export function currentQuestion(pending: Pick<PendingInteraction, 'questions'>, selections: Selections): number {
+/** The first answerable question without a selection or a typed answer (where digits apply), else the last answerable one. */
+export function currentQuestion(pending: Pick<PendingInteraction, 'questions'>, selections: Selections, freeTexts: FreeTexts = {}): number {
   const answerable = answerableQuestions(pending);
-  for (const i of answerable) if ((selections[i] ?? []).length === 0) return i;
+  for (const i of answerable) if ((selections[i] ?? []).length === 0 && typedAnswer(freeTexts, i) === null) return i;
   return answerable[answerable.length - 1] ?? 0;
 }
 
@@ -289,8 +311,10 @@ export const ARM_MS = 700;
  *  - `denyWithMessage` (tool approval) — hint `approval.composerHint`;
  *  - `freeAnswer` (a question with exactly one unanswered question) — hint
  *    `approval.composerAnswerHint`;
- *  - `focusCard` (a question with several unanswered questions: `⏎` moves
- *    focus to the card instead of sending a partial answer map) — same hint;
+ *  - `replyInstead` (a question with several unanswered questions): the
+ *    card takes the answers; what is typed here goes back instead of them, as
+ *    a `DenyWithMessage` (never a partial answer map) — hint
+ *    `approval.composerReplyInsteadHint`; `⏎` on an empty draft focuses the card;
  *  - `keepPlanning` (plan) — hint `plan.composerHint`;
  *  - `screenDenyWithReply` (screen prompt) — hint `approval.composerHint`;
  *  - `keepDraft` (setup prompt, watched card): nothing is sent, the draft stays;
@@ -300,7 +324,7 @@ export type ComposerMode =
   | { kind: 'send' }
   | { kind: 'denyWithMessage'; requestId: PendingInteraction['requestId'] }
   | { kind: 'freeAnswer'; requestId: PendingInteraction['requestId']; questionIndex: number }
-  | { kind: 'focusCard'; requestId: PendingInteraction['requestId'] }
+  | { kind: 'replyInstead'; requestId: PendingInteraction['requestId'] }
   | { kind: 'keepPlanning'; requestId: PendingInteraction['requestId'] }
   | { kind: 'screenDenyWithReply'; requestId: PendingInteraction['requestId']; promptRev: string }
   | { kind: 'keepDraft'; requestId: PendingInteraction['requestId'] };
@@ -313,7 +337,7 @@ export function composerModeFor(top: PendingInteraction | null): ComposerMode {
     case 'question': {
       const answerable = answerableQuestions(top);
       if (answerable.length === 1) return { kind: 'freeAnswer', requestId: top.requestId, questionIndex: answerable[0] as number };
-      return { kind: 'focusCard', requestId: top.requestId };
+      return { kind: 'replyInstead', requestId: top.requestId };
     }
     case 'planApproval':
       return { kind: 'keepPlanning', requestId: top.requestId };
@@ -329,14 +353,15 @@ export function composerModeFor(top: PendingInteraction | null): ComposerMode {
 /** The hint key the armed composer shows for a mode (null = no hint). */
 export function composerHintKey(
   mode: ComposerMode,
-): 'approval.composerHint' | 'approval.composerAnswerHint' | 'plan.composerHint' | null {
+): 'approval.composerHint' | 'approval.composerAnswerHint' | 'approval.composerReplyInsteadHint' | 'plan.composerHint' | null {
   switch (mode.kind) {
     case 'denyWithMessage':
     case 'screenDenyWithReply':
       return 'approval.composerHint';
     case 'freeAnswer':
-    case 'focusCard':
       return 'approval.composerAnswerHint';
+    case 'replyInstead':
+      return 'approval.composerReplyInsteadHint';
     case 'keepPlanning':
       return 'plan.composerHint';
     default:

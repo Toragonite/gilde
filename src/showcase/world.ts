@@ -381,7 +381,7 @@ export function questionCard(uid: SessionUid, n: number, receivedAt: number): Pe
     promptRev: null,
     confidence: 'high',
     multiSelect: false,
-    questions: [{ text: 'Which database should the cache use?', options: ['Redis', 'Postgres', 'In-memory only'], multiSelect: false }],
+    questions: [{ text: 'Which database should the cache use?', options: ['Redis', 'Postgres', 'In-memory only'], multiSelect: false, header: null, descriptions: [], previews: [] }],
   };
 }
 

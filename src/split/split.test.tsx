@@ -416,7 +416,7 @@ domTest(
     const question = pending('q1', {
       kind: 'question',
       title: 'Which region?',
-      questions: [{ text: 'Which region?', options: ['eu', 'us'], multiSelect: false }],
+      questions: [{ text: 'Which region?', options: ['eu', 'us'], multiSelect: false, header: null, descriptions: [], previews: [] }],
       options: [
         { key: '1', label: 'eu', role: 'answer' },
         { key: '2', label: 'us', role: 'answer' },

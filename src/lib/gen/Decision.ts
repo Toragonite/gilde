@@ -8,7 +8,8 @@ import type { QuestionAnswer } from "./QuestionAnswer";
  * Value rules: `labels` non-empty unless `free_text` is present; more than one
  * label only for `multi_select` questions; `question_index` < number of
  * questions; `Answer` only for `Question` cards, `ApprovePlan`/`KeepPlanning`
- * only for `PlanApproval` cards, `AllowSession` only when `always_label` is set
+ * only for `PlanApproval` cards, `DenyWithMessage` for `ToolApproval` cards and
+ * for `Question` cards (the user replies instead of answering), `AllowSession` only when `always_label` is set
  * (else `UNSUPPORTED{allowSessionHidden}`), otherwise
  * `INVALID_ARGUMENT{field:"decision", rule:"kindForCard"}` (checked against
  * the card by the session actor: [`Decision::fits`]). A `Deny` needs no

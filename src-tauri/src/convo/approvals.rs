@@ -59,6 +59,10 @@ pub const DEGRADED_INPUT_CAP: TextCap = TextCap::Bytes(4 * 1024);
 /// Question text ≤ 400, option label ≤ 120 (§3.4.5).
 pub const QUESTION_CAP: TextCap = TextCap::Chars(400);
 pub const LABEL_CAP: TextCap = TextCap::Chars(120);
+/// A question's chip ≤ 40, an option's description ≤ 400, its preview ≤ 2 KiB.
+pub const HEADER_CAP: TextCap = TextCap::Chars(40);
+pub const DESCRIPTION_CAP: TextCap = TextCap::Chars(400);
+pub const PREVIEW_CAP: TextCap = TextCap::Bytes(2 * 1024);
 /// A subagent's label (F-28).
 pub const AGENT_LABEL_CAP: TextCap = TextCap::Chars(60);
 /// The label of a subagent whose task frame was not seen (F-28): the
@@ -181,6 +185,8 @@ struct QuestionIn {
     #[serde(default)]
     question: Option<String>,
     #[serde(default)]
+    header: Option<String>,
+    #[serde(default)]
     options: Option<Vec<OptionIn>>,
     #[serde(rename = "multiSelect", default)]
     multi_select: Option<bool>,
@@ -190,6 +196,15 @@ struct QuestionIn {
 struct OptionIn {
     #[serde(default)]
     label: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    preview: Option<String>,
+}
+
+/// A shown text, or `None` when absent or nothing is left after sanitising.
+fn shown(text: Option<&str>, cap: TextCap) -> Option<String> {
+    text.map(|t| display(t, cap)).filter(|t| !t.trim().is_empty())
 }
 
 fn str_of<'v>(o: &'v Map<String, Value>, k: &str) -> Option<&'v str> {
@@ -366,7 +381,8 @@ pub fn build_request(request_id: &str, request: &RawValue, ctx: &CardContext<'_>
         let mut duplicate = false;
         for (i, q) in qs.iter().enumerate().take(16) {
             let Some(text) = q.question.clone().filter(|t| !t.is_empty()) else { return degraded(details, None) };
-            let labels: Vec<String> = q.options.iter().flatten().filter_map(|op| op.label.clone()).take(64).collect();
+            let offered: Vec<&OptionIn> = q.options.iter().flatten().filter(|op| op.label.is_some()).take(64).collect();
+            let labels: Vec<String> = offered.iter().filter_map(|op| op.label.clone()).collect();
             // F-37: the `answers` map is keyed by question text; a repeated
             // text can carry only one answer, so only the first is offered.
             if wire.iter().any(|w| w.text == text) {
@@ -375,7 +391,10 @@ pub fn build_request(request_id: &str, request: &RawValue, ctx: &CardContext<'_>
             }
             views.push(QuestionView {
                 text: display(&text, QUESTION_CAP),
+                header: shown(q.header.as_deref(), HEADER_CAP),
                 options: unique_labels(&labels),
+                descriptions: offered.iter().map(|op| shown(op.description.as_deref(), DESCRIPTION_CAP)).collect(),
+                previews: offered.iter().map(|op| shown(op.preview.as_deref(), PREVIEW_CAP)).collect(),
                 multi_select: q.multi_select.unwrap_or(false),
             });
             wire.push(WireQuestion { original_index: i, text, labels, multi_select: q.multi_select.unwrap_or(false) });
@@ -828,6 +847,15 @@ mod tests {
         assert_eq!(r.card.kind, InteractionKind::Question);
         assert_eq!(r.card.questions.len(), 3, "the repeated question text is offered once (F-37)");
         assert!(r.card.detail_lines.contains(&EvidenceLine::key(KEY_DUPLICATE_QUESTION)), "…and never dropped silently [A19.3]");
+        let colour = &r.card.questions[0];
+        assert_eq!(colour.header.as_deref(), Some("Colour"), "the chip is shown");
+        assert_eq!(colour.descriptions, [Some("r".to_string()), Some("b".to_string())], "each option's description, in option order");
+        assert_eq!(colour.previews, [None, None]);
+        assert_eq!(r.card.questions[1].descriptions, [None, None], "an option without a description has none");
+        // Replying instead of answering: the text goes back as the tool result.
+        let instead = payload(&r, Decision::DenyWithMessage { message: "let's talk about something else".into() });
+        assert_eq!(instead["behavior"], "deny");
+        assert_eq!(instead["message"], "let's talk about something else");
         let original = json!([
             {"question":"Which colour?","header":"Colour","options":[{"label":"red","description":"r"},{"label":"blue","description":"b"}],"multiSelect":false},
             {"question":"Which fruits?","header":"Fruit","options":[{"label":"apple"},{"label":"cherry"}],"multiSelect":true},

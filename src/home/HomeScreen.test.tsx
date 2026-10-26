@@ -395,7 +395,7 @@ domTest(
       const s1 = approval(1);
       const question = session(2, {
         activity: { state: { kind: 'needsAnswer' }, since: 0, confidence: 'high', evidence: null, episode: 'e_2' as never },
-        pending: [pending('q2', { kind: 'question', questions: [{ text: 'Which region?', options: ['eu', 'us'], multiSelect: false }] })],
+        pending: [pending('q2', { kind: 'question', questions: [{ text: 'Which region?', options: ['eu', 'us'], multiSelect: false, header: null, descriptions: [], previews: [] }] })],
       });
       const view = render(<HomeScreen />);
       seed(world([s1, question], [queueItem(1, 1), queueItem(2, 2, { reason: { kind: 'needsAnswer' } })]));

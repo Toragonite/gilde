@@ -73,14 +73,15 @@ export function composerIntent(
 /** The hint the armed composer shows (null = none). */
 export function intentHintKey(
   intent: ComposerIntent,
-): 'approval.composerHint' | 'approval.composerAnswerHint' | 'plan.composerHint' | 'approval.noteHint' | null {
+): 'approval.composerHint' | 'approval.composerAnswerHint' | 'approval.composerReplyInsteadHint' | 'plan.composerHint' | 'approval.noteHint' | null {
   switch (intent.kind) {
     case 'denyWithMessage':
     case 'screenDenyWithReply':
       return 'approval.composerHint';
     case 'freeAnswer':
-    case 'focusCard':
       return 'approval.composerAnswerHint';
+    case 'replyInstead':
+      return 'approval.composerReplyInsteadHint';
     case 'keepPlanning':
       return 'plan.composerHint';
     case 'allowWithNote':
@@ -100,7 +101,7 @@ export type SubmitResult =
   | { kind: 'done'; queued: ClientMsgId | null }
   /** Nothing sent; keep the draft and show a line. */
   | { kind: 'kept'; line: { key: string; params: Readonly<Record<string, unknown>> }; error?: IpcError }
-  /** Several unanswered questions: move focus to the card. */
+  /** Several unanswered questions and nothing typed: move focus to the card. */
   | { kind: 'focusCard' }
   /** An answer for this request is already on its way. */
   | { kind: 'busy' };
@@ -115,7 +116,7 @@ function keptError(error: IpcError): SubmitResult {
 /** Perform `intent` with `text` for session `uid` (the card's session; a mirrored card is never the composer's). */
 export async function submit(uid: SessionUid, intent: ComposerIntent, rawText: string, priority: SendPriority): Promise<SubmitResult> {
   const text = cleanText(rawText);
-  if (text.trim() === '') return { kind: 'kept', line: { key: '', params: {} } };
+  if (text.trim() === '') return intent.kind === 'replyInstead' ? { kind: 'focusCard' } : { kind: 'kept', line: { key: '', params: {} } };
   const tooLongReply = { kind: 'kept' as const, line: { key: 'composer.replyTooLong', params: {} } };
   const answer = async (run: () => ReturnType<typeof sendDecision>): Promise<SubmitResult> => {
     const outcome = await run();
@@ -151,8 +152,9 @@ export async function submit(uid: SessionUid, intent: ComposerIntent, rawText: s
           'shortcut',
         ),
       );
-    case 'focusCard':
-      return { kind: 'focusCard' };
+    case 'replyInstead':
+      if (utf8Length(text) > REPLY_MAX_BYTES) return tooLongReply;
+      return answer(() => sendDecision(uid, { requestId: intent.requestId }, { kind: 'denyWithMessage', message: text }, 'shortcut'));
     case 'screenDenyWithReply':
       if (utf8Length(text) > MESSAGE_MAX_BYTES) return { kind: 'kept', line: { key: 'composer.tooLong', params: {} } };
       return answer(() => sendScreenAction(uid, { requestId: intent.requestId, promptRev: intent.promptRev }, { kind: 'denyWithReply', text }));

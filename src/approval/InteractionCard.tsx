@@ -28,7 +28,7 @@ import { GuardNote } from '../components/GuardNote';
 import { StateGlyph } from '../components/StateGlyph';
 import type { GlyphKind } from '../components/StateGlyph';
 import { useAnswerGuard } from '../hooks/useAnswerGuard';
-import { useHotkeys } from '../hooks/useHotkeys';
+import { isImeComposing, useHotkeys } from '../hooks/useHotkeys';
 import type { HotkeyBinding } from '../hooks/useHotkeys';
 import type { MessageKey } from '../i18n';
 import { useI18n } from '../i18n/useI18n';
@@ -65,7 +65,7 @@ import {
   toggleSelection,
   trustOption,
 } from './decisions';
-import type { CardAction, Selections } from './decisions';
+import type { CardAction, FreeTexts, Selections } from './decisions';
 import { setReplyIntent } from './replyIntent';
 import { useNow } from './useNow';
 import './approval.css';
@@ -166,6 +166,7 @@ export function InteractionCard(props: InteractionCardProps) {
   const titleId = useId();
   const hintId = useId();
   const [selections, setSelections] = useState<Selections>({});
+  const [freeTexts, setFreeTexts] = useState<FreeTexts>({});
   const [line, setLine] = useState<Line>(null);
   const [busy, setBusy] = useState(false);
   const [detail, setDetail] = useState<DetailState>({ kind: 'closed' });
@@ -187,6 +188,7 @@ export function InteractionCard(props: InteractionCardProps) {
   // Reset the per-request state when another request takes this slot.
   useEffect(() => {
     setSelections({});
+    setFreeTexts({});
     setLine(null);
     setBusy(false);
     setDetail({ kind: 'closed' });
@@ -258,6 +260,8 @@ export function InteractionCard(props: InteractionCardProps) {
           if (!q || !canAnswer) return;
           const next = toggleSelection(selections, action.questionIndex, action.label, q.multiSelect);
           setSelections(next);
+          // A single-select pick replaces whatever was typed for that question.
+          if (!q.multiSelect) setFreeTexts((f) => ({ ...f, [action.questionIndex]: '' }));
           if (answersOnPick(live)) {
             const decision = answerFromSelections(live, next);
             if (decision) {
@@ -283,9 +287,18 @@ export function InteractionCard(props: InteractionCardProps) {
   const guarded = guard.guard((action: CardAction, via: AnswerVia) => run(action, via));
 
   const submitSelections = () => {
-    const decision = answerFromSelections(live, selections);
+    const decision = answerFromSelections(live, selections, freeTexts);
     if (decision) guarded({ kind: 'decide', decision }, 'button');
   };
+
+  /** The card's "Other" field: a typed answer replaces a single-select question's pick. */
+  const typeAnswer = (questionIndex: number, text: string) => {
+    setFreeTexts((f) => ({ ...f, [questionIndex]: text }));
+    if (text.trim() !== '' && live.questions[questionIndex]?.multiSelect === false) {
+      setSelections((s) => ({ ...s, [questionIndex]: [] }));
+    }
+  };
+  const typedAny = Object.values(freeTexts).some((text) => text.trim() !== '');
 
   const toggleDetail = useCallback(() => {
     if (detail.kind === 'open' || detail.kind === 'loading') {
@@ -346,9 +359,9 @@ export function InteractionCard(props: InteractionCardProps) {
     bindings.push({
       id: `card.digit.${digit}`,
       combo: digit,
-      when: () => digitAction(live, digit, currentQuestion(live, selections)) !== null,
+      when: () => digitAction(live, digit, currentQuestion(live, selections, freeTexts)) !== null,
       run: () => {
-        const action = digitAction(live, digit, currentQuestion(live, selections));
+        const action = digitAction(live, digit, currentQuestion(live, selections, freeTexts));
         if (action) guarded(action, 'digit');
       },
     });
@@ -377,7 +390,7 @@ export function InteractionCard(props: InteractionCardProps) {
       id: 'card.answer',
       combo: 'enter',
       when: (event) =>
-        live.kind === 'question' && !(event.target instanceof HTMLButtonElement) && answerFromSelections(live, selections) !== null,
+        live.kind === 'question' && !(event.target instanceof HTMLButtonElement) && answerFromSelections(live, selections, freeTexts) !== null,
       run: () => submitSelections(),
     },
     {
@@ -473,12 +486,15 @@ export function InteractionCard(props: InteractionCardProps) {
       <QuestionList
         pending={live}
         selections={selections}
+        freeTexts={freeTexts}
         disabled={disabled}
         guardProps={guard.props}
         onPick={(qi, label) => guarded({ kind: 'pick', questionIndex: qi, label }, 'button')}
+        onType={typeAnswer}
+        onSubmit={submitSelections}
       />
     );
-    if (!answersOnPick(live)) {
+    if (!answersOnPick(live) || typedAny) {
       actions = (
         <button
           type="button"
@@ -486,7 +502,7 @@ export function InteractionCard(props: InteractionCardProps) {
           data-card-control=""
           data-role="answer"
           aria-keyshortcuts="Enter"
-          disabled={disabled || answerFromSelections(live, selections) === null}
+          disabled={disabled || answerFromSelections(live, selections, freeTexts) === null}
           {...guard.props}
           onClick={submitSelections}
         >
@@ -681,14 +697,29 @@ function DetailPanel({ state, te, t }: { state: DetailState; te: ReturnType<type
 interface QuestionListProps {
   pending: PendingInteraction;
   selections: Selections;
+  freeTexts: FreeTexts;
   disabled: boolean;
   guardProps: Record<string, unknown>;
   onPick: (questionIndex: number, label: string) => void;
+  onType: (questionIndex: number, text: string) => void;
+  /** `⏎` in an "Other" field (keys in a text field never reach the card's bindings). */
+  onSubmit: () => void;
 }
 
-function QuestionList({ pending, selections, disabled, guardProps, onPick }: QuestionListProps) {
+/** What an option says besides its label: its description, then its preview. */
+function OptionDetail({ description, preview }: { description: string | null | undefined; preview: string | null | undefined }) {
+  return (
+    <>
+      {description ? <span className="g-card-odesc">{description}</span> : null}
+      {preview ? <pre className="g-card-opreview mono">{preview}</pre> : null}
+    </>
+  );
+}
+
+function QuestionList({ pending, selections, freeTexts, disabled, guardProps, onPick, onType, onSubmit }: QuestionListProps) {
+  const { t } = useI18n();
   const answerable = new Set(answerableQuestions(pending));
-  const current = currentQuestion(pending, selections);
+  const current = currentQuestion(pending, selections, freeTexts);
   return (
     <div className="g-card-questions">
       {pending.questions.map((q, qi) => {
@@ -698,6 +729,7 @@ function QuestionList({ pending, selections, disabled, guardProps, onPick }: Que
           <fieldset key={qi} className="g-card-question" data-current={qi === current ? 'true' : undefined} disabled={!open}>
             {/* The card's title already shows a lone question: keep it for screen readers only. */}
             <legend className={pending.questions.length === 1 && q.text === pending.title ? 'g-sr-only' : 'g-card-qtext'}>{q.text}</legend>
+            {q.header ? <span className="g-card-qheader badge">{q.header}</span> : null}
             {open && (
               <div className="g-card-options">
                 {q.options.map((label, oi) => {
@@ -714,7 +746,10 @@ function QuestionList({ pending, selections, disabled, guardProps, onPick }: Que
                         onChange={() => onPick(qi, label)}
                       />
                       {digit ? <KeyCap k={digit} /> : null}
-                      <span>{label}</span>
+                      <span className="g-card-olabel">
+                        <span>{label}</span>
+                        <OptionDetail description={q.descriptions[oi]} preview={q.previews[oi]} />
+                      </span>
                     </label>
                   ) : (
                     <button
@@ -730,11 +765,32 @@ function QuestionList({ pending, selections, disabled, guardProps, onPick }: Que
                       onClick={() => onPick(qi, label)}
                     >
                       {digit ? <KeyCap k={digit} /> : null}
-                      <span>{label}</span>
+                      <span className="g-card-olabel">
+                        <span>{label}</span>
+                        <OptionDetail description={q.descriptions[oi]} preview={q.previews[oi]} />
+                      </span>
                     </button>
                   );
                 })}
               </div>
+            )}
+            {open && (
+              <input
+                type="text"
+                className="g-card-other"
+                data-card-control=""
+                placeholder={t('card.otherPlaceholder')}
+                aria-label={t('card.otherLabel', { index: qi + 1 })}
+                value={freeTexts[qi] ?? ''}
+                maxLength={2000}
+                disabled={disabled}
+                onChange={(event) => onType(qi, event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key !== 'Enter' || isImeComposing(event.nativeEvent)) return;
+                  event.preventDefault();
+                  if (!event.repeat) onSubmit();
+                }}
+              />
             )}
           </fieldset>
         );

@@ -104,8 +104,14 @@ pub enum OptionRole {
 pub struct QuestionView {
     /// ≤ 400
     pub text: String,
+    /// The question's short chip (`header`); ≤ 40.
+    pub header: Option<String>,
     /// Each label ≤ 120.
     pub options: Vec<String>,
+    /// Per option, in `options` order: its `description`; each ≤ 400.
+    pub descriptions: Vec<Option<String>>,
+    /// Per option, in `options` order: its `preview` (monospace); each ≤ 2 KiB.
+    pub previews: Vec<Option<String>>,
     pub multi_select: bool,
 }
 
@@ -123,7 +129,8 @@ pub fn is_option_key(k: &str) -> bool {
 /// Value rules: `labels` non-empty unless `free_text` is present; more than one
 /// label only for `multi_select` questions; `question_index` < number of
 /// questions; `Answer` only for `Question` cards, `ApprovePlan`/`KeepPlanning`
-/// only for `PlanApproval` cards, `AllowSession` only when `always_label` is set
+/// only for `PlanApproval` cards, `DenyWithMessage` for `ToolApproval` cards and
+/// for `Question` cards (the user replies instead of answering), `AllowSession` only when `always_label` is set
 /// (else `UNSUPPORTED{allowSessionHidden}`), otherwise
 /// `INVALID_ARGUMENT{field:"decision", rule:"kindForCard"}` (checked against
 /// the card by the session actor: [`Decision::fits`]). A `Deny` needs no
@@ -204,10 +211,12 @@ impl Decision {
             Decision::ApprovePlan | Decision::KeepPlanning { .. } => {
                 card.kind == InteractionKind::PlanApproval
             }
-            Decision::AllowOnce
-            | Decision::Deny
-            | Decision::DenyWithMessage { .. }
-            | Decision::DenyAndStop => card.kind == InteractionKind::ToolApproval,
+            Decision::DenyWithMessage { .. } => {
+                matches!(card.kind, InteractionKind::ToolApproval | InteractionKind::Question)
+            }
+            Decision::AllowOnce | Decision::Deny | Decision::DenyAndStop => {
+                card.kind == InteractionKind::ToolApproval
+            }
             Decision::AllowSession => card.kind == InteractionKind::ToolApproval,
         };
         if !kind_ok {
@@ -304,7 +313,10 @@ mod tests {
             multi_select: false,
             questions: vec![QuestionView {
                 text: "q".into(),
+                header: None,
                 options: vec!["a".into(), "b".into()],
+                descriptions: vec![None, None],
+                previews: vec![None, None],
                 multi_select: false,
             }],
         }
@@ -352,6 +364,9 @@ mod tests {
             }],
         };
         assert!(matches!(bad_index.fits(&q), Err(DecisionMisfit::Invalid(_))));
+        // The user may reply instead of answering; a plain Deny stays a tool card's.
+        assert_eq!(Decision::DenyWithMessage { message: "something else".into() }.fits(&q), Ok(()));
+        assert!(matches!(Decision::Deny.fits(&q), Err(DecisionMisfit::Invalid(_))));
     }
 
     #[test]

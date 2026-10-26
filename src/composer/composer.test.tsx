@@ -185,9 +185,9 @@ domTest(
 );
 
 domTest(
-  'T-ui-composerByKind: question → Answer with free text (one question); several → focus the card',
+  'T-ui-composerByKind: question → Answer with free text (one question); several → a reply instead of them, or the card',
   harness(async (c, core) => {
-    const one = pending('q1', { kind: 'question', questions: [{ text: 'Which?', options: ['A', 'B'], multiSelect: false }] });
+    const one = pending('q1', { kind: 'question', questions: [{ text: 'Which?', options: ['A', 'B'], multiSelect: false, header: null, descriptions: [], previews: [] }] });
     const view = await armedWith(c, one);
     assert(view.getByText(translate('en', 'approval.composerAnswerHint', { agent: 'claude' })) !== null, 'answer hint');
     const el = input(view);
@@ -201,20 +201,31 @@ domTest(
     const two = pending('q2', {
       kind: 'question',
       questions: [
-        { text: 'Which?', options: ['A'], multiSelect: false },
-        { text: 'And?', options: ['B'], multiSelect: false },
+        { text: 'Which?', options: ['A'], multiSelect: false, header: null, descriptions: [], previews: [] },
+        { text: 'And?', options: ['B'], multiSelect: false, header: null, descriptions: [], previews: [] },
       ],
     });
     setSessions([session(2, { pending: [two] })]);
     const v2 = render(<Composer uid={uid(2)} onFocusCard={() => focused++} />);
     act(() => c.advance(800));
+    v2.rerender(<Composer uid={uid(2)} onFocusCard={() => focused++} />);
+    assert(v2.getByText(translate('en', 'approval.composerReplyInsteadHint', { agent: 'claude' })) !== null, 'reply-instead hint');
     const el2 = input(v2);
-    type(el2, 'partial');
     enter(el2);
     await settle();
-    assertEqual(focused, 1, 'focus moves to the card');
-    assertEqual(answers(core).length, 1, 'no partial answer map is sent [N-12]');
-    assertEqual(el2.value, 'partial', 'the draft stays');
+    assertEqual(focused, 1, 'nothing typed: focus moves to the card');
+    type(el2, "let's talk about the floor first");
+    enter(el2);
+    await settle();
+    assertDeepEqual(
+      answers(core).map((a) => a.decision),
+      [
+        { kind: 'answer', answers: [{ questionIndex: 0, labels: [], freeText: 'neither, use C' }] },
+        { kind: 'denyWithMessage', message: "let's talk about the floor first" },
+      ],
+      'a reply instead of the questions, never a partial answer map [N-12]',
+    );
+    assertEqual(el2.value, '', 'sent: the draft clears');
   }),
 );
 

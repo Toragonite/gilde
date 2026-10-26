@@ -10,6 +10,18 @@ export type QuestionView = {
  */
 text: string, 
 /**
+ * The question's short chip (`header`); ≤ 40.
+ */
+header: string | null, 
+/**
  * Each label ≤ 120.
  */
-options: Array<string>, multiSelect: boolean, };
+options: Array<string>, 
+/**
+ * Per option, in `options` order: its `description`; each ≤ 400.
+ */
+descriptions: Array<string | null>, 
+/**
+ * Per option, in `options` order: its `preview` (monospace); each ≤ 2 KiB.
+ */
+previews: Array<string | null>, multiSelect: boolean, };

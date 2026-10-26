@@ -164,7 +164,7 @@ function ComposerBody({ uid, inputRef, active = true, onFocusCard, compact = fal
       const now = clock.now();
       const current = composerIntent(session.uid, top, intentForSession, shown.current.at, draftStart.current, now, live ?? top);
       if (current.kind === 'send' && session.caps.send === 'none') return;
-      if (draft.trim() === '' && current.kind !== 'focusCard') return;
+      if (draft.trim() === '' && current.kind !== 'replyInstead') return;
       setSending(true);
       const target = current.kind === 'send' || !top ? session.uid : answerTarget(top, session.uid);
       const result = await submit(target, current, draft, priority);
@@ -357,7 +357,7 @@ function ComposerBody({ uid, inputRef, active = true, onFocusCard, compact = fal
           disabled={sending || draft.trim() === '' || (!canSend && intent.kind === 'send')}
           onClick={() => void send('next')}
         >
-          {intent.kind === 'send' ? t('action.send') : intent.kind === 'focusCard' ? t('card.answer') : t('action.send')}{' '}
+          {t('action.send')}{' '}
           <span className="g-key" aria-hidden="true">⏎</span>
         </button>
       </div>
