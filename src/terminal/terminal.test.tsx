@@ -137,7 +137,7 @@ test('Log lines are facts only: never the text of a block', () => {
   const secret = 'the user typed a secret plan';
   const lines = [
     describeEvent({ kind: 'appended', block: text('b1', 1, secret) }),
-    describeEvent({ kind: 'appended', block: block('u1', 2, { kind: 'userText', text: secret, origin: 'human', delivery: 'queued', clientMsgId: null }) }),
+    describeEvent({ kind: 'appended', block: block('u1', 2, { kind: 'userText', text: secret, origin: 'human', delivery: 'queued', clientMsgId: null, images: [] }) }),
     describeEvent({ kind: 'updated', blockId: text('b1', 1, '').id, patch: { kind: 'textDelta', append: secret } }),
     describeEvent({ kind: 'reset', blocks: [text('b2', 3, secret)], hasOlder: false, reason: 'initial' }),
   ];

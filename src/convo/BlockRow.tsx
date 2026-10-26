@@ -18,6 +18,7 @@ import type { SystemNote } from '../lib/gen/SystemNote';
 import type { ToolVerb } from '../lib/gen/ToolVerb';
 import { Markdown } from '../markdown';
 import { interactionDisplay } from '../store/convo';
+import { ImageThumbs } from './ImageThumbs';
 import type { Row, ToolBlock } from './rows';
 import { editTotals, firstLine, verbCounts } from './rows';
 
@@ -120,7 +121,8 @@ function UserRow({ row, ctx }: { row: Extract<Row, { kind: 'user' }>; ctx: RowCo
           </span>
         )}
       </div>
-      <div className="g-msg-body g-msg-usertext">{k.text}</div>
+      {k.text !== '' && <div className="g-msg-body g-msg-usertext">{k.text}</div>}
+      <ImageThumbs images={k.images} />
     </div>
   );
 }
@@ -240,6 +242,8 @@ function ToolLine({ b, ctx, showTime }: { b: ToolBlock; ctx: RowContext; showTim
           {k.resultPreview ? <pre className="mono">{k.resultPreview}</pre> : null}
         </div>
       )}
+      {/* What the agent hands back as an image is shown, not folded away. */}
+      <ImageThumbs images={k.resultImages} />
     </div>
   );
 }

@@ -3,6 +3,7 @@
 import type { ClientMsgId } from "./ClientMsgId";
 import type { Delivery } from "./Delivery";
 import type { FileChange } from "./FileChange";
+import type { ImageRef } from "./ImageRef";
 import type { InteractionKind } from "./InteractionKind";
 import type { InteractionOutcome } from "./InteractionOutcome";
 import type { RequestId } from "./RequestId";
@@ -19,7 +20,11 @@ text: string, origin: UserOrigin,
 /**
  * From `command_lifecycle` (§6.1.3).
  */
-delivery: Delivery | null, clientMsgId: ClientMsgId | null, } | { "kind": "assistantText", 
+delivery: Delivery | null, clientMsgId: ClientMsgId | null, 
+/**
+ * Images the message carries (sent from the composer or read back).
+ */
+images: Array<ImageRef>, } | { "kind": "assistantText", 
 /**
  * ≤ 1 MiB
  */
@@ -39,7 +44,11 @@ inputPreview: string, status: ToolStatus,
 /**
  * ≤ 8 KiB
  */
-resultPreview: string | null, fileChange: FileChange | null, 
+resultPreview: string | null, 
+/**
+ * Images the result carries (a screenshot, an image file read).
+ */
+resultImages: Array<ImageRef>, fileChange: FileChange | null, 
 /**
  * Stream cut before the input closed [R4 §3].
  */

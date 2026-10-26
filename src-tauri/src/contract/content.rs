@@ -6,7 +6,7 @@ use ts_rs::TS;
 
 use crate::contract::activity::ErrorSub;
 use crate::contract::common::{EpochMs, Notice};
-use crate::contract::ids::{BlockId, ClientMsgId, RequestId, SubId};
+use crate::contract::ids::{BlockId, ClientMsgId, ImageId, RequestId, SubId};
 use crate::contract::interaction::InteractionKind;
 use crate::contract::team::MessageKind;
 
@@ -27,6 +27,38 @@ pub struct Block {
     pub truncated: bool,
 }
 
+/// The image types a block may show or a message may carry: raster only (an
+/// SVG could carry script).
+pub const IMAGE_MEDIA_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+
+/// The canonical spelling of an allowed image type (`image/jpg` is
+/// `image/jpeg`), or `None`.
+pub fn image_media_type(raw: &str) -> Option<&'static str> {
+    let lower = raw.trim().to_ascii_lowercase();
+    let lower = if lower == "image/jpg" { "image/jpeg" } else { lower.as_str() };
+    IMAGE_MEDIA_TYPES.into_iter().find(|t| *t == lower)
+}
+
+/// Standard padded base64 (RFC 4648 §4): what the vendor wire and the
+/// WebView's `data:` URLs use.
+pub fn is_base64(data: &str) -> bool {
+    !data.is_empty()
+        && data.len().is_multiple_of(4)
+        && data.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
+        && !data.trim_end_matches('=').contains('=')
+}
+
+/// An image a block shows. Its bytes stay in the core's image store (memory
+/// only, never persisted or logged); the WebView reads them with
+/// `content_image`. Only raster types: png, jpeg, gif, webp.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "ts-export", ts(export))]
+pub struct ImageRef {
+    pub id: ImageId,
+    pub media_type: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
 #[cfg_attr(feature = "ts-export", ts(export))]
@@ -38,6 +70,8 @@ pub enum BlockKind {
         /// From `command_lifecycle` (§6.1.3).
         delivery: Option<Delivery>,
         client_msg_id: Option<ClientMsgId>,
+        /// Images the message carries (sent from the composer or read back).
+        images: Vec<ImageRef>,
     },
     AssistantText {
         /// ≤ 1 MiB
@@ -59,6 +93,8 @@ pub enum BlockKind {
         status: ToolStatus,
         /// ≤ 8 KiB
         result_preview: Option<String>,
+        /// Images the result carries (a screenshot, an image file read).
+        result_images: Vec<ImageRef>,
         file_change: Option<FileChange>,
         /// Stream cut before the input closed [R4 §3].
         incomplete: bool,

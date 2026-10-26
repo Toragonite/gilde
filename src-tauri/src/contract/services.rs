@@ -46,7 +46,7 @@ use crate::contract::ipc::{
     IdeRevealReq, InteractionAnswerReq, InteractionAnswerRes, InteractionDetailReq,
     InteractionDetailRes, InterruptOutcome, NewSessionOptions, NewsessionOptionsReq, PauseUntil,
     ScreenKeyOutcome, ScreenPromptAction, ScreenPromptKeyReq, ScreenPromptKeyRes, SendDelivery,
-    SendPriority, SessionContinueReq, SessionContinueRes, SessionModelsRes, SessionRetryAsTerminalReq,
+    OutgoingImage, SendPriority, SessionContinueReq, SessionContinueRes, SessionModelsRes, SessionRetryAsTerminalReq,
     SessionRetryAsTerminalRes, SessionStartReq, SessionStartRes, SessionStopPreviewRes,
     SessionStopReq, SessionStopRes, SessionTechnicalRes, TurnCancelQueuedReq, TurnCancelQueuedRes,
     TurnInterruptReq, TurnInterruptRes, TurnRetryReq, TurnRetryRes, TurnSendReq, TurnSendRes,
@@ -608,6 +608,9 @@ pub struct OutgoingMessage {
     pub client_msg_id: ClientMsgId,
     pub text: String,
     pub priority: SendPriority,
+    /// Conversation only; another driver refuses a message that has any
+    /// (`UNSUPPORTED{images}`).
+    pub images: Vec<OutgoingImage>,
 }
 
 /// The answer outcome of a structured card (§4.2.3) [C12].

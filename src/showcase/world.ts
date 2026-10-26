@@ -846,9 +846,9 @@ export function conversationOf(session: Session, now: number): Block[] {
   };
   const tool = (n: number) => `toolu_${uid.slice(-8)}_${n}`;
   const out: Block[] = [
-    block({ kind: 'userText', text: session.title ?? 'Continue', origin: 'human', delivery: 'delivered', clientMsgId: null }, 12),
+    block({ kind: 'userText', text: session.title ?? 'Continue', origin: 'human', delivery: 'delivered', clientMsgId: null, images: [] }, 12),
     block({ kind: 'thinking', seconds: 4, text: null }, 11),
-    block({ kind: 'toolCall', toolUseId: tool(1), summary: { tool: 'Read', verb: 'read', object: 'src/client/retry.ts' }, inputPreview: 'src/client/retry.ts', status: 'ok', resultPreview: '128 lines', fileChange: null, incomplete: false }, 11),
+    block({ kind: 'toolCall', toolUseId: tool(1), summary: { tool: 'Read', verb: 'read', object: 'src/client/retry.ts' }, inputPreview: 'src/client/retry.ts', status: 'ok', resultPreview: '128 lines', resultImages: [], fileChange: null, incomplete: false }, 11),
     block({
       kind: 'assistantText',
       markdown:
@@ -858,13 +858,13 @@ export function conversationOf(session: Session, now: number): Block[] {
       streaming: false,
       agent: null,
     }, 10),
-    block({ kind: 'toolCall', toolUseId: tool(2), summary: { tool: 'Edit', verb: 'edit', object: 'src/client/retry.ts' }, inputPreview: 'src/client/retry.ts', status: 'ok', resultPreview: null, fileChange: { pathRel: 'src/client/retry.ts', added: 6, removed: 2, change: 'modified' }, incomplete: false }, 8),
+    block({ kind: 'toolCall', toolUseId: tool(2), summary: { tool: 'Edit', verb: 'edit', object: 'src/client/retry.ts' }, inputPreview: 'src/client/retry.ts', status: 'ok', resultPreview: null, resultImages: [], fileChange: { pathRel: 'src/client/retry.ts', added: 6, removed: 2, change: 'modified' }, incomplete: false }, 8),
   ];
   const card = session.pending[0];
   if (card) {
     out.push(block({ kind: 'interaction', requestId: card.requestId, interactionKind: card.kind, outcome: 'pending' }, 3));
   } else if (session.activity.state.kind === 'working') {
-    out.push(block({ kind: 'toolCall', toolUseId: tool(3), summary: { tool: 'Bash', verb: 'run', object: 'npm test -- retry' }, inputPreview: 'npm test -- retry', status: 'running', resultPreview: null, fileChange: null, incomplete: false }, 1));
+    out.push(block({ kind: 'toolCall', toolUseId: tool(3), summary: { tool: 'Bash', verb: 'run', object: 'npm test -- retry' }, inputPreview: 'npm test -- retry', status: 'running', resultPreview: null, resultImages: [], fileChange: null, incomplete: false }, 1));
   } else {
     out.push(block({ kind: 'assistantText', markdown: 'Done. The backoff now resets after a success and the new test passes.', streaming: false, agent: null }, 2));
   }
@@ -879,7 +879,7 @@ export function historyConversationOf(row: HistoryRow, now: number): Block[] {
   const at = row.startedAt ?? now;
   const block = (seq: number, kind: BlockKind, offsetMin: number): Block => ({ id: blockId(row.uid, seq), seq, at: at + offsetMin * MIN, kind, truncated: false });
   return [
-    block(1, { kind: 'userText', text: row.title ?? 'Continue', origin: 'human', delivery: 'delivered', clientMsgId: null }, 0),
+    block(1, { kind: 'userText', text: row.title ?? 'Continue', origin: 'human', delivery: 'delivered', clientMsgId: null, images: [] }, 0),
     block(2, { kind: 'assistantText', markdown: 'I looked at the failing path first and kept the change small.', streaming: false, agent: null }, 1),
     block(3, { kind: 'assistantText', markdown: 'Done. The change is merged and the tests pass.', streaming: false, agent: null }, 38),
   ];

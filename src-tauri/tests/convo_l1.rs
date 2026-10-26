@@ -469,6 +469,7 @@ fn msg(n: u8, text: &str) -> OutgoingMessage {
         client_msg_id: ClientMsgId::parse(format!("0192f000-0000-4000-8000-0000000000{n:02x}")).unwrap(),
         text: text.into(),
         priority: SendPriority::Next,
+        images: Vec::new(),
     }
 }
 

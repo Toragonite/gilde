@@ -47,7 +47,7 @@ use crate::contract::activity::{
 };
 use crate::contract::common::{clamp_safe_u64, AbsPath, EpochMs, Notice, PermissionMode};
 use crate::contract::compat::CompatCapability;
-use crate::contract::content::{Delivery, InteractionOutcome, SystemNote};
+use crate::contract::content::{Delivery, ImageRef, InteractionOutcome, SystemNote};
 use crate::contract::display::TextCap;
 use crate::contract::error::IpcError;
 use crate::contract::ids::{AccountId, ClientMsgId, RequestId, SessionUid};
@@ -61,11 +61,12 @@ use crate::convo::guard::{ModeFlipGuard, SettingsFileGuard, SilentApprovalGuard}
 use crate::convo::handshake::{self, parse_initialize, permission_mode_of, InitVerdict, LaunchKind};
 use crate::convo::ledger::{AnswerCheck, GildeKind, GildeReply, GildeTable, Ledger, Seen};
 use crate::convo::wire::{
-    self, control_request, control_response_error, control_response_success, depth_within, user_frame, ControlBody,
-    UserFrameShape, MAX_DEPTH, UNSUPPORTED_ERROR,
+    self, control_request, control_response_error, control_response_success, depth_within, user_frame_with_images,
+    ControlBody, UserFrameShape, MAX_DEPTH, UNSUPPORTED_ERROR,
 };
 use crate::convo::Flags;
 use crate::render::claude_stream::{self, AssistantMsgIn, EventIn, StreamRenderer};
+use crate::render::images;
 use crate::render::sanitize::display;
 use crate::render::tools::{self, PathBase};
 use crate::render::transcript::TokenUsage;
@@ -101,6 +102,8 @@ pub struct Now {
 pub enum FrameClass {
     /// User frames: ≤ 1 MiB.
     User,
+    /// A user frame that carries images: ≤ 32 MiB.
+    UserImages,
     /// Gilde's control requests and error replies: ≤ 1 MiB.
     Control,
     /// A decision echoing the original input: ≤ the request it answers.
@@ -111,6 +114,7 @@ impl FrameClass {
     pub fn cap(self) -> usize {
         match self {
             FrameClass::User | FrameClass::Control => wire::FRAME_CAP,
+            FrameClass::UserImages => wire::IMAGE_FRAME_CAP,
             FrameClass::Answer => wire::ANSWER_FRAME_CAP,
         }
     }
@@ -610,6 +614,7 @@ pub enum CancelPlan {
 struct HeldFrame {
     id: ClientMsgId,
     line: String,
+    class: FrameClass,
 }
 
 /// The core of one Conversation session (one process).
@@ -1064,7 +1069,7 @@ impl Core {
                 }
                 for h in std::mem::take(&mut self.held) {
                     let id = h.id.clone();
-                    if out.try_write(h.line, FrameClass::User).is_ok() {
+                    if out.try_write(h.line, h.class).is_ok() {
                         self.awaiting_turn = true;
                         self.turn_starting = true;
                     } else {
@@ -1722,7 +1727,8 @@ impl Core {
         if self.exited || self.stopping {
             return Err(IpcError::unsupported("send"));
         }
-        crate::contract::validate::text_range("text", &msg.text, 1, crate::contract::ipc::MAX_PROMPT_BYTES)
+        let min_text = if msg.images.is_empty() { 1 } else { 0 };
+        crate::contract::validate::text_range("text", &msg.text, min_text, crate::contract::ipc::MAX_PROMPT_BYTES)
             .map_err(IpcError::from)?;
         let now_capable = self.cfg.flags.now_priority && self.capabilities.contains("interrupt_send_now_v1");
         let wants_now = msg.priority == SendPriority::Now;
@@ -1731,14 +1737,15 @@ impl Core {
             origin: self.cfg.flags.handshake_shape,
             empty_session_id: !self.cfg.flags.handshake_shape,
         };
-        let line = user_frame(&msg.text, msg.client_msg_id.as_str(), shape);
-        if line.len() > FrameClass::User.cap() {
-            return Err(IpcError::invalid_argument("text", "size"));
+        let line = user_frame_with_images(&msg.text, &msg.images, msg.client_msg_id.as_str(), shape);
+        let class = if msg.images.is_empty() { FrameClass::User } else { FrameClass::UserImages };
+        if line.len() > class.cap() {
+            return Err(IpcError::invalid_argument(if msg.images.is_empty() { "text" } else { "images" }, "size"));
         }
         let active = self.turn_active();
         let delivery = if !self.ready {
             // Held until the `initialize` response (§6.1.2 step 1).
-            self.held.push(HeldFrame { id: msg.client_msg_id.clone(), line });
+            self.held.push(HeldFrame { id: msg.client_msg_id.clone(), line, class });
             SendDelivery::Queued
         } else if wants_now && !now_capable && active && self.after_result.is_none() {
             // P9 fallback: interrupt, wait for the turn's result (≤ 5 s), then send.
@@ -1751,10 +1758,10 @@ impl Core {
                 })?;
             self.mark_interrupt(target);
             self.interrupt_sent_mono = Some(now.mono);
-            self.after_result = Some((HeldFrame { id: msg.client_msg_id.clone(), line }, now.mono + SEND_NOW_WAIT_MS));
+            self.after_result = Some((HeldFrame { id: msg.client_msg_id.clone(), line, class }, now.mono + SEND_NOW_WAIT_MS));
             SendDelivery::Queued
         } else {
-            if let Err(e) = out.try_write(line, FrameClass::User) {
+            if let Err(e) = out.try_write(line, class) {
                 if e == WriteError::Full {
                     self.not_reading(fx);
                 }
@@ -1769,7 +1776,9 @@ impl Core {
             if active { SendDelivery::Queued } else { SendDelivery::Sent }
         };
         let d = (delivery == SendDelivery::Queued).then_some(Delivery::Queued);
-        for u in self.render.user_sent(&msg.client_msg_id, &msg.text, now.wall, d) {
+        // Kept for the view: the sent block shows what was attached.
+        let shown: Vec<ImageRef> = msg.images.iter().filter_map(|i| images::global().put(&i.media_type, &i.data)).collect();
+        for u in self.render.user_sent(&msg.client_msg_id, &msg.text, shown, now.wall, d) {
             fx.push(Effect::Content(u));
         }
         if delivery == SendDelivery::Queued {
@@ -1789,7 +1798,7 @@ impl Core {
         if self.exited || self.stopping {
             return;
         }
-        if out.try_write(h.line, FrameClass::User).is_err() {
+        if out.try_write(h.line, h.class).is_err() {
             self.not_reading(fx);
             for u in self.render.delivery(h.id.as_str(), Delivery::Cancelled) {
                 fx.push(Effect::Content(u));
@@ -2352,6 +2361,7 @@ mod tests {
             client_msg_id: ClientMsgId::parse("0192f000-0000-4000-8000-000000000001").unwrap(),
             text: "hi".into(),
             priority: SendPriority::Next,
+            images: Vec::new(),
         };
         assert_eq!(t.core.send(first, &mut t.out, t.now, &mut t.fx).unwrap(), SendDelivery::Queued);
         assert_eq!(t.out.lines.len(), 1, "user frames are held until initialize answers");
@@ -2618,7 +2628,7 @@ mod tests {
         f.session_state_events = false;
         let mut t = T::with(f);
         t.ready();
-        let m = OutgoingMessage { client_msg_id: ClientMsgId::parse("0192f000-0000-4000-8000-000000000001").unwrap(), text: "go".into(), priority: SendPriority::Next };
+        let m = OutgoingMessage { client_msg_id: ClientMsgId::parse("0192f000-0000-4000-8000-000000000001").unwrap(), text: "go".into(), priority: SendPriority::Next, images: Vec::new() };
         t.core.send(m, &mut t.out, t.now, &mut t.fx).unwrap();
         t.state("idle"); // ignored with the flag off…
         assert_eq!(t.last_stream().phase, TurnPhase::Running, "…and the first frame after the user frame starts the turn");
@@ -2636,12 +2646,12 @@ mod tests {
         let a = ClientMsgId::parse("0192f000-0000-4000-8000-00000000000a").unwrap();
         let b = ClientMsgId::parse("0192f000-0000-4000-8000-00000000000b").unwrap();
         for id in [&a, &b] {
-            let d = t.core.send(OutgoingMessage { client_msg_id: id.clone(), text: "q".into(), priority: SendPriority::Next }, &mut t.out, t.now, &mut t.fx).unwrap();
+            let d = t.core.send(OutgoingMessage { client_msg_id: id.clone(), text: "q".into(), priority: SendPriority::Next, images: Vec::new() }, &mut t.out, t.now, &mut t.fx).unwrap();
             assert_eq!(d, SendDelivery::Queued);
         }
         assert_eq!(t.core.queued().len(), 2);
         // Idempotent by clientMsgId.
-        assert_eq!(t.core.send(OutgoingMessage { client_msg_id: a.clone(), text: "q".into(), priority: SendPriority::Next }, &mut t.out, t.now, &mut t.fx).unwrap(), SendDelivery::Queued);
+        assert_eq!(t.core.send(OutgoingMessage { client_msg_id: a.clone(), text: "q".into(), priority: SendPriority::Next, images: Vec::new() }, &mut t.out, t.now, &mut t.fx).unwrap(), SendDelivery::Queued);
         assert_eq!(t.out.subtypes().iter().filter(|s| *s == "user").count(), 2);
         t.line(json!({"type":"command_lifecycle","command_uuid":a.as_str(),"state":"queued"}));
         t.line(json!({"type":"command_lifecycle","command_uuid":a.as_str(),"state":"started"}));
@@ -2653,13 +2663,13 @@ mod tests {
         assert_eq!(t.core.render.delivery_of(b.as_str()), Some(Delivery::Delivered));
         // The replay alone (no lifecycle frame) marks Delivered.
         let c = ClientMsgId::parse("0192f000-0000-4000-8000-00000000000c").unwrap();
-        t.core.send(OutgoingMessage { client_msg_id: c.clone(), text: "x".into(), priority: SendPriority::Next }, &mut t.out, t.now, &mut t.fx).unwrap();
+        t.core.send(OutgoingMessage { client_msg_id: c.clone(), text: "x".into(), priority: SendPriority::Next, images: Vec::new() }, &mut t.out, t.now, &mut t.fx).unwrap();
         t.line(json!({"type":"user","message":{"role":"user","content":[{"type":"text","text":"x"}]},"uuid":c.as_str(),"isReplay":true,"origin":{"kind":"human"}}));
         assert_eq!(t.core.render.delivery_of(c.as_str()), Some(Delivery::Delivered));
         // Cancelled.
         let d = ClientMsgId::parse("0192f000-0000-4000-8000-00000000000d").unwrap();
         t.sys_init(&[]);
-        t.core.send(OutgoingMessage { client_msg_id: d.clone(), text: "y".into(), priority: SendPriority::Next }, &mut t.out, t.now, &mut t.fx).unwrap();
+        t.core.send(OutgoingMessage { client_msg_id: d.clone(), text: "y".into(), priority: SendPriority::Next, images: Vec::new() }, &mut t.out, t.now, &mut t.fx).unwrap();
         match t.core.cancel_queued(&d, &mut t.out, &mut t.fx).unwrap() {
             CancelPlan::Wait(_) => {}
             other => panic!("{other:?}"),
@@ -2679,6 +2689,7 @@ mod tests {
             client_msg_id: ClientMsgId::parse(format!("0192f000-0000-4000-8000-0000000000{n:02x}")).unwrap(),
             text: "now".into(),
             priority: SendPriority::Now,
+            images: Vec::new(),
         };
         t.core.send(m(1), &mut t.out, t.now, &mut t.fx).unwrap();
         assert_eq!(t.out.last()["priority"], "now");
@@ -2711,7 +2722,7 @@ mod tests {
         assert_eq!(t.core.pending_cards().len(), 1, "the card stays answerable");
         t.out.full = false;
         assert_eq!(t.answer("r1", Decision::AllowOnce).unwrap().0, AnswerOutcome::Answered);
-        let huge = OutgoingMessage { client_msg_id: ClientMsgId::parse("0192f000-0000-4000-8000-000000000001").unwrap(), text: "\u{1}".repeat(200 * 1024), priority: SendPriority::Next };
+        let huge = OutgoingMessage { client_msg_id: ClientMsgId::parse("0192f000-0000-4000-8000-000000000001").unwrap(), text: "\u{1}".repeat(200 * 1024), priority: SendPriority::Next, images: Vec::new() };
         assert_eq!(t.core.send(huge, &mut t.out, t.now, &mut t.fx).unwrap_err().params["rule"], "size", "an escaped frame over 1 MiB");
     }
 
@@ -3015,7 +3026,7 @@ mod tests {
         t.ready();
         t.sys_init(&[]);
         t.ask("r1", "AskUserQuestion", json!({"questions":[{"question":"Which?","header":"h","options":[{"label":"a"},{"label":"b"}],"multiSelect":false}]}), "toolu_q");
-        let m = OutgoingMessage { client_msg_id: ClientMsgId::parse("0192f000-0000-4000-8000-000000000001").unwrap(), text: "later".into(), priority: SendPriority::Next };
+        let m = OutgoingMessage { client_msg_id: ClientMsgId::parse("0192f000-0000-4000-8000-000000000001").unwrap(), text: "later".into(), priority: SendPriority::Next, images: Vec::new() };
         t.core.send(m, &mut t.out, t.now, &mut t.fx).unwrap();
         t.core.on_exit(&[], "", t.now, &mut t.fx);
         assert!(t.core.pending_cards().is_empty());
@@ -3046,7 +3057,7 @@ mod tests {
         f.session_state_events = false;
         let mut t = T::with(f);
         t.ready();
-        t.core.send(OutgoingMessage { client_msg_id: ClientMsgId::parse("0192f000-0000-4000-8000-000000000001").unwrap(), text: "go".into(), priority: SendPriority::Next }, &mut t.out, t.now, &mut t.fx).unwrap();
+        t.core.send(OutgoingMessage { client_msg_id: ClientMsgId::parse("0192f000-0000-4000-8000-000000000001").unwrap(), text: "go".into(), priority: SendPriority::Next, images: Vec::new() }, &mut t.out, t.now, &mut t.fx).unwrap();
         t.core.interrupt(false, &mut t.out, t.now, &mut t.fx).unwrap();
         t.result(json!({"subtype":"error_during_execution","is_error":true,"terminal_reason":null}));
         assert_eq!(t.last_stream().last_turn_end.unwrap().outcome, TurnOutcome::Interrupted);
@@ -3068,7 +3079,7 @@ mod tests {
     #[test]
     fn no_initialize_within_the_timeout_drops_the_held_prompt() {
         let mut t = T::with(probed());
-        let m = OutgoingMessage { client_msg_id: ClientMsgId::parse("0192f000-0000-4000-8000-000000000001").unwrap(), text: "hi".into(), priority: SendPriority::Next };
+        let m = OutgoingMessage { client_msg_id: ClientMsgId::parse("0192f000-0000-4000-8000-000000000001").unwrap(), text: "hi".into(), priority: SendPriority::Next, images: Vec::new() };
         t.core.send(m, &mut t.out, t.now, &mut t.fx).unwrap();
         assert_eq!(t.core.queued().len(), 1);
         t.advance(30_000);

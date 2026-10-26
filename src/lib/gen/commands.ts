@@ -34,6 +34,8 @@ import type { AppQuitRes } from "./AppQuitRes";
 import type { AppViewStateRes } from "./AppViewStateRes";
 import type { ChangesGetReq } from "./ChangesGetReq";
 import type { ChangesView } from "./ChangesView";
+import type { ContentImageReq } from "./ContentImageReq";
+import type { ContentImageRes } from "./ContentImageRes";
 import type { ContinueAllReq } from "./ContinueAllReq";
 import type { ContinueAllRes } from "./ContinueAllRes";
 import type { ConvoEnvelope } from "./ConvoEnvelope";
@@ -213,6 +215,7 @@ export type CommandName =
   | "convo_subscribe"
   | "convo_unsubscribe"
   | "convo_load_older"
+  | "content_image"
   | "pty_attach"
   | "pty_snapshot"
   | "pty_write"
@@ -299,6 +302,7 @@ export const COMMAND_NAMES: readonly CommandName[] = [
   "convo_subscribe",
   "convo_unsubscribe",
   "convo_load_older",
+  "content_image",
   "pty_attach",
   "pty_snapshot",
   "pty_write",
@@ -550,7 +554,7 @@ export function session_technical(req: SessionTechnicalReq): Promise<SessionTech
 
 /**
  * `turn_send` (contract §4.2.3; T10). Rate class `turn`; idempotency `clientMsgId`; capability `main`.
- * Errors beyond INVALID_ARGUMENT, NOT_FOUND, INTERNAL, BUSY: UNSUPPORTED{send}, CONFLICT{queueFull}, REFUSED{screenPromptPending}, BUSY{stdinFull}.
+ * Errors beyond INVALID_ARGUMENT, NOT_FOUND, INTERNAL, BUSY: UNSUPPORTED{send|images}, CONFLICT{queueFull}, REFUSED{screenPromptPending}, BUSY{stdinFull}.
  */
 export function turn_send(req: TurnSendReq): Promise<TurnSendRes> {
   return invoke<TurnSendRes>("turn_send", { req });
@@ -650,6 +654,14 @@ export function convo_unsubscribe(req: ConvoUnsubscribeReq): Promise<ConvoUnsubs
  */
 export function convo_load_older(req: ConvoLoadOlderReq): Promise<ConvoLoadOlderRes> {
   return invoke<ConvoLoadOlderRes>("convo_load_older", { req });
+}
+
+/**
+ * `content_image` (contract §4.2.4; T04). Rate class `query`; idempotency `none`; capability `main`.
+ * Errors beyond INVALID_ARGUMENT, NOT_FOUND, INTERNAL, BUSY: NOT_FOUND{image}.
+ */
+export function content_image(req: ContentImageReq): Promise<ContentImageRes> {
+  return invoke<ContentImageRes>("content_image", { req });
 }
 
 /**

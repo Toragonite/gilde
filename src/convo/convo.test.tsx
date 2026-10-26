@@ -14,6 +14,7 @@ import type { Block } from '../lib/gen/Block';
 import type { BlockKind } from '../lib/gen/BlockKind';
 import type { ConvoEnvelope } from '../lib/gen/ConvoEnvelope';
 import type { IdeOpenReq } from '../lib/gen/IdeOpenReq';
+import type { ImageId } from '../lib/gen/ImageId';
 import type { RequestId } from '../lib/gen/RequestId';
 import type { Session } from '../lib/gen/Session';
 import type { SubId } from '../lib/gen/SubId';
@@ -25,6 +26,7 @@ import type { FakeCore } from '../test/backend';
 import { block, pending, session, snapshot, text, uid } from '../test/fixtures';
 import { assert, assertDeepEqual, assertEqual, domTest, test } from '../test/harness';
 import { ConversationView, splitPathLine } from './ConversationView';
+import { resetImageCacheForTests } from './ImageThumbs';
 import { editTotals, toRows, verbCounts } from './rows';
 import type { ToolBlock } from './rows';
 
@@ -38,7 +40,7 @@ function tool(id: string, seq: number, verb: ToolBlock['kind']['summary']['verb'
     summary: { tool: verb === 'run' ? 'Bash' : 'Read', verb, object },
     inputPreview: object,
     status: 'ok',
-    resultPreview: null,
+    resultPreview: null, resultImages: [],
     fileChange: null,
     incomplete: false,
     ...extra,
@@ -92,7 +94,7 @@ const measure = () => ROW_PX;
 
 test('toRows: consecutive tool calls fold per category; text breaks a run; speakers only at run starts', () => {
   const rows = toRows([
-    block('u', 1, { kind: 'userText', text: 'split it', origin: 'human', delivery: null, clientMsgId: null }),
+    block('u', 1, { kind: 'userText', text: 'split it', origin: 'human', delivery: null, clientMsgId: null, images: [] }),
     text('a1', 2, 'reading first'),
     tool('r1', 3, 'read', 'a.ts'),
     tool('r2', 4, 'search', 'auth'),
@@ -187,11 +189,43 @@ domTest(
       kind: 'reset',
       reason: 'initial',
       hasOlder: false,
-      blocks: [block('u1', 1, { kind: 'userText', text: 'also update the docs', origin: 'human', delivery: 'cancelled', clientMsgId: null })],
+      blocks: [block('u1', 1, { kind: 'userText', text: 'also update the docs', origin: 'human', delivery: 'cancelled', clientMsgId: null, images: [] })],
     });
     const chip = view.container.querySelector('[data-delivery="cancelled"]');
     assertEqual(chip?.textContent, translate('en', 'convo.delivery.cancelled'), 'the Cancelled chip');
     assert(view.getByText(translate('en', 'convo.you')) !== null, 'You');
+  }),
+);
+
+domTest(
+  'Images: a sent image and a screenshot the agent hands back show; one the core no longer holds says so',
+  harness(async (core, send) => {
+    resetImageCacheForTests();
+    core.on('content_image', (req) =>
+      (req as { imageId: string }).imageId === 'i_00000000000000a1'
+        ? { mediaType: 'image/png', data: 'iVBORw0KGgo=' }
+        : Promise.reject({ code: 'NOT_FOUND', key: 'error.notFound', params: { entity: 'image' }, detail: null }),
+    );
+    setSessions([session(1)]);
+    const view = render(<ConversationView uid={uid(1)} measure={measure} viewportHeight={2000} />);
+    const png = { id: 'i_00000000000000a1' as ImageId, mediaType: 'image/png' };
+    const gone = { id: 'i_00000000000000b2' as ImageId, mediaType: 'image/png' };
+    await send({
+      kind: 'reset',
+      reason: 'initial',
+      hasOlder: false,
+      blocks: [
+        block('u1', 1, { kind: 'userText', text: '', origin: 'human', delivery: null, clientMsgId: null, images: [png] }),
+        tool('r1', 2, 'read', 'shot.png', { resultImages: [gone] }),
+      ],
+    });
+    await act(async () => {
+      await flush();
+    });
+    const img = view.getByAltText(translate('en', 'convo.image', { index: 1 })) as HTMLImageElement;
+    assertEqual(img.getAttribute('src'), 'data:image/png;base64,iVBORw0KGgo=', 'read once, shown as a data URL');
+    assert(view.getByText(translate('en', 'convo.imageGone')) !== null, 'the one that left the store');
+    assertDeepEqual(core.calls('content_image').map((c) => c.req), [{ imageId: png.id }, { imageId: gone.id }], 'each read once');
   }),
 );
 
@@ -203,7 +237,7 @@ domTest(
     const many = Array.from({ length: 40 }, (_, i) => text(`b${i}`, i + 1, `line ${i}`));
     await send({ kind: 'reset', reason: 'initial', hasOlder: false, blocks: many });
     assertEqual(view.container.querySelector('[data-follow-pill]'), null, 'no pill at the bottom');
-    await send({ kind: 'appended', block: block('u40', 41, { kind: 'userText', text: 'next', origin: 'human', delivery: null, clientMsgId: null }) });
+    await send({ kind: 'appended', block: block('u40', 41, { kind: 'userText', text: 'next', origin: 'human', delivery: null, clientMsgId: null, images: [] }) });
     assertEqual(view.container.querySelector('[data-follow-pill]'), null, 'following: still no pill');
 
     const list = view.container.querySelector('[role="log"]') as HTMLElement;
@@ -211,8 +245,8 @@ domTest(
       list.scrollTop = 0;
       fireEvent.scroll(list);
     });
-    await send({ kind: 'appended', block: block('u41', 42, { kind: 'userText', text: 'one', origin: 'human', delivery: null, clientMsgId: null }) });
-    await send({ kind: 'appended', block: block('u42', 43, { kind: 'userText', text: 'two', origin: 'human', delivery: null, clientMsgId: null }) });
+    await send({ kind: 'appended', block: block('u41', 42, { kind: 'userText', text: 'one', origin: 'human', delivery: null, clientMsgId: null, images: [] }) });
+    await send({ kind: 'appended', block: block('u42', 43, { kind: 'userText', text: 'two', origin: 'human', delivery: null, clientMsgId: null, images: [] }) });
     const pill = view.container.querySelector('[data-follow-pill]');
     assert(pill !== null, 'the pill appears');
     assertEqual(pill?.textContent, `${translate('en', 'convo.newBelow', { n: 2 })} ↓`, 'it counts the new rows');

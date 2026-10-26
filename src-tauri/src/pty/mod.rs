@@ -177,6 +177,10 @@ impl SessionDriver for PtyDriver {
     /// `turn_send` → bracketed paste + CR through the ungated write path
     /// (§6.2.3); refused while a screen prompt is pending.
     async fn send(&mut self, msg: OutgoingMessage) -> Result<SendDelivery, IpcError> {
+        if !msg.images.is_empty() {
+            // Keystrokes cannot carry an image.
+            return Err(IpcError::unsupported("images"));
+        }
         if self.pty.screen_prompt(&self.id).is_some() {
             return Err(IpcError::refused("screenPromptPending"));
         }

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-content-image"
+description = "Enables the content_image command without any pre-configured scope."
+commands.allow = ["content_image"]
+
+[[permission]]
+identifier = "deny-content-image"
+description = "Denies the content_image command without any pre-configured scope."
+commands.deny = ["content_image"]

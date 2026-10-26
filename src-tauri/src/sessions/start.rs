@@ -434,7 +434,7 @@ impl SessionsManager {
             permission_mode: req.permission_mode,
             model: req.model.clone(),
             allow_bypass,
-            first_prompt: req.prompt.clone().map(|text| OutgoingMessage { client_msg_id: mint_msg_id(), text, priority: SendPriority::Next }),
+            first_prompt: req.prompt.clone().map(|text| OutgoingMessage { client_msg_id: mint_msg_id(), text, priority: SendPriority::Next, images: Vec::new() }),
             abandoned: req.abandoned.clone(),
             env: composer,
         };
@@ -652,7 +652,7 @@ impl SessionsManager {
         let actor = ActorHandle::start(driver, info, self.actor_ctx(sink));
         self.insert_actor(actor.clone());
         if let Some(text) = prompt {
-            if let Err(e) = actor.send(mint_msg_id(), text, SendPriority::Next, false).await {
+            if let Err(e) = actor.send(mint_msg_id(), text, Vec::new(), SendPriority::Next, false).await {
                 let (code, key, _) = e.log_fields();
                 tracing::warn!(target: "sessions", code, key, "the first turn did not start");
             }

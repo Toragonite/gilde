@@ -20,7 +20,13 @@
  */
 
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
-import type { ChangeEvent, KeyboardEvent as ReactKeyboardEvent, RefObject } from 'react';
+import type {
+  ChangeEvent,
+  ClipboardEvent as ReactClipboardEvent,
+  DragEvent as ReactDragEvent,
+  KeyboardEvent as ReactKeyboardEvent,
+  RefObject,
+} from 'react';
 
 import { answerTarget, sendDecision, setReplyIntent, useReplyIntent } from '../approval';
 import { ARM_MS } from '../approval/decisions';
@@ -38,6 +44,8 @@ import type { IpcError } from '../lib/ipcError';
 import { vendorBadge } from '../lib/vendor';
 import { useAppStore } from '../store/useAppStore';
 import { sessionOf } from '../store/worldSlice';
+import { attachmentOf, imageFiles, MAX_IMAGES, SEND_TYPES } from './attachments';
+import type { Attachment } from './attachments';
 import { ComposerChips } from './ComposerChips';
 import { composerIntent, intentHintKey, stopTurn, submit } from './send';
 import './composer.css';
@@ -81,6 +89,8 @@ function ComposerBody({ uid, inputRef, active = true, onFocusCard, compact = fal
   const [line, setLine] = useState<Line>(null);
   const [sending, setSending] = useState(false);
   const [stop, setStop] = useState<StopState>(null);
+  const [attachments, setAttachments] = useState<readonly Attachment[]>([]);
+  const fileRef = useRef<HTMLInputElement | null>(null);
   const [, setTick] = useState(0);
 
   const pending = session?.pending ?? EMPTY;
@@ -164,13 +174,15 @@ function ComposerBody({ uid, inputRef, active = true, onFocusCard, compact = fal
       const now = clock.now();
       const current = composerIntent(session.uid, top, intentForSession, shown.current.at, draftStart.current, now, live ?? top);
       if (current.kind === 'send' && session.caps.send === 'none') return;
-      if (draft.trim() === '' && current.kind !== 'replyInstead') return;
+      const images = current.kind === 'send' ? attachments : [];
+      if (draft.trim() === '' && images.length === 0 && current.kind !== 'replyInstead') return;
       setSending(true);
       const target = current.kind === 'send' || !top ? session.uid : answerTarget(top, session.uid);
-      const result = await submit(target, current, draft, priority);
+      const result = await submit(target, current, draft, priority, images);
       setSending(false);
       switch (result.kind) {
         case 'done':
+          if (images.length > 0) setAttachments([]);
           clearDraft(session.uid);
           draftStart.current = null;
           setReplyIntent(session.uid, null);
@@ -186,8 +198,38 @@ function ComposerBody({ uid, inputRef, active = true, onFocusCard, compact = fal
           break;
       }
     },
-    [agent, clearDraft, draft, intentForSession, live, onFocusCard, sending, session, top],
+    [agent, attachments, clearDraft, draft, intentForSession, live, onFocusCard, sending, session, top],
   );
+
+  // Images: pasted, dropped or picked; a Conversation session takes them.
+  const addImages = async (files: readonly File[]) => {
+    if (files.length === 0) return;
+    if (!conversation) {
+      setLine({ key: 'composer.imagesConversationOnly', params: { agent } });
+      return;
+    }
+    const room = MAX_IMAGES - attachments.length;
+    const read = await Promise.all(files.slice(0, Math.max(0, room)).map((f) => attachmentOf(f).catch(() => null)));
+    const added = read.filter((a): a is Attachment => a !== null);
+    if (added.length > 0) setAttachments((list) => [...list, ...added].slice(0, MAX_IMAGES));
+    if (files.length > room) setLine({ key: 'composer.imagesMax', params: { n: MAX_IMAGES } });
+    else if (added.length < files.length) setLine({ key: 'composer.imageUnreadable', params: {} });
+  };
+
+  const onPaste = (event: ReactClipboardEvent<HTMLTextAreaElement>) => {
+    const files = imageFiles(event.clipboardData);
+    if (files.length === 0) return;
+    // A screenshot pastes as an image only; text that came with it still types.
+    if (!event.clipboardData.types.includes('text/plain')) event.preventDefault();
+    void addImages(files);
+  };
+
+  const onDrop = (event: ReactDragEvent<HTMLDivElement>) => {
+    const files = imageFiles(event.dataTransfer);
+    if (files.length === 0) return;
+    event.preventDefault();
+    void addImages(files);
+  };
 
   const onKeyDown = (event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key !== 'Enter') return;
@@ -277,7 +319,15 @@ function ComposerBody({ uid, inputRef, active = true, onFocusCard, compact = fal
   const shownLine = line?.queued && !queued.some((q) => q.clientMsgId === line.queued) ? null : line;
 
   return (
-    <div className="g-composer" data-compact={compact ? 'true' : undefined} data-intent={intent.kind}>
+    <div
+      className="g-composer"
+      data-compact={compact ? 'true' : undefined}
+      data-intent={intent.kind}
+      onDragOver={(event) => {
+        if (Array.from(event.dataTransfer.types).includes('Files')) event.preventDefault();
+      }}
+      onDrop={onDrop}
+    >
       {hintKey && (
         <p className="g-composer-hint" id={hintId} data-composer-hint="">
           {t(hintKey, { agent })}
@@ -295,7 +345,25 @@ function ComposerBody({ uid, inputRef, active = true, onFocusCard, compact = fal
         disabled={!canSend && !top}
         onChange={onChange}
         onKeyDown={onKeyDown}
+        onPaste={onPaste}
       />
+      {attachments.length > 0 && (
+        <ul className="g-composer-images" aria-label={t('composer.images', { n: attachments.length })}>
+          {attachments.map((a, i) => (
+            <li key={a.key} className="g-composer-image">
+              <img src={a.url} alt={t('convo.image', { index: i + 1 })} />
+              <button
+                type="button"
+                className="g-cbtn g-cbtn-ghost"
+                aria-label={t('composer.removeImage', { index: i + 1 })}
+                onClick={() => setAttachments((list) => list.filter((x) => x.key !== a.key))}
+              >
+                {t('composer.remove')}
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
       {shownLine && shownLine.key !== '' && (
         <p className="g-composer-line" role="status">
           {td(shownLine.key, shownLine.params)}
@@ -320,6 +388,30 @@ function ComposerBody({ uid, inputRef, active = true, onFocusCard, compact = fal
       )}
       <div className="g-composer-bar">
         <ComposerChips session={session} active={active} compact={compact} />
+        {conversation && !compact && (
+          <>
+            <input
+              ref={fileRef}
+              type="file"
+              accept={SEND_TYPES.join(',')}
+              multiple
+              hidden
+              aria-label={t('composer.attachImage')}
+              onChange={(event) => {
+                void addImages(Array.from(event.target.files ?? []));
+                event.target.value = '';
+              }}
+            />
+            <button
+              type="button"
+              className="g-cbtn g-cbtn-ghost"
+              disabled={attachments.length >= MAX_IMAGES || !canSend}
+              onClick={() => fileRef.current?.click()}
+            >
+              {t('composer.attachImage')}
+            </button>
+          </>
+        )}
         {compact && queued.length > 0 && <span className="g-composer-chip">{t('composer.queuedChip', { n: queued.length })}</span>}
         <span className="g-composer-spacer" />
         {stopLine && <span className="g-composer-stop">{stopLine}</span>}
@@ -354,7 +446,7 @@ function ComposerBody({ uid, inputRef, active = true, onFocusCard, compact = fal
           type="button"
           className="g-cbtn g-cbtn-primary"
           aria-keyshortcuts="Enter"
-          disabled={sending || draft.trim() === '' || (!canSend && intent.kind === 'send')}
+          disabled={sending || (draft.trim() === '' && (attachments.length === 0 || intent.kind !== 'send')) || (!canSend && intent.kind === 'send')}
           onClick={() => void send('next')}
         >
           {t('action.send')}{' '}

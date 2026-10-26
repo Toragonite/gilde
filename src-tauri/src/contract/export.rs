@@ -73,7 +73,7 @@ fn manifest_names_are_unique_snake_case() {
     names.sort_unstable();
     names.dedup();
     assert_eq!(names.len(), count, "duplicate command names");
-    assert_eq!(count, 84, "the §4.2 list has 84 commands (83 + history_row, A29.2)");
+    assert_eq!(count, 85, "the §4.2 list has 85 commands (83 + history_row, A29.2, + content_image)");
 }
 
 #[test]

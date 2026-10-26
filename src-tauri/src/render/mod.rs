@@ -5,6 +5,7 @@
 
 pub mod blocks;
 pub mod claude_stream;
+pub mod images;
 pub mod mesh;
 pub mod rollout;
 pub mod sanitize;

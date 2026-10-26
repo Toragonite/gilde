@@ -114,8 +114,11 @@ pub const WAVE0_STUB_ERROR: ErrorSpec = e("UNSUPPORTED", &["notBuilt"]);
 pub const BODY_DEFAULT: usize = 1024 * 1024;
 /// `pty_write`: 1.4 MiB of base64.
 pub const BODY_PTY_WRITE: usize = 1_468_006;
-/// `turn_send`: 300 KiB.
-pub const BODY_TURN_SEND: usize = 300 * 1024;
+/// `turn_send`: 300 KiB of text and envelope, plus up to five images of
+/// ≤ 5 MiB of base64 each (≈ 25.3 MiB).
+/// (`turns::MAX_SEND_IMAGES` × `turns::MAX_SEND_IMAGE_BASE64`; this file is
+/// also read by the build script, so the numbers are spelled out.)
+pub const BODY_TURN_SEND: usize = 300 * 1024 + 5 * (5 * 1024 * 1024 + 1024);
 
 /// The response marker for a raw-bytes response (`pty_snapshot`).
 pub const RAW_RESPONSE: &str = "raw";
@@ -216,7 +219,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     // -- §4.2.3 Turns and interactions --------------------------------------------
     CommandSpec {
         name: "turn_send", section: "4.2.3", module: "turn", owner: "T10", req: "TurnSendReq", res: "TurnSendRes",
-        errors: &[e("UNSUPPORTED", &["send"]), e("CONFLICT", &["queueFull"]), e("REFUSED", &["screenPromptPending"]), e("BUSY", &["stdinFull"])],
+        errors: &[e("UNSUPPORTED", &["send", "images"]), e("CONFLICT", &["queueFull"]), e("REFUSED", &["screenPromptPending"]), e("BUSY", &["stdinFull"])],
         idempotency: Idempotency::ClientMsgId, rate: RateClass::Turn, max_body_bytes: BODY_TURN_SEND, ..BASE
     },
     CommandSpec { name: "turn_cancel_queued", section: "4.2.3", module: "turn", owner: "T10", req: "TurnCancelQueuedReq", res: "TurnCancelQueuedRes", errors: &[e("NOT_FOUND", &["message"])], rate: RateClass::Turn, ..BASE },
@@ -240,6 +243,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec { name: "convo_subscribe", section: "4.2.4", module: "convo", owner: "T04", req: "ConvoSubscribeReq", res: "ConvoSubscribeRes", channel: Some("ConvoEnvelope"), errors: &[e("UNSUPPORTED", &["noReadableConversation"])], rate: RateClass::Interactive, ..BASE },
     CommandSpec { name: "convo_unsubscribe", section: "4.2.4", module: "convo", owner: "T04", req: "ConvoUnsubscribeReq", res: "ConvoUnsubscribeRes", rate: RateClass::Interactive, ..BASE },
     CommandSpec { name: "convo_load_older", section: "4.2.4", module: "convo", owner: "T04", req: "ConvoLoadOlderReq", res: "ConvoLoadOlderRes", rate: RateClass::Query, ..BASE },
+    CommandSpec { name: "content_image", section: "4.2.4", module: "convo", owner: "T04", req: "ContentImageReq", res: "ContentImageRes", errors: &[e("NOT_FOUND", &["image"])], rate: RateClass::Query, ..BASE },
     CommandSpec { name: "pty_attach", section: "4.2.4", module: "pty", owner: "T06", req: "PtyAttachReq", res: "PtyInfo", channel: Some("PtyChunk"), errors: &[e("UNSUPPORTED", &["noPty"])], rate: RateClass::Interactive, ..BASE },
     CommandSpec { name: "pty_snapshot", section: "4.2.4", module: "pty", owner: "T06", req: "PtySnapshotReq", res: RAW_RESPONSE, ..BASE },
     CommandSpec { name: "pty_write", section: "4.2.4", module: "pty", owner: "T06", req: "PtyWriteReq", res: "PtyWriteRes", rate: RateClass::Interactive, max_body_bytes: BODY_PTY_WRITE, ..BASE },

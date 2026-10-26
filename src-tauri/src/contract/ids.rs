@@ -258,6 +258,12 @@ contract_id!(
     |s| printable_ascii(s, 1, 160)
 );
 contract_id!(
+    /// `^i_[0-9a-f]{16}$` = sha256(mediaType + "\0" + base64 data): an image a
+    /// conversation block shows, held in memory by the core (§3.7).
+    ImageId,
+    |s| prefixed_hex(s, "i_", 16)
+);
+contract_id!(
     /// `^r_<UUIDv7>$`, minted when a quit or crash record is written.
     QuitRecordId,
     |s| s.strip_prefix("r_").is_some_and(|u| is_uuid(u, Some(7)))
@@ -301,6 +307,13 @@ impl ProjectId {
     /// From `realpath(gitCommonDir)` (or the folder's realpath).
     pub fn derive(realpath: &str) -> ProjectId {
         ProjectId(format!("p_{}", hash16(realpath.as_bytes())))
+    }
+}
+
+impl ImageId {
+    /// sha256(mediaType + "\0" + base64 data): the same image is one id.
+    pub fn derive(media_type: &str, data: &str) -> ImageId {
+        ImageId(format!("i_{}", hash16(&join_nul(&[media_type, data]))))
     }
 }
 

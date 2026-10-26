@@ -145,6 +145,7 @@ fn sample(name: &str) -> Value {
         "convo_subscribe" => json!({"uid": UID, "viewId": VIEW, "tailBlocks": null}),
         "convo_unsubscribe" => json!({"subId": SUB}),
         "convo_load_older" => json!({"subId": SUB, "beforeBlockId": "msg_1#0", "count": 50}),
+        "content_image" => json!({"imageId": "i_00000000000000a1"}),
         "pty_attach" | "pty_detach" => json!({"ptyId": PTY, "viewId": VIEW}),
         "pty_snapshot" => json!({"ptyId": PTY}),
         "pty_write" => json!({"ptyId": PTY, "b64": "aGk="}),
@@ -411,6 +412,8 @@ fn t_ipc_1_value_rules_report_field_and_rule() {
         ("session_mark_seen", json!({"uid": "s_not-a-uuid"}), "uid", "pattern"),
         ("turn_send", json!({"uid": UID, "clientMsgId": CRID, "text": "", "priority": "next"}), "text", "required"),
         ("turn_send", json!({"uid": UID, "clientMsgId": CRID, "text": "a\u{0}b", "priority": "next"}), "text", "nul"),
+        ("turn_send", json!({"uid": UID, "clientMsgId": CRID, "text": "x", "priority": "next", "images": [{"mediaType": "image/svg+xml", "data": "PHN2Zz4="}]}), "images[0].mediaType", "pattern"),
+        ("content_image", json!({"imageId": "../etc"}), "imageId", "pattern"),
         ("session_start", {
             let mut r = sample("session_start");
             r["location"] = json!({"kind": "newWorktree", "slug": "Bad Slug", "base": null});

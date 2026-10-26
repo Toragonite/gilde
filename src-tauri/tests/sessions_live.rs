@@ -509,6 +509,7 @@ async fn live_terminal_session_end_to_end() {
             client_msg_id: ClientMsgId::parse(uuid::Uuid::new_v4().to_string()).unwrap(),
             text: "second message".into(),
             priority: SendPriority::Next,
+            images: Vec::new(),
         })
         .await
         .unwrap();

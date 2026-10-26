@@ -7,7 +7,7 @@
 //!    are exactly `req` (plus `channel` for the three streaming commands);
 //! 2. the **size guard**: the serialized `req` is at most the command's body cap
 //!    (manifest `max_body_bytes`: 1 MiB, `pty_write` 1.4 MiB, `turn_send`
-//!    300 KiB) and nests at most [`MAX_JSON_DEPTH`] levels;
+//!    300 KiB plus its images) and nests at most [`MAX_JSON_DEPTH`] levels;
 //! 3. **deserialization** with `deny_unknown_fields` → any failure (wrong type,
 //!    missing required field, unknown field, unknown enum variant) is
 //!    `INVALID_ARGUMENT{field: "$", rule: "shape"}`;

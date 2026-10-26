@@ -28,11 +28,12 @@ use serde_json::Value;
 
 use crate::contract::common::{AbsPath, EpochMs};
 use crate::contract::content::{
-    Block, BlockKind, FileChange, SystemNote, ToolStatus, ToolSummary, ToolVerb, UserOrigin,
+    Block, BlockKind, FileChange, ImageRef, SystemNote, ToolStatus, ToolSummary, ToolVerb, UserOrigin,
 };
 use crate::contract::display::TextCap;
 use crate::contract::ids::{hash16, BlockId};
 use crate::contract::team::MessageKind;
+use crate::render::images;
 use crate::render::sanitize::{display, sanitize_display_text};
 use crate::render::tools::{self, PathBase};
 
@@ -272,14 +273,14 @@ pub fn user_text_kinds(text: &str, default_origin: UserOrigin) -> Vec<KindOut> {
                     Some(kind) => (BlockKind::System { note: SystemNote::TeamEvent { message_kind: kind, member }, text: None }, false),
                     None => {
                         let s = sanitize_display_text(&w.body, USER_TEXT_CAP);
-                        (BlockKind::UserText { text: s.text, origin: w.tag.origin(), delivery: None, client_msg_id: None }, s.truncated)
+                        (BlockKind::UserText { text: s.text, origin: w.tag.origin(), delivery: None, client_msg_id: None, images: Vec::new() }, s.truncated)
                     }
                 }
             })
             .collect();
     }
     let s = sanitize_display_text(text, USER_TEXT_CAP);
-    vec![(BlockKind::UserText { text: s.text, origin: default_origin, delivery: None, client_msg_id: None }, s.truncated)]
+    vec![(BlockKind::UserText { text: s.text, origin: default_origin, delivery: None, client_msg_id: None, images: Vec::new() }, s.truncated)]
 }
 
 // ---------------------------------------------------------------------------
@@ -297,6 +298,7 @@ fn tool_call_kind(item: &Value, base: PathBase<'_>) -> KindOut {
         input_preview: preview.text,
         status: ToolStatus::Running,
         result_preview: None,
+        result_images: Vec::new(),
         file_change: tools::claude_file_change(name, input, base),
         incomplete: false,
     };
@@ -327,6 +329,20 @@ pub fn item_kinds(item: &Value, role: &str, base: PathBase<'_>) -> Vec<KindOut> 
         "redacted_thinking" => vec![(BlockKind::Thinking { seconds: None, text: None }, false)],
         "tool_use" | "server_tool_use" | "mcp_tool_use" => vec![tool_call_kind(item, base)],
         t if is_tool_result_type(t) => Vec::new(),
+        // A pasted or attached image: a user text that is only the image.
+        "image" if role == "user" => match images::item_image(item, images::global()) {
+            Some(image) => vec![(
+                BlockKind::UserText {
+                    text: String::new(),
+                    origin: UserOrigin::Human,
+                    delivery: None,
+                    client_msg_id: None,
+                    images: vec![image],
+                },
+                false,
+            )],
+            None => Vec::new(),
+        },
         other => {
             let name = if other.is_empty() { "unknown" } else { other };
             vec![(BlockKind::Unknown { type_name: display(name, TYPE_NAME_CAP) }, false)]
@@ -392,6 +408,8 @@ pub struct ToolResultUpdate {
     pub tool_use_id: String,
     pub status: ToolStatus,
     pub preview: Option<String>,
+    /// The result's image parts, stored ([`images`]).
+    pub images: Vec<ImageRef>,
     pub truncated: bool,
 }
 
@@ -411,11 +429,13 @@ pub fn claude_tool_results(message: &Value) -> Vec<ToolResultUpdate> {
             } else {
                 ToolStatus::Ok
             };
-            let preview = tools::result_preview(item.get("content").unwrap_or(&Value::Null));
+            let content = item.get("content").unwrap_or(&Value::Null);
+            let preview = tools::result_preview(content);
             Some(ToolResultUpdate {
                 tool_use_id: tool_use_id(id),
                 status,
                 preview: Some(preview.text).filter(|p| !p.is_empty()),
+                images: images::value_images(content, images::global()),
                 truncated: preview.truncated,
             })
         })
@@ -425,9 +445,10 @@ pub fn claude_tool_results(message: &Value) -> Vec<ToolResultUpdate> {
 /// Apply a tool result to a `ToolCall` block (other kinds are left alone).
 /// `file_change` and `verb` refine the call from the result (`toolUseResult`).
 pub fn apply_tool_result(block: &mut Block, update: &ToolResultUpdate, file_change: Option<FileChange>, verb: Option<ToolVerb>) {
-    if let BlockKind::ToolCall { status, result_preview, file_change: fc, summary, incomplete, .. } = &mut block.kind {
+    if let BlockKind::ToolCall { status, result_preview, result_images, file_change: fc, summary, incomplete, .. } = &mut block.kind {
         *status = update.status;
         *result_preview = update.preview.clone();
+        *result_images = update.images.clone();
         *incomplete = false;
         if file_change.is_some() {
             *fc = file_change;

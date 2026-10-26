@@ -34,7 +34,7 @@ use crate::contract::error::{ErrorCode, IpcError};
 use crate::contract::ids::{AccountId, ClientMsgId, ProcessKey, PtyId, RequestId, SessionUid};
 use crate::contract::interaction::{Decision, DecisionKind, PendingInteraction};
 use crate::contract::ipc::{
-    AnswerOutcome, AnswerVia, AppliesFrom, InteractionDetailRes, InterruptOutcome, ModelOption,
+    AnswerOutcome, AnswerVia, AppliesFrom, InteractionDetailRes, InterruptOutcome, ModelOption, OutgoingImage,
     ScreenKeyOutcome, ScreenPromptAction, SendDelivery, SendPriority, SessionModelsRes,
     SessionTechnicalRes, TurnSendRes,
 };
@@ -796,8 +796,15 @@ impl ActorHandle {
         }
     }
 
-    pub async fn send(&self, id: ClientMsgId, text: String, priority: SendPriority, retry: bool) -> Result<TurnSendRes, IpcError> {
-        let msg = OutgoingMessage { client_msg_id: id, text, priority };
+    pub async fn send(
+        &self,
+        id: ClientMsgId,
+        text: String,
+        images: Vec<OutgoingImage>,
+        priority: SendPriority,
+        retry: bool,
+    ) -> Result<TurnSendRes, IpcError> {
+        let msg = OutgoingMessage { client_msg_id: id, text, priority, images };
         self.call(move |reply| Cmd::Send { msg, retry, reply }, "send").await
     }
 
@@ -1035,7 +1042,7 @@ async fn run(mut driver: Box<dyn ActorDriver>, mut rx: mpsc::Receiver<Cmd>, ctx:
                 let _ = reply.send(last_text.clone());
             }
             Cmd::FirstPrompt(text) => {
-                let msg = OutgoingMessage { client_msg_id: mint_msg_id(), text: text.clone(), priority: SendPriority::Next };
+                let msg = OutgoingMessage { client_msg_id: mint_msg_id(), text: text.clone(), priority: SendPriority::Next, images: Vec::new() };
                 match driver.send(msg).await {
                     Ok(_) => last_text = Some(text),
                     Err(e) => {

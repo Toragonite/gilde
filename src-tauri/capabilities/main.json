@@ -46,6 +46,7 @@
     "allow-convo-subscribe",
     "allow-convo-unsubscribe",
     "allow-convo-load-older",
+    "allow-content-image",
     "allow-pty-attach",
     "allow-pty-snapshot",
     "allow-pty-write",

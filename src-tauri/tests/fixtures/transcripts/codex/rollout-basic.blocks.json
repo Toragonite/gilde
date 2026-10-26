@@ -8,7 +8,8 @@
       "text": "List the files.",
       "origin": "human",
       "delivery": null,
-      "clientMsgId": null
+      "clientMsgId": null,
+      "images": []
     },
     "truncated": false
   },
@@ -38,6 +39,7 @@
       "inputPreview": "bash -lc ls",
       "status": "ok",
       "resultPreview": "Cargo.toml\nsrc\n",
+      "resultImages": [],
       "fileChange": null,
       "incomplete": false
     },
@@ -58,6 +60,7 @@
       "inputPreview": "NOTES.md",
       "status": "ok",
       "resultPreview": null,
+      "resultImages": [],
       "fileChange": {
         "pathRel": "NOTES.md",
         "added": 2,
@@ -83,6 +86,7 @@
       "inputPreview": "{\n  \"q\": \"layout\"\n}",
       "status": "ok",
       "resultPreview": "found 3",
+      "resultImages": [],
       "fileChange": null,
       "incomplete": false
     },
@@ -115,6 +119,7 @@
       "inputPreview": "false",
       "status": "error",
       "resultPreview": null,
+      "resultImages": [],
       "fileChange": null,
       "incomplete": false
     },

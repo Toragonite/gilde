@@ -112,6 +112,51 @@
   white-space: pre-wrap;
 }
 
+.g-thumbs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 4px 0 4px 10px;
+}
+
+.g-thumb {
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--n2);
+  cursor: zoom-in;
+  max-width: 100%;
+  overflow: hidden;
+}
+
+.g-thumb img {
+  display: block;
+  max-height: 120px;
+  max-width: 240px;
+  object-fit: contain;
+}
+
+.g-thumb[data-open='true'] {
+  cursor: zoom-out;
+}
+
+.g-thumb[data-open='true'] img {
+  max-height: none;
+  max-width: 100%;
+}
+
+.g-thumb:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.g-thumb-gone {
+  padding: 4px 8px;
+  cursor: default;
+  color: var(--n9);
+  font-size: var(--fs-sub);
+}
+
 .g-toolwrap {
   min-width: 0;
 }

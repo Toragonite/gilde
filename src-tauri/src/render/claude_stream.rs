@@ -35,8 +35,8 @@ use serde_json::Value;
 
 use crate::contract::common::{AbsPath, EpochMs};
 use crate::contract::content::{
-    BackgroundTaskStatus, Block, BlockKind, BlockPatch, ConvoSourceKind, Delivery, InteractionOutcome, SystemNote,
-    ToolStatus, UserOrigin,
+    BackgroundTaskStatus, Block, BlockKind, BlockPatch, ConvoSourceKind, Delivery, ImageRef, InteractionOutcome,
+    SystemNote, ToolStatus, UserOrigin,
 };
 use crate::contract::display::{Sanitized, TextCap};
 use crate::contract::ids::{BlockId, ClientMsgId};
@@ -46,6 +46,7 @@ use crate::render::blocks::{
     apply_tool_result, block_id, item_kinds, stream_block_id, tool_use_id, user_text_kinds, ToolResultUpdate,
     AGENT_LABEL_CAP, ASSISTANT_TEXT_CAP, SYSTEM_TEXT_CAP, THINKING_CAP, USER_TEXT_CAP,
 };
+use crate::render::images;
 use crate::render::sanitize::{display, sanitize_display_text};
 use crate::render::tools::{self, PathBase, INPUT_PREVIEW_CAP, RESULT_PREVIEW_CAP};
 use crate::render::transcript::TokenUsage;
@@ -291,12 +292,12 @@ impl StreamRenderer {
     // -- user texts Gilde sent ---------------------------------------------------
 
     /// The block of a message Gilde wrote to stdin (id = `clientMsgId`).
-    pub fn user_sent(&mut self, id: &ClientMsgId, text: &str, at: EpochMs, delivery: Option<Delivery>) -> Vec<ContentUpdate> {
+    pub fn user_sent(&mut self, id: &ClientMsgId, text: &str, images: Vec<ImageRef>, at: EpochMs, delivery: Option<Delivery>) -> Vec<ContentUpdate> {
         let s = sanitize_display_text(text, USER_TEXT_CAP);
         let b = Self::block(
             block_id(id.as_str()),
             at,
-            BlockKind::UserText { text: s.text, origin: UserOrigin::Human, delivery, client_msg_id: Some(id.clone()) },
+            BlockKind::UserText { text: s.text, origin: UserOrigin::Human, delivery, client_msg_id: Some(id.clone()), images },
             s.truncated,
         );
         if self.users.insert(id.as_str().to_owned(), b.clone()).is_none() {
@@ -366,6 +367,7 @@ impl StreamRenderer {
                                 input_preview: String::new(),
                                 status: ToolStatus::Running,
                                 result_preview: None,
+                                result_images: Vec::new(),
                                 file_change: None,
                                 incomplete: false,
                             }),
@@ -413,6 +415,7 @@ impl StreamRenderer {
                                     input_preview: s.text,
                                     status: ToolStatus::Running,
                                     result_preview: None,
+                                    result_images: Vec::new(),
                                     file_change: None,
                                     incomplete: false,
                                 };
@@ -468,6 +471,7 @@ impl StreamRenderer {
                             input_preview: s.text,
                             status: ToolStatus::Running,
                             result_preview: None,
+                            result_images: Vec::new(),
                             file_change: None,
                             incomplete: true,
                         },
@@ -604,6 +608,7 @@ impl StreamRenderer {
                         tool_use_id: tuid.clone(),
                         status,
                         preview: Some(preview.text).filter(|p| !p.is_empty()),
+                        images: item.content.map(|c| images::raw_images(c, images::global())).unwrap_or_default(),
                         truncated: preview.truncated,
                     };
                     let base = self.base();
@@ -628,6 +633,11 @@ impl StreamRenderer {
                 _ => {}
             }
         }
+        // The message's own images (an attached screenshot) go with its text.
+        let mut own_images = images::raw_images(content, images::global());
+        if texts.is_empty() && !own_images.is_empty() {
+            texts.push(String::new());
+        }
         if !texts.is_empty() {
             let joined = texts.join("\n");
             let base_id = uuid.filter(|u| !u.is_empty()).map(str::to_owned).unwrap_or_else(|| {
@@ -639,6 +649,10 @@ impl StreamRenderer {
                     facts.interrupt_marker = true;
                 }
                 let id = if k == 0 { block_id(&base_id) } else { block_id(&format!("{base_id}#{k}")) };
+                let mut kind = kind;
+                if let BlockKind::UserText { images, .. } = &mut kind {
+                    images.append(&mut own_images);
+                }
                 out.push(ContentUpdate::Appended(Self::block(id, at, kind, truncated)));
             }
         }
@@ -876,6 +890,36 @@ mod tests {
     }
 
     #[test]
+    fn images_in_a_tool_result_and_in_a_user_message_are_shown() {
+        let png = "iVBORw0KGgo=";
+        let image = json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":png}});
+        let mut r = StreamRenderer::new(None, None);
+        let a: AssistantMsgIn = serde_json::from_value(json!({"id":"msg_1","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"/w/p/shot.png"}}]})).unwrap();
+        r.assistant(&a, None, 1);
+        let msg = RawValue::from_string(
+            json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":[image.clone()]}]}).to_string(),
+        )
+        .unwrap();
+        let (u, _) = r.user(&msg, Some("u-1"), None, 2);
+        let shown = |u: &[ContentUpdate]| match &u[0] {
+            ContentUpdate::Appended(Block { kind: BlockKind::ToolCall { result_images, .. }, .. }) => result_images.clone(),
+            ContentUpdate::Appended(Block { kind: BlockKind::UserText { images, .. }, .. }) => images.clone(),
+            other => panic!("{other:?}"),
+        };
+        let result = shown(&u);
+        assert_eq!(result.len(), 1, "the screenshot the tool returned");
+        let (media_type, data) = images::global().get(&result[0].id).expect("stored");
+        assert_eq!((media_type, &*data), ("image/png", png));
+
+        let msg = RawValue::from_string(json!({"role":"user","content":[image, {"type":"text","text":"what is this?"}]}).to_string()).unwrap();
+        let (u, _) = r.user(&msg, Some("u-2"), None, 3);
+        assert_eq!(shown(&u).len(), 1, "an attached image goes with its text");
+        let id = ClientMsgId::parse("0192f000-0000-4000-8000-000000000009").unwrap();
+        let sent = r.user_sent(&id, "", result.clone(), 4, None);
+        assert_eq!(shown(&sent), result, "a sent image shows on the sent block");
+    }
+
+    #[test]
     fn the_interrupt_marker_and_subagent_labels() {
         let mut r = StreamRenderer::new(None, None);
         let msg = RawValue::from_string(json!({"role":"user","content":[{"type":"text","text":"[Request interrupted by user for tool use]"}]}).to_string()).unwrap();
@@ -906,7 +950,7 @@ mod tests {
     fn deliveries_update_our_user_block() {
         let mut r = StreamRenderer::new(None, None);
         let id = ClientMsgId::parse("0192f000-0000-4000-8000-000000000000").unwrap();
-        let u = r.user_sent(&id, "hi", 1, None);
+        let u = r.user_sent(&id, "hi", Vec::new(), 1, None);
         assert_eq!(ids(&u), ["+0192f000-0000-4000-8000-000000000000"]);
         assert_eq!(r.delivery(id.as_str(), Delivery::Queued).len(), 1);
         assert_eq!(r.delivery(id.as_str(), Delivery::Queued).len(), 0, "no change, no update");

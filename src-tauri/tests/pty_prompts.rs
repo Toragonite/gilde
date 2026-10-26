@@ -893,6 +893,7 @@ async fn a_digit_is_sent_without_cr_and_send_is_refused_while_the_prompt_is_up()
             client_msg_id: ClientMsgId::parse("0b7f6f9e-8a8f-4c4e-9d4b-6c1f2a3b4c5e").expect("id"),
             text: "hello".into(),
             priority: SendPriority::Next,
+            images: Vec::new(),
         })
         .await
         .expect_err("refused");

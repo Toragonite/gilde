@@ -318,6 +318,51 @@ domTest(
   }),
 );
 
+/** A paste that carries one image file (what a screenshot paste looks like). */
+function pasteImage(el: HTMLElement, file: File, types: string[] = ['Files']) {
+  fireEvent.paste(el, {
+    clipboardData: { types, files: [file], items: [{ kind: 'file', type: file.type, getAsFile: () => file }] },
+  });
+}
+
+const PNG_BYTES = Uint8Array.from(atob('iVBORw0KGgo='), (c) => c.charCodeAt(0));
+
+domTest(
+  'Images: a pasted screenshot is attached and goes with the message, even without text',
+  harness(async (_c, core) => {
+    setSessions([session(1)]);
+    const view = render(<Composer uid={uid(1)} />);
+    const el = input(view);
+    pasteImage(el, new File([PNG_BYTES], 'shot.png', { type: 'image/png' }));
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 20));
+    });
+    assert(view.getByAltText(translate('en', 'convo.image', { index: 1 })) !== null, 'the thumbnail');
+    enter(el);
+    await settle();
+    assertDeepEqual(sends(core)[0]?.images, [{ mediaType: 'image/png', data: 'iVBORw0KGgo=' }], 'the image, as base64');
+    assertEqual(sends(core)[0]?.text, '', 'no text needed');
+    assertEqual(view.queryByAltText(translate('en', 'convo.image', { index: 1 })), null, 'sent: the attachment clears');
+  }),
+);
+
+domTest(
+  'Images: a session not in Conversation mode says where images can go and attaches nothing',
+  harness(async (_c, core) => {
+    setSessions([session(1, { control: { kind: 'inGilde', mode: 'turnBased', pty: null, hostedTeam: false, transport: 'l1' } })]);
+    const view = render(<Composer uid={uid(1)} />);
+    const el = input(view);
+    assertEqual(view.queryByText(translate('en', 'composer.attachImage')), null, 'no attach button');
+    pasteImage(el, new File([PNG_BYTES], 'shot.png', { type: 'image/png' }));
+    await settle();
+    assert(view.getByText(translate('en', 'composer.imagesConversationOnly', { agent: 'claude' })) !== null, 'the line');
+    type(el, 'hi');
+    enter(el);
+    await settle();
+    assertDeepEqual(sends(core)[0]?.images, [], 'a plain message');
+  }),
+);
+
 domTest(
   '⌘. stops: "Stopping…", then after 5 s "Still stopping…" with Force stop',
   harness(async (c, core) => {

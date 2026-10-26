@@ -874,6 +874,10 @@ impl SessionDriver for TurnDriver {
     /// A new turn, or the one held message while a turn runs (§6.3).
     /// Idempotent by `clientMsgId`: a repeat returns the first outcome.
     async fn send(&mut self, msg: OutgoingMessage) -> Result<SendDelivery, IpcError> {
+        if !msg.images.is_empty() {
+            // The helper's turn has no image input yet.
+            return Err(IpcError::unsupported("images"));
+        }
         let inner = &self.inner;
         {
             let mut state = inner.state.lock();

@@ -139,7 +139,7 @@ pub fn item_kind(item: &Value, item_id: &str, base: PathBase<'_>) -> Option<(Blo
         "usermessage" => {
             let text = text_of(first_present(item, &["content", "text", "message"]));
             let s = sanitize_display_text(&text, USER_TEXT_CAP);
-            (BlockKind::UserText { text: s.text, origin: UserOrigin::Human, delivery: None, client_msg_id: None }, s.truncated)
+            (BlockKind::UserText { text: s.text, origin: UserOrigin::Human, delivery: None, client_msg_id: None, images: Vec::new() }, s.truncated)
         }
         "agentmessage" => {
             let text = text_of(first_present(item, &["text", "content", "message"]));
@@ -189,6 +189,7 @@ pub fn item_kind(item: &Value, item_id: &str, base: PathBase<'_>) -> Option<(Blo
                     input_preview: input.text,
                     status: status_of(item),
                     result_preview: result.map(|r| r.text).filter(|t| !t.is_empty()),
+                    result_images: Vec::new(),
                     file_change,
                     incomplete: false,
                 },
@@ -217,7 +218,7 @@ pub fn rollout_content(bytes: &[u8], offset: u64, fallback_at: EpochMs, base: &C
         }),
         "user_message" => {
             let s = sanitize_display_text(&text_of(payload.get("message")), USER_TEXT_CAP);
-            Some((BlockKind::UserText { text: s.text, origin: UserOrigin::Human, delivery: None, client_msg_id: None }, s.truncated))
+            Some((BlockKind::UserText { text: s.text, origin: UserOrigin::Human, delivery: None, client_msg_id: None, images: Vec::new() }, s.truncated))
         }
         "agent_message" => {
             let s = sanitize_display_text(&text_of(payload.get("message")), ASSISTANT_TEXT_CAP);

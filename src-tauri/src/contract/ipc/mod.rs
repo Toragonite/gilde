@@ -82,4 +82,37 @@ mod tests {
         assert!(!is_model_id("bad model"));
         assert!(!is_model_id(&"a".repeat(129)));
     }
+
+    #[test]
+    fn turn_send_body_cap_holds_its_images() {
+        assert_eq!(
+            crate::contract::ipc_manifest::BODY_TURN_SEND,
+            300 * 1024 + MAX_SEND_IMAGES * (MAX_SEND_IMAGE_BASE64 + 1024),
+            "the manifest spells the image caps out"
+        );
+    }
+
+    #[test]
+    fn turn_send_takes_raster_base64_images_and_an_image_needs_no_text() {
+        use crate::contract::validate::Validate as _;
+        let req = |text: &str, images: Vec<OutgoingImage>| TurnSendReq {
+            uid: crate::contract::ids::SessionUid::parse("s_0192f000-0000-7000-8000-000000000001").unwrap(),
+            client_msg_id: crate::contract::ids::ClientMsgId::parse("0192f000-0000-4000-8000-000000000001").unwrap(),
+            text: text.into(),
+            priority: SendPriority::Next,
+            images,
+        };
+        let png = || OutgoingImage { media_type: "image/png".into(), data: "iVBORw0KGgo=".into() };
+        assert!(req("", vec![]).validate().is_err(), "no text and no image");
+        assert!(req("", vec![png()]).validate().is_ok(), "an image alone");
+        assert!(req("look", vec![png(); MAX_SEND_IMAGES]).validate().is_ok());
+        let rule = |r: TurnSendReq| r.validate().unwrap_err().rule;
+        assert_eq!(rule(req("look", vec![png(); MAX_SEND_IMAGES + 1])), "maxItems");
+        assert_eq!(rule(req("x", vec![OutgoingImage { media_type: "image/svg+xml".into(), data: "PHN2Zz4=".into() }])), "pattern");
+        assert_eq!(rule(req("x", vec![OutgoingImage { media_type: "image/png".into(), data: "not base64".into() }])), "pattern");
+        assert_eq!(
+            rule(req("x", vec![OutgoingImage { media_type: "image/png".into(), data: "A".repeat(MAX_SEND_IMAGE_BASE64 + 4) }])),
+            "maxLength"
+        );
+    }
 }

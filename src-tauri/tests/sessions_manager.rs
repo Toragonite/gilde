@@ -1668,7 +1668,7 @@ async fn t_sessions_turn_send_idempotent_and_watched_refused() {
     let r = Rig::new();
     let uid = r.start(r.start_req(Vendor::Claude, CLAUDE_ACCT, ControlMode::Conversation)).await.unwrap();
     let id = mid();
-    let send = |text: &str| TurnSendReq { uid: uid.clone(), client_msg_id: id.clone(), text: text.into(), priority: SendPriority::Next };
+    let send = |text: &str| TurnSendReq { uid: uid.clone(), client_msg_id: id.clone(), text: text.into(), priority: SendPriority::Next, images: Vec::new() };
     let a = r.m.send(send("hello")).await.unwrap();
     let b = r.m.send(send("hello")).await.unwrap();
     assert_eq!(a, b);
@@ -1676,9 +1676,9 @@ async fn t_sessions_turn_send_idempotent_and_watched_refused() {
     // watched / unknown
     let w = SessionUid::mint();
     r.put(session(&w, Vendor::Claude, Some(CLAUDE_ACCT), Some(VSID), watching(Origin::VsCode), ActivityState::Working));
-    let q = TurnSendReq { uid: w, client_msg_id: mid(), text: "x".into(), priority: SendPriority::Next };
+    let q = TurnSendReq { uid: w, client_msg_id: mid(), text: "x".into(), priority: SendPriority::Next, images: Vec::new() };
     assert_err(r.m.send(q).await, ErrorCode::Unsupported, Some(("cap", "send")));
-    let q = TurnSendReq { uid: SessionUid::mint(), client_msg_id: mid(), text: "x".into(), priority: SendPriority::Next };
+    let q = TurnSendReq { uid: SessionUid::mint(), client_msg_id: mid(), text: "x".into(), priority: SendPriority::Next, images: Vec::new() };
     assert_err(r.m.send(q).await, ErrorCode::NotFound, None);
 }
 
@@ -1702,7 +1702,7 @@ async fn t_sessions_held_turn_based_queue() {
     // A turn runs: the next message is held.
     *log.send_result.lock() = Some(Ok(SendDelivery::Queued));
     let held = mid();
-    let res = r.m.send(TurnSendReq { uid: uid.clone(), client_msg_id: held.clone(), text: "second".into(), priority: SendPriority::Next }).await.unwrap();
+    let res = r.m.send(TurnSendReq { uid: uid.clone(), client_msg_id: held.clone(), text: "second".into(), priority: SendPriority::Next, images: Vec::new() }).await.unwrap();
     assert_eq!(res.delivery, SendDelivery::Queued);
     assert_eq!(res.position, Some(1));
     assert_eq!(r.world.queued.lock()[&uid][0].text, "second");
@@ -1816,7 +1816,7 @@ async fn t_sessions_turn_retry() {
     let r = Rig::new();
     let uid = r.start(r.start_req(Vendor::Claude, CLAUDE_ACCT, ControlMode::Conversation)).await.unwrap();
     r.put(session(&uid, Vendor::Claude, Some(CLAUDE_ACCT), None, ended(), ActivityState::Ready));
-    r.m.send(TurnSendReq { uid: uid.clone(), client_msg_id: mid(), text: "do it".into(), priority: SendPriority::Next }).await.unwrap();
+    r.m.send(TurnSendReq { uid: uid.clone(), client_msg_id: mid(), text: "do it".into(), priority: SendPriority::Next, images: Vec::new() }).await.unwrap();
     assert_err(r.m.retry(TurnRetryReq { uid: uid.clone(), client_msg_id: mid() }).await, ErrorCode::Refused, Some(("reason", "notInError")));
     r.set_state(&uid, ActivityState::Error { sub: ErrorSub::AgentError });
     let id = mid();

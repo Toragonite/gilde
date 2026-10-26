@@ -14,6 +14,7 @@ import type { ComposerMode, ReplyIntent } from '../approval';
 import { utf8Length } from '../approval/decisions';
 import { commands } from '../lib/commands';
 import type { ClientMsgId } from '../lib/gen/ClientMsgId';
+import type { OutgoingImage } from '../lib/gen/OutgoingImage';
 import type { PendingInteraction } from '../lib/gen/PendingInteraction';
 import type { SendPriority } from '../lib/gen/SendPriority';
 import type { SessionUid } from '../lib/gen/SessionUid';
@@ -113,10 +114,21 @@ function keptError(error: IpcError): SubmitResult {
   return { kind: 'kept', line: { key: error.key, params: error.params ?? {} }, error };
 }
 
-/** Perform `intent` with `text` for session `uid` (the card's session; a mirrored card is never the composer's). */
-export async function submit(uid: SessionUid, intent: ComposerIntent, rawText: string, priority: SendPriority): Promise<SubmitResult> {
+/**
+ * Perform `intent` with `text` for session `uid` (the card's session; a
+ * mirrored card is never the composer's). `images` go only with an ordinary
+ * message, which may then have no text.
+ */
+export async function submit(
+  uid: SessionUid,
+  intent: ComposerIntent,
+  rawText: string,
+  priority: SendPriority,
+  images: readonly OutgoingImage[] = [],
+): Promise<SubmitResult> {
   const text = cleanText(rawText);
-  if (text.trim() === '') return intent.kind === 'replyInstead' ? { kind: 'focusCard' } : { kind: 'kept', line: { key: '', params: {} } };
+  const withImages = intent.kind === 'send' && images.length > 0;
+  if (text.trim() === '' && !withImages) return intent.kind === 'replyInstead' ? { kind: 'focusCard' } : { kind: 'kept', line: { key: '', params: {} } };
   const tooLongReply = { kind: 'kept' as const, line: { key: 'composer.replyTooLong', params: {} } };
   const answer = async (run: () => ReturnType<typeof sendDecision>): Promise<SubmitResult> => {
     const outcome = await run();
@@ -129,7 +141,7 @@ export async function submit(uid: SessionUid, intent: ComposerIntent, rawText: s
       if (utf8Length(text) > MESSAGE_MAX_BYTES) return { kind: 'kept', line: { key: 'composer.tooLong', params: {} } };
       try {
         const clientMsgId = newClientMsgId();
-        const res = await commands.turn_send({ uid, clientMsgId, text, priority });
+        const res = await commands.turn_send({ uid, clientMsgId, text, priority, images: withImages ? images.map(({ mediaType, data }) => ({ mediaType, data })) : [] });
         return { kind: 'done', queued: res.delivery === 'queued' ? clientMsgId : null };
       } catch (e) {
         if (isIpcError(e)) return keptError(e);

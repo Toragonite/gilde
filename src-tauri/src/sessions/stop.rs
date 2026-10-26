@@ -251,7 +251,7 @@ impl SessionsManager {
     /// for a session Gilde does not run (Watching / Not running).
     pub(crate) async fn turn_send(&self, req: TurnSendReq) -> Result<TurnSendRes, IpcError> {
         let actor = self.live_actor(&req.uid, "send").await?;
-        actor.send(req.client_msg_id, req.text, req.priority, false).await
+        actor.send(req.client_msg_id, req.text, req.images, req.priority, false).await
     }
 
     /// `turn_retry`: the Error·Agent error primary action resends the last
@@ -275,7 +275,7 @@ impl SessionsManager {
             return Err(IpcError::refused("notInError"));
         }
         let text = actor.last_text().await.ok_or_else(|| IpcError::refused("notInError"))?;
-        let res = actor.send(req.client_msg_id, text, SendPriority::Next, true).await?;
+        let res = actor.send(req.client_msg_id, text, Vec::new(), SendPriority::Next, true).await?;
         Ok(TurnRetryRes { delivery: res.delivery })
     }
 

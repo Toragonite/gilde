@@ -262,6 +262,7 @@ fn msg(n: u8, text: &str) -> OutgoingMessage {
         client_msg_id: msg_id(n),
         text: text.to_string(),
         priority: SendPriority::Next,
+        images: Vec::new(),
     }
 }
 

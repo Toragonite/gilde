@@ -8,7 +8,8 @@
       "text": "Please read src/main.rs and fix the typo.",
       "origin": "human",
       "delivery": null,
-      "clientMsgId": null
+      "clientMsgId": null,
+      "images": []
     },
     "truncated": false
   },
@@ -50,6 +51,7 @@
       "inputPreview": "{\n  \"file_path\": \"/w/demo/src/main.rs\"\n}",
       "status": "ok",
       "resultPreview": "fn mian() {}\n",
+      "resultImages": [],
       "fileChange": null,
       "incomplete": false
     },
@@ -70,6 +72,7 @@
       "inputPreview": "{\n  \"file_path\": \"/w/demo/src/main.rs\",\n  \"new_string\": \"fn main() {}\",\n  \"old_string\": \"fn mian() {}\"\n}",
       "status": "ok",
       "resultPreview": "The file /w/demo/src/main.rs has been updated.",
+      "resultImages": [],
       "fileChange": {
         "pathRel": "src/main.rs",
         "added": 1,
@@ -95,6 +98,7 @@
       "inputPreview": "cargo build\ncargo test",
       "status": "denied",
       "resultPreview": "The user doesn't want to proceed with this tool use. The tool use was rejected.",
+      "resultImages": [],
       "fileChange": null,
       "incomplete": false
     },
@@ -135,7 +139,8 @@
       "text": "Now write a README please",
       "origin": "human",
       "delivery": null,
-      "clientMsgId": null
+      "clientMsgId": null,
+      "images": []
     },
     "truncated": false
   },
@@ -154,6 +159,7 @@
       "inputPreview": "{\n  \"content\": \"# Demo\\n\\nHello\\n\",\n  \"file_path\": \"/w/demo/README.md\"\n}",
       "status": "ok",
       "resultPreview": "File created successfully at: /w/demo/README.md",
+      "resultImages": [],
       "fileChange": {
         "pathRel": "README.md",
         "added": 3,
@@ -199,7 +205,8 @@
       "text": "Please run the tests.",
       "origin": "teammate",
       "delivery": null,
-      "clientMsgId": null
+      "clientMsgId": null,
+      "images": []
     },
     "truncated": false
   },
@@ -212,7 +219,8 @@
       "text": "Status?",
       "origin": "peer",
       "delivery": null,
-      "clientMsgId": null
+      "clientMsgId": null,
+      "images": []
     },
     "truncated": false
   },

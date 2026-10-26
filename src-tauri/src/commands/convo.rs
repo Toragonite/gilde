@@ -17,7 +17,8 @@ use tauri::Manager as _;
 
 use crate::contract::content::ConvoEnvelope;
 use crate::contract::ipc::{
-    ConvoLoadOlderReq, ConvoLoadOlderRes, ConvoSubscribeReq, ConvoSubscribeRes, ConvoUnsubscribeReq, ConvoUnsubscribeRes,
+    ContentImageReq, ContentImageRes, ConvoLoadOlderReq, ConvoLoadOlderRes, ConvoSubscribeReq, ConvoSubscribeRes,
+    ConvoUnsubscribeReq, ConvoUnsubscribeRes,
 };
 use crate::contract::{IpcError, Req};
 use crate::follow::hub::{ContentHub, ConvoChannel};
@@ -68,4 +69,18 @@ pub async fn convo_load_older<R: tauri::Runtime>(
     let req = req.into_inner();
     blocking(move || hub.load_older(&req.sub_id, &req.before_block_id, req.count)).await?;
     Ok(ConvoLoadOlderRes {})
+}
+
+/// `content_image` (contract §4.2.4): the bytes of an image a block names,
+/// from the in-memory image store; `NOT_FOUND{image}` once it left the store.
+/// Like the other content commands it answers only once the hub is managed.
+#[tauri::command]
+pub async fn content_image<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    req: Req<ContentImageReq>,
+) -> Result<ContentImageRes, IpcError> {
+    hub(&app)?;
+    let req = req.into_inner();
+    let (media_type, data) = crate::render::images::global().get(&req.image_id).ok_or_else(|| IpcError::not_found("image"))?;
+    Ok(ContentImageRes { media_type: media_type.to_owned(), data: data.to_string() })
 }

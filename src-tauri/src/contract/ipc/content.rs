@@ -6,7 +6,7 @@ use ts_rs::TS;
 use super::empty_structs;
 use crate::contract::common::Notice;
 use crate::contract::content::ConvoSourceKind;
-use crate::contract::ids::{BlockId, PtyId, SessionUid, SubId, ViewId};
+use crate::contract::ids::{BlockId, ImageId, PtyId, SessionUid, SubId, ViewId};
 use crate::contract::validate::{self as v, Checked, Invalid, Validate};
 
 empty_structs!(res:
@@ -84,6 +84,33 @@ impl Validate for ConvoLoadOlderReq {
         v::nested("beforeBlockId", &self.before_block_id)?;
         v::range("count", self.count, 1, 200)
     }
+}
+
+// -- content_image -------------------------------------------------------------
+
+/// The bytes of an image a block names (`ImageRef`), for a `data:` URL. The
+/// store keeps images in memory only and drops the oldest first:
+/// `NOT_FOUND{image}` once it left.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[cfg_attr(feature = "ts-export", ts(export))]
+pub struct ContentImageReq {
+    pub image_id: ImageId,
+}
+
+impl Validate for ContentImageReq {
+    fn validate(&self) -> Checked {
+        v::nested("imageId", &self.image_id)
+    }
+}
+
+/// `data` is standard base64 of one of `IMAGE_MEDIA_TYPES`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "ts-export", ts(export))]
+pub struct ContentImageRes {
+    pub media_type: String,
+    pub data: String,
 }
 
 // -- pty_* -------------------------------------------------------------------

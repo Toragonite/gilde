@@ -6,6 +6,7 @@ use ts_rs::TS;
 use super::sessions::{uid_req, MAX_PROMPT_BYTES};
 use super::{empty_structs, model_rule};
 use crate::contract::common::PermissionMode;
+use crate::contract::content::{image_media_type, is_base64};
 use crate::contract::ids::{ClientMsgId, RequestId, SessionUid};
 use crate::contract::interaction::{is_option_key, Decision, DecisionKind};
 use crate::contract::validate::{self as v, Checked, Invalid, Validate};
@@ -20,7 +21,8 @@ uid_req!(
 
 // -- turn_send -----------------------------------------------------------------
 
-/// Routes by `caps.send`. `text` 1..=256 KiB, no NUL. Never answers a pending card.
+/// Routes by `caps.send`. `text` ≤ 256 KiB, no NUL; 1 byte at least unless the
+/// message carries an image. Never answers a pending card.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[cfg_attr(feature = "ts-export", ts(export))]
@@ -29,6 +31,40 @@ pub struct TurnSendReq {
     pub client_msg_id: ClientMsgId,
     pub text: String,
     pub priority: SendPriority,
+    /// ≤ [`MAX_SEND_IMAGES`]; only a Conversation session takes them
+    /// (`UNSUPPORTED{images}` otherwise). Absent = none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<OutgoingImage>,
+}
+
+/// Images one message may carry.
+pub const MAX_SEND_IMAGES: usize = 5;
+/// One sent image's base64 ≤ 5 MiB (the WebView scales larger ones down first).
+pub const MAX_SEND_IMAGE_BASE64: usize = 5 * 1024 * 1024;
+
+/// An image sent with a message: a raster type (`IMAGE_MEDIA_TYPES`) and its
+/// standard padded base64.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[cfg_attr(feature = "ts-export", ts(export))]
+pub struct OutgoingImage {
+    pub media_type: String,
+    pub data: String,
+}
+
+impl Validate for OutgoingImage {
+    fn validate(&self) -> Checked {
+        if image_media_type(&self.media_type).is_none() {
+            return Err(Invalid::new("mediaType", "pattern"));
+        }
+        if self.data.len() > MAX_SEND_IMAGE_BASE64 {
+            return Err(Invalid::new("data", "maxLength"));
+        }
+        if !is_base64(&self.data) {
+            return Err(Invalid::new("data", "pattern"));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
@@ -43,7 +79,12 @@ impl Validate for TurnSendReq {
     fn validate(&self) -> Checked {
         v::nested("uid", &self.uid)?;
         v::nested("clientMsgId", &self.client_msg_id)?;
-        v::text_range("text", &self.text, 1, MAX_PROMPT_BYTES)
+        v::max_items("images", &self.images, MAX_SEND_IMAGES)?;
+        for (i, image) in self.images.iter().enumerate() {
+            v::nested(&format!("images[{i}]"), image)?;
+        }
+        let min = if self.images.is_empty() { 1 } else { 0 };
+        v::text_range("text", &self.text, min, MAX_PROMPT_BYTES)
     }
 }
 

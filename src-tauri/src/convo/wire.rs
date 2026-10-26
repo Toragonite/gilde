@@ -21,6 +21,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use serde_json::Value;
 
+use crate::contract::content::image_media_type;
+use crate::contract::ipc::OutgoingImage;
+
 /// Stdout lines up to this size are parsed; longer ones are skipped to the
 /// next `\n` and become `System{RowTooLarge}` (§6.1.8).
 pub const LINE_CAP: usize = 64 * 1024 * 1024;
@@ -28,6 +31,9 @@ pub const LINE_CAP: usize = 64 * 1024 * 1024;
 pub const MAX_DEPTH: usize = 64;
 /// One stdin frame (user frames, Gilde's control requests) (§6.1.3).
 pub const FRAME_CAP: usize = 1024 * 1024;
+/// A user frame that carries images: its text plus up to five images of
+/// ≤ 5 MiB of base64 each (`turn_send`'s caps), with room for the envelope.
+pub const IMAGE_FRAME_CAP: usize = 32 * 1024 * 1024;
 /// A decision that echoes the original tool input as `updatedInput` may be as
 /// large as the request it answers, which was itself ≤ [`LINE_CAP`]; capping
 /// it at [`FRAME_CAP`] would make a large `Write` impossible to approve.
@@ -420,9 +426,31 @@ struct TextItemOut<'a> {
 }
 
 #[derive(Debug, Serialize)]
+struct ImageSourceOut<'a> {
+    #[serde(rename = "type")]
+    ty: &'static str,
+    media_type: &'a str,
+    data: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct ImageItemOut<'a> {
+    #[serde(rename = "type")]
+    ty: &'static str,
+    source: ImageSourceOut<'a>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum ItemOut<'a> {
+    Image(ImageItemOut<'a>),
+    Text(TextItemOut<'a>),
+}
+
+#[derive(Debug, Serialize)]
 struct UserMessageOut<'a> {
     role: &'static str,
-    content: [TextItemOut<'a>; 1],
+    content: Vec<ItemOut<'a>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -466,9 +494,32 @@ impl Default for UserFrameShape {
 /// `{"type":"user","message":{"role":"user","content":[{"type":"text","text":…}]},"parent_tool_use_id":null,"uuid":…,"origin":{"kind":"human"}}`
 /// (+ `"priority":"now"`) [R4 §4.1–4.2, §6.1.3].
 pub fn user_frame(text: &str, uuid: &str, shape: UserFrameShape) -> String {
+    user_frame_with_images(text, &[], uuid, shape)
+}
+
+/// [`user_frame`] with images: each a `{"type":"image","source":{"type":"base64",
+/// "media_type":…,"data":…}}` item before the text; an empty text is left out
+/// (the vendor refuses an empty text item).
+pub fn user_frame_with_images(text: &str, images: &[OutgoingImage], uuid: &str, shape: UserFrameShape) -> String {
+    let mut content: Vec<ItemOut<'_>> = images
+        .iter()
+        .map(|i| {
+            ItemOut::Image(ImageItemOut {
+                ty: "image",
+                source: ImageSourceOut {
+                    ty: "base64",
+                    media_type: image_media_type(&i.media_type).unwrap_or("image/png"),
+                    data: &i.data,
+                },
+            })
+        })
+        .collect();
+    if !text.is_empty() || images.is_empty() {
+        content.push(ItemOut::Text(TextItemOut { ty: "text", text }));
+    }
     let frame = UserFrameOut {
         ty: "user",
-        message: UserMessageOut { role: "user", content: [TextItemOut { ty: "text", text }] },
+        message: UserMessageOut { role: "user", content },
         parent_tool_use_id: None,
         uuid,
         origin: shape.origin.then_some(OriginOut { kind: "human" }),
@@ -780,6 +831,21 @@ mod tests {
         let legacy = user_frame("x", "u", UserFrameShape { now: false, origin: false, empty_session_id: true });
         assert!(parse(&legacy).get("origin").is_none());
         assert_eq!(parse(&legacy)["session_id"], "");
+    }
+
+    #[test]
+    fn images_go_before_the_text_and_an_empty_text_is_left_out() {
+        let png = OutgoingImage { media_type: "image/PNG".into(), data: "iVBORw0KGgo=".into() };
+        let f = parse(&user_frame_with_images("what is this?", std::slice::from_ref(&png), "u", UserFrameShape::default()));
+        assert_eq!(
+            f["message"]["content"],
+            serde_json::json!([
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}},
+                {"type":"text","text":"what is this?"}
+            ])
+        );
+        let only = parse(&user_frame_with_images("", &[png], "u", UserFrameShape::default()));
+        assert_eq!(only["message"]["content"].as_array().map(Vec::len), Some(1), "no empty text item");
     }
 
     #[test]

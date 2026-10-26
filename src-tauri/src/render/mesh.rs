@@ -72,7 +72,7 @@ impl MeshTurnRenderer {
     /// The user's message that starts this turn (sent by Gilde, so delivered).
     pub fn user_prompt(&mut self, text: &str, client_msg_id: Option<ClientMsgId>, at: EpochMs) -> ContentUpdate {
         let s = sanitize_display_text(text, USER_TEXT_CAP);
-        let kind = BlockKind::UserText { text: s.text, origin: UserOrigin::Human, delivery: Some(Delivery::Delivered), client_msg_id };
+        let kind = BlockKind::UserText { text: s.text, origin: UserOrigin::Human, delivery: Some(Delivery::Delivered), client_msg_id, images: Vec::new() };
         ContentUpdate::Appended(self.block(kind, s.truncated, at))
     }
 
@@ -146,6 +146,7 @@ impl MeshTurnRenderer {
                     input_preview: input.text,
                     status: ToolStatus::Unknown,
                     result_preview: None,
+                    result_images: Vec::new(),
                     file_change: None,
                     incomplete: false,
                 };
